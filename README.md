@@ -282,6 +282,27 @@ image_generator.generate_image_from_embd(
 
 **5. Manual property editing:** The notebook demonstrates how to directly modify the mask `M` and the feature matrix `Y` to produce custom embeddings -- for example, swapping one property for another or interpolating between features.
 
+### Evaluation & benchmarks
+
+The repo includes scripts for **held-out tuple splits**, **embedding and image metrics**, **baselines**, and optional **API-based vision judging** (OpenAI; set `OPENAI_API_KEY` from [platform.openai.com](https://platform.openai.com/)).
+
+| Step | Command / module |
+|------|------------------|
+| Disjoint train/holdout tuples | `python dataset_generation/compositional_split.py --categories_json ... --output_root ... --holdout_fraction 0.1` |
+| Copy truncation sidecars to holdout | `python -m evaluation.run_copy_truncation --train_folder .../train --holdout_folder .../holdout` |
+| Train-set SSAE reconstruction | `python -m evaluation.run_reconstruction --checkpoint results/run` |
+| Holdout compositional embeddings | `python -m evaluation.run_compositional_embeddings --checkpoint ... --holdout_folder .../holdout/` |
+| Embedding baselines (mean / ridge / PCA) | `python -m baselines.run_baselines --checkpoint ... --train_folder ... --holdout_folder ...` |
+| Unsupervised sparse AE (MSE + L1) | `python -m baselines.run_unsup_sae_holdout --checkpoint ... --train_folder ... --holdout_folder ...` |
+| Concept cosine matrix + stats | `python -m evaluation.decorrelation --checkpoint ...` ; heatmap: `python -m evaluation.run_decorrelation_plot --checkpoint ... --output_png fig.png` |
+| Image benchmark (SD3 + CLIP + LPIPS; optional DINO / locality CLIP) | `python -m evaluation.run_image_benchmark --checkpoint ... --holdout_folder ... --output_dir bench_out --dino --locality_drop_one_attr` |
+| OpenAI vision judge (batch) | `python -m evaluation.run_vlm_openai_batch --benchmark_dir bench_out --model gpt-4o-mini` |
+| CLIP linear probe on images | `python -m evaluation.run_clip_probe --train_folder .../train --train_images_subdir path/to/00000.png_folder --holdout_folder .../holdout --benchmark_dir bench_out` |
+| Failure rates by edit type | `python -m evaluation.run_edit_type_summary --per_sample_csv bench_out/per_sample.csv --manifest_json evaluation/examples/edit_manifest.example.json` |
+| Ablation YAML grid | `python experiments/sweep_generate.py --output_dir configs/sweep1` |
+
+Unified CLI: `python -m evaluation.cli <subcommand> ...` (see `evaluation/cli.py`).
+
 ---
 
 ## Configuration Reference
@@ -330,8 +351,23 @@ decoder-only-ssae/
 │   └── models.yaml                    # Model configuration
 ├── dataset_generation/
 │   ├── functions.py                   # PromptsGenerator class
+│   ├── compositional_split.py         # Disjoint train/holdout full tuples
 │   └── prompts/input/
 │       └── categories_with_properties.json  # Category/property definitions
+├── evaluation/
+│   ├── cli.py                         # Unified evaluation CLI
+│   ├── run_image_benchmark.py         # Image-level benchmark + CSV/summary
+│   ├── run_vlm_openai_batch.py        # OpenAI vision API batch judge
+│   ├── run_clip_probe.py              # CLIP multi-label linear probe
+│   ├── dino_embed.py                  # DINOv2 similarity
+│   ├── vlm_openai.py                  # Single-image OpenAI judge helper
+│   ├── examples/
+│   │   └── edit_manifest.example.json # Example for edit_type aggregation
+│   └── ...
+├── baselines/
+│   ├── run_baselines.py               # Mean / ridge / PCA
+│   ├── run_unsup_sae_holdout.py       # Unsupervised sparse AE
+│   └── ...
 ├── inference/
 │   ├── abstract.py                    # SFDInference base class
 │   ├── inference_model_avg.py         # Inference with avg feature model

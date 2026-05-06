@@ -76,7 +76,11 @@ class ImageGenerator:
 
     @torch.no_grad()
     def generate_image_from_prompt(
-        self, prompt: str, image_name: Path | str, use_negative_prompts: bool = False
+        self,
+        prompt: str,
+        image_name: Path | str,
+        use_negative_prompts: bool = False,
+        seed: int | None = None,
     ):
         (
             prompt_embeds,
@@ -84,7 +88,7 @@ class ImageGenerator:
             pooled_prompt_embeds,
             negative_pooled_prompt_embeds,
         ) = self.get_embds_text_encoder(
-            prompt=prompt, use_negative_prompts=use_negative_prompts
+            prompt=prompt, use_negative_prompts=use_negative_prompts, seed=seed
         )
 
         self.generate_image_from_embd(
@@ -93,6 +97,7 @@ class ImageGenerator:
             image_name=image_name,
             negative_prompt_embeds=negative_prompt_embeds,
             negative_pooled_prompt_embeds=negative_pooled_prompt_embeds,
+            seed=seed,
         )
 
     @torch.no_grad()
@@ -103,8 +108,9 @@ class ImageGenerator:
         image_name: Path | str,
         negative_prompt_embeds: torch.tensor = None,
         negative_pooled_prompt_embeds: torch.tensor = None,
+        seed: int | None = None,
     ) -> None:
-        setup_seed(0)
+        setup_seed(0 if seed is None else seed)
 
         if self.simulated:
             return self._generate_image_from_embd_simulated(
@@ -165,16 +171,28 @@ class ImageGenerator:
 
         print(f"Image saved in {image_name}")
 
-    def get_embds_text_encoder(self, prompt: str, use_negative_prompts: bool = False):
+    def get_embds_text_encoder(
+        self,
+        prompt: str,
+        use_negative_prompts: bool = False,
+        seed: int | None = None,
+    ):
         if self.simulated:
-            return self._get_embds_text_encoder_simulated(prompt, use_negative_prompts)
+            return self._get_embds_text_encoder_simulated(
+                prompt, use_negative_prompts, seed=seed
+            )
         else:
-            return self._get_embds_text_encoder(prompt, use_negative_prompts)
+            return self._get_embds_text_encoder(
+                prompt, use_negative_prompts, seed=seed
+            )
 
     def _get_embds_text_encoder(
-        self, prompt: str, use_negative_prompts: bool = False
+        self,
+        prompt: str,
+        use_negative_prompts: bool = False,
+        seed: int | None = None,
     ) -> tuple[torch.tensor, torch.tensor, torch.tensor, torch.tensor]:
-        setup_seed(0)
+        setup_seed(0 if seed is None else seed)
         embds = self.pipeline.encode_prompt(prompt, prompt, prompt)
         (
             prompt_embeds,
@@ -195,9 +213,12 @@ class ImageGenerator:
         )
 
     def _get_embds_text_encoder_simulated(
-        self, prompt: str, use_negative_prompts: bool = False
+        self,
+        prompt: str,
+        use_negative_prompts: bool = False,
+        seed: int | None = None,
     ) -> tuple[torch.tensor, torch.tensor, torch.tensor, torch.tensor]:
-        setup_seed(0)
+        setup_seed(0 if seed is None else seed)
 
         prompt_embeds = torch.randn(1, 333, 4096, device=self.device)
         pooled_prompt_embeds = torch.randn(1, 2048, device=self.device)

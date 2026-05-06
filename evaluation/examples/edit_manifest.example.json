@@ -1,0 +1,12 @@
+[
+  {
+    "sample_idx": 0,
+    "method": "ssae_compose",
+    "edit_type": "compose_holdout"
+  },
+  {
+    "sample_idx": 1,
+    "method": "ssae_compose",
+    "edit_type": "swap_property"
+  }
+]
