@@ -8,12 +8,22 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 
+from backbones.base import StreamSpec
 from trainings.config.config import check_yaml_params
 from trainings.dataloader.checks import run_checks_dataset
 from trainings.dataloader.properties.properties import Properties
 from trainings.dataloader.properties.same_id import SameId
 
 MAX_MIN = "MAX_MIN"
+MANIFEST_FILENAME = "manifest.json"
+
+
+class MissingManifestError(FileNotFoundError):
+    """Embedding folder was produced by an older extraction script.
+
+    Re-run `python get_embeddings.py --backbone <name> --prompts ... --out ...`
+    to regenerate the folder with a manifest.json.
+    """
 
 
 class H5Dataset(Dataset):
@@ -46,6 +56,25 @@ class H5Dataset(Dataset):
         # extract files
         self.folder_embds = folder_path + "embds/"
 
+        # backbone-agnostic manifest describes the streams stored per prompt
+        manifest_path = os.path.join(self.folder_embds, MANIFEST_FILENAME)
+        if not os.path.exists(manifest_path):
+            raise MissingManifestError(
+                f"No {MANIFEST_FILENAME} at {manifest_path}. "
+                f"Re-extract with `python get_embeddings.py --backbone <name> "
+                f"--prompts <prompts.json> --out {folder_path}`."
+            )
+        with open(manifest_path, "r") as f:
+            manifest = json.load(f)
+        self.backbone_name: str = manifest["backbone"]
+        self.stream_specs: list[StreamSpec] = [
+            StreamSpec.from_dict(s) for s in manifest["streams"]
+        ]
+        self.log_print(
+            f"Loaded manifest: backbone={self.backbone_name}, "
+            f"streams={[s.name for s in self.stream_specs]}"
+        )
+
         self.folders = [
             f
             for f in os.listdir(self.folder_embds)
@@ -62,25 +91,12 @@ class H5Dataset(Dataset):
             )
             self.folders = self.folders[: self.truncate_n_prompts]
 
-        self.files = [f + "/embds.h5" for f in self.folders]
-        self.files_pooled = [f + "/embds_pooled.h5" for f in self.folders]
+        # per-stream file paths (relative to folder_embds), one list per stream
+        self.files_by_stream: dict[str, list[str]] = {
+            spec.name: [f + "/" + spec.h5_file for f in self.folders]
+            for spec in self.stream_specs
+        }
         self.files_prompts = [f + "/prompts.txt" for f in self.folders]
-
-        # detect if dataset has pooled_embds files
-        self.has_pooled_embds = False
-        if os.path.exists(os.path.join(self.folder_embds, self.files_pooled[0])):
-            self.log_print(
-                "Has found /embds_pooled.h5 files, will only use /embds_pooled.h5"
-            )
-            self.log_print("has_pooled_embds set to True")
-            self.has_pooled_embds = True
-
-        # detect if dataset has embds files
-        self.has_embds = False
-        if os.path.exists(os.path.join(self.folder_embds, self.files[0])):
-            self.log_print("Has found /embds.h5 files, will only use /embds_pooled.h5")
-            self.log_print("has_embds set to True")
-            self.has_embds = True
 
         # get properties
         self.properties = Properties(folder_path=folder_path, logger=logger)
@@ -117,7 +133,7 @@ class H5Dataset(Dataset):
         )
 
         if not self.simulated:
-            assert len(self.files) == self.mask_reduced.shape[0]
+            assert len(self.folders) == self.mask_reduced.shape[0]
 
         # get dim_x
         vector_0, mask_0 = self.__getitem__(0)
@@ -141,25 +157,16 @@ class H5Dataset(Dataset):
         return self.mask_reduced.shape[0]
 
     def _get_item_real(self, idx):
-        vector1 = torch.empty(0)
-        vector2 = torch.empty(0)
-        # pooled embd
-        if self.has_pooled_embds:
-            file_pooled_path = os.path.join(self.folder_embds, self.files_pooled[idx])
-
-            with h5py.File(file_pooled_path, "r") as f:
-                vector2 = f["vector"][:]  # Read dataset
-                vector2 = torch.from_numpy(vector2).to(torch.float32).flatten()
-
-        if self.has_embds:
-            # embd
-            file_path = os.path.join(self.folder_embds, self.files[idx])
-
+        # concat streams in manifest order — this order is load-bearing:
+        # inference reverses it via `stream_specs`.
+        parts = []
+        for spec in self.stream_specs:
+            file_path = os.path.join(self.folder_embds, self.files_by_stream[spec.name][idx])
             with h5py.File(file_path, "r") as f:
-                vector1 = f["vector"][:]  # Read dataset
-                vector1 = torch.from_numpy(vector1).to(torch.float32).flatten()
+                arr = f["vector"][:]
+            parts.append(torch.from_numpy(arr).to(torch.float32).flatten())
 
-        embds = torch.cat((vector1, vector2))
+        embds = torch.cat(parts) if len(parts) > 1 else parts[0]
         if self.indices_truncate_embds_topk is not None:
             embds = embds[self.indices_truncate_embds_topk]
 

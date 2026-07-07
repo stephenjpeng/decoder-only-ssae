@@ -51,6 +51,7 @@ def training(
     tp["tid_same"] = dataset.same_id.tid_same
     tp["dim_output"] = dataset.dim_x
     tp["n_prompts"] = len(dataset)
+    tp["backbone"] = dataset.backbone_name
 
     dataloader = DataLoader(
         dataset,

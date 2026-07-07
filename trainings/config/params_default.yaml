@@ -1,3 +1,7 @@
+# The backbone (text encoder / diffusion pipeline) is not set here — it is
+# recorded in <folder_path>/embds/manifest.json at extraction time and the
+# dataloader + inference layer read it from there. To use a different backbone,
+# re-run `python get_embeddings.py --backbone <name> --prompts ... --out ...`.
 training:
   model:
     model_name: "model_trainable_inputs"

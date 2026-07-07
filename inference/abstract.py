@@ -42,6 +42,7 @@ class SFDInference:
         self.tp["tid_same"] = self.dataset.same_id.tid_same
         self.tp["dim_output"] = self.dataset.dim_x
         self.tp["n_prompts"] = len(self.dataset)
+        self.tp["backbone"] = self.dataset.backbone_name
 
     def initialize_model(self):
         Decoder = import_model(self.tp["model_name"])
@@ -130,25 +131,33 @@ class SFDInference:
 
     def overwrite_full_embedding(
         self, embd_topk: torch.tensor, idx: int
-    ) -> tuple[torch.tensor, torch.tensor]:
-        """
-        given a reconstructed of dim topk, returns the full clip embedding
-        ready to be used for the diffusion model
+    ) -> dict[str, torch.Tensor]:
+        """Given a top-k reconstruction, rebuild the per-stream embeddings.
+
+        The flat vector is split according to `dataset.stream_specs` (written
+        by the backbone at extraction time) and each slice is reshaped back to
+        its per-sample shape with a leading batch dim.
         """
 
         full_embd = self.get_full_embedding(idx)
 
         embd_topk = self.dataset.denormalize(embd_topk)
-
         full_embd[self.dataset.indices_truncate_embds_topk] = embd_topk
 
-        embd = full_embd[:-2048]
-        pooled_embd = full_embd[-2048:]
+        streams: dict[str, torch.Tensor] = {}
+        offset = 0
+        for spec in self.dataset.stream_specs:
+            n = spec.flat_dim
+            slice_flat = full_embd[offset : offset + n]
+            streams[spec.name] = slice_flat.reshape(1, *spec.shape)
+            offset += n
+        return streams
 
-        embd = embd[None, :].reshape(1, 333, 4096).to(torch.bfloat16)
-        pooled_embd = pooled_embd[None, :].to(torch.bfloat16)
+    def get_backbone(self, **kwargs):
+        """Instantiate the backbone the dataset was extracted with."""
+        from backbones import get_backbone
 
-        return embd, pooled_embd
+        return get_backbone(self.dataset.backbone_name, **kwargs)
 
     def get_full_embedding(self, idx: int) -> torch.tensor:
         indices_truncate_embds_topk = self.dataset.indices_truncate_embds_topk
