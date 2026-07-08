@@ -67,6 +67,7 @@ class H5Dataset(Dataset):
         with open(manifest_path, "r") as f:
             manifest = json.load(f)
         self.backbone_name: str = manifest["backbone"]
+        self.backbone_kwargs: dict = manifest.get("backbone_kwargs", {})
         self.stream_specs: list[StreamSpec] = [
             StreamSpec.from_dict(s) for s in manifest["streams"]
         ]

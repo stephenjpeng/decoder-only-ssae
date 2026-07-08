@@ -154,10 +154,16 @@ class SFDInference:
         return streams
 
     def get_backbone(self, **kwargs):
-        """Instantiate the backbone the dataset was extracted with."""
+        """Instantiate the backbone the dataset was extracted with.
+
+        Merges the kwargs recorded in the manifest at extraction time with
+        any caller overrides -- important for generic backbones like
+        `hf_causal_lm` that need `model_id`/`hidden_size` at construction.
+        """
         from backbones import get_backbone
 
-        return get_backbone(self.dataset.backbone_name, **kwargs)
+        merged = {**self.dataset.backbone_kwargs, **kwargs}
+        return get_backbone(self.dataset.backbone_name, **merged)
 
     def get_full_embedding(self, idx: int) -> torch.tensor:
         indices_truncate_embds_topk = self.dataset.indices_truncate_embds_topk

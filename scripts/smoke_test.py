@@ -218,7 +218,74 @@ def main() -> None:
         # 6) helpful error for pre-manifest folders
         _check_missing_manifest_error(tmp)
 
+        # 7) text-LM backbones register and expose expected stream shapes
+        _check_hf_causal_lm_registration()
+
     print("\nALL SMOKE CHECKS PASSED")
+
+
+def _check_hf_causal_lm_registration() -> None:
+    """Registry + stream_specs wiring for the text-LM backbones.
+
+    Cheap check that avoids downloading weights: instantiate without calling
+    `load()`, confirm stream shapes and flat_dim match constructor args.
+    """
+    from backbones import get_backbone, list_backbones
+
+    for name in ("hf_causal_lm", "gemma_2_2b_it"):
+        assert name in list_backbones(), f"{name} missing from registry"
+
+    generic = get_backbone(
+        "hf_causal_lm",
+        device="cpu",
+        model_id="unused/for-shape-check",
+        hidden_size=16,
+        max_length=8,
+    )
+    assert [s.name for s in generic.stream_specs] == ["seq"]
+    assert generic.stream_specs[0].shape == (8, 16)
+    assert generic.flat_dim == 8 * 16
+
+    gemma = get_backbone("gemma_2_2b_it", device="cpu", max_length=32)
+    assert gemma.model_id == "google/gemma-2-2b-it"
+    assert gemma.hidden_size == 2304
+    assert gemma.stream_specs[0].shape == (32, 2304)
+
+    # model_id override still works via the preset
+    gemma_base = get_backbone(
+        "gemma_2_2b_it", device="cpu", model_id="google/gemma-2-2b", max_length=32
+    )
+    assert gemma_base.model_id == "google/gemma-2-2b"
+
+    # prompt-wrapping defaults + overrides
+    assert gemma.apply_chat_template is True, "IT preset should default to chat template on"
+    assert generic.apply_chat_template is False, "generic hf_causal_lm should default off"
+
+    templated = get_backbone(
+        "hf_causal_lm",
+        device="cpu",
+        model_id="unused",
+        hidden_size=16,
+        max_length=8,
+        prompt_template="describe: {prompt}",
+    )
+    # _format_prompt without chat template = pure string substitution (no tokenizer needed)
+    assert templated._format_prompt("a cat") == "describe: a cat"
+
+    try:
+        get_backbone(
+            "hf_causal_lm",
+            device="cpu",
+            model_id="unused",
+            hidden_size=16,
+            max_length=8,
+            prompt_template="no placeholder here",
+        )
+    except ValueError as e:
+        assert "{prompt}" in str(e), e
+    else:
+        raise AssertionError("expected ValueError for template missing {prompt}")
+    print("OK hf_causal_lm + gemma_2_2b_it registration, shapes, and prompt wrapping")
 
 
 if __name__ == "__main__":
