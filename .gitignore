@@ -21,6 +21,7 @@ embds/
 results/
 outputs/
 dataset_generation/prompts/output/
+dataset_generation_sp/
 
 # Jupyter
 .ipynb_checkpoints
@@ -33,3 +34,6 @@ dataset_generation/prompts/output/
 # Logs
 logs/
 *.log
+
+# Context files
+CONTEXT/
