@@ -33,7 +33,12 @@ def training(
 
     log_print = print if logger is None else logger.print
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if torch.cuda.is_available():
+        device = torch.device("cuda")
+    elif torch.backends.mps.is_available():
+        device = torch.device("mps")
+    else:
+        device = torch.device("cpu")
     log_print("device : ", device)
 
     tp["logger"] = logger
