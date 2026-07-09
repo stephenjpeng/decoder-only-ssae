@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import inspect
 import json
+import shutil
 import time
 from pathlib import Path
 
@@ -36,6 +37,15 @@ def parse_args() -> argparse.Namespace:
         "--out",
         required=True,
         help="Output folder; embeddings go under <out>/embds/",
+    )
+    p.add_argument(
+        "--categories",
+        default="dataset_generation/prompts/input/categories_with_properties.json",
+        help=(
+            "Path to categories_with_properties.json (the file passed to "
+            "PromptsGenerator). Copied to <out>/properties.json -- required by "
+            "H5Dataset/Properties at training time. Pass '' to skip."
+        ),
     )
     p.add_argument("--n", type=int, default=None, help="Optional prompt cap")
     p.add_argument(
@@ -133,6 +143,27 @@ def main() -> None:
     out_root = Path(args.out)
     embds_root = out_root / "embds"
     embds_root.mkdir(parents=True, exist_ok=True)
+
+    # H5Dataset/Properties (trainings/dataloader) read prompts.json and
+    # properties.json from out_root directly, alongside embds/. Write the
+    # (possibly --n-truncated) prompt list here rather than copying
+    # args.prompts verbatim, so the entry count always matches the folders
+    # actually written below.
+    with open(out_root / "prompts.json", "w") as f:
+        json.dump(prompts, f, indent=4)
+
+    properties_dest = out_root / "properties.json"
+    if properties_dest.exists():
+        pass  # caller already staged one (e.g. a specific train/holdout split); don't clobber it
+    elif args.categories:
+        categories_path = Path(args.categories)
+        if categories_path.exists():
+            shutil.copy(categories_path, properties_dest)
+        else:
+            print(
+                f"warning: --categories path {categories_path} not found; "
+                f"skipping properties.json (training will fail without it)"
+            )
 
     manifest = {
         "backbone": backbone.name,

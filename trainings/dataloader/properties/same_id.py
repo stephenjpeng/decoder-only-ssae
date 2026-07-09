@@ -22,7 +22,12 @@ def get_cid_never_same(
 def get_pid_never_same(
     cid_never_same: List[str], cid_to_pids: Dict[int, np.array]
 ) -> tuple[np.array, int]:
-    pid_never_same = np.array([cid_to_pids[cns] for cns in cid_never_same]).flatten()
+    # categories can have different numbers of properties, so this must stay
+    # a flat list comprehension rather than np.array(list_of_lists) -- the
+    # latter requires a rectangular shape and raises on ragged input.
+    pid_never_same = np.array(
+        [pid for cns in cid_never_same for pid in cid_to_pids[cns]]
+    )
     return pid_never_same, len(pid_never_same)
 
 
