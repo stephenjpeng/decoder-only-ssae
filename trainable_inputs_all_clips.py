@@ -50,9 +50,11 @@ def training(
     tp["n_categories"] = dataset.properties.n_categories
     tp["n_properties_situation"] = dataset.same_id.n_pid_never_same
     tp["n_features"] = dataset.properties.n_properties * tp["n_repeat"]
-    tp["n_features_situation"] = (
-        dataset.properties.n_properties * dataset.same_id.n_pid_never_same
-    )
+    # width of the "shared identity" block within that same n_repeat-wide
+    # feature space -- must scale with n_repeat like n_features above, not
+    # n_properties, or it overshoots n_features whenever most categories are
+    # marked "never same" in properties_same.json (the common case).
+    tp["n_features_situation"] = tp["n_repeat"] * dataset.same_id.n_pid_never_same
     tp["tid_same"] = dataset.same_id.tid_same
     tp["dim_output"] = dataset.dim_x
     tp["n_prompts"] = len(dataset)
