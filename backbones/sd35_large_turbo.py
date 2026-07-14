@@ -61,7 +61,9 @@ class Sd35LargeTurboBackbone(Backbone):
             text_encoder_3=t5,
             torch_dtype=torch.bfloat16,
         )
-        self.pipeline.to(self.device)
+        # NF4-quantized submodules disallow .to() on the whole pipeline;
+        # offload swaps components onto GPU on demand and works with them.
+        self.pipeline.enable_model_cpu_offload(gpu_id=self.device.index or 0)
         try:
             self.pipeline.enable_xformers_memory_efficient_attention()
         except (ModuleNotFoundError, AttributeError):
