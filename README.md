@@ -296,7 +296,8 @@ The repo includes scripts for **held-out tuple splits**, **embedding and image m
 | Unsupervised sparse AE (MSE + L1) | `python -m baselines.run_unsup_sae_holdout --checkpoint ... --train_folder ... --holdout_folder ...` |
 | Concept cosine matrix + stats | `python -m evaluation.decorrelation --checkpoint ...` ; heatmap: `python -m evaluation.run_decorrelation_plot --checkpoint ... --output_png fig.png` |
 | Image benchmark (SD3 + CLIP + LPIPS; optional DINO / locality CLIP) | `python -m evaluation.run_image_benchmark --checkpoint ... --holdout_folder ... --output_dir bench_out --dino --locality_drop_one_attr` |
-| OpenAI vision judge (batch) | `python -m evaluation.run_vlm_openai_batch --benchmark_dir bench_out --model gpt-4o-mini` |
+| Concept-strength / magnitude sensitivity (non-binary mask values, e.g. 2/10/-10) | `python -m evaluation.run_magnitude_sensitivity --checkpoint ... --data_folder ... --output_dir mag_out --concepts "holding a gun" --magnitudes -10,-2,-1,0,1,2,5,10` |
+| OpenAI vision judge (batch; works on `bench_out` or `mag_out`, same `per_sample.csv`/`images/` layout) | `python -m evaluation.run_vlm_openai_batch --benchmark_dir bench_out --model gpt-4o-mini` |
 | CLIP linear probe on images | `python -m evaluation.run_clip_probe --train_folder .../train --train_images_subdir path/to/00000.png_folder --holdout_folder .../holdout --benchmark_dir bench_out` |
 | Failure rates by edit type | `python -m evaluation.run_edit_type_summary --per_sample_csv bench_out/per_sample.csv --manifest_json evaluation/examples/edit_manifest.example.json` |
 | Ablation YAML grid | `python experiments/sweep_generate.py --output_dir configs/sweep1` |
@@ -357,6 +358,8 @@ decoder-only-ssae/
 ├── evaluation/
 │   ├── cli.py                         # Unified evaluation CLI
 │   ├── run_image_benchmark.py         # Image-level benchmark + CSV/summary
+│   ├── run_magnitude_sensitivity.py   # Concept-strength / mask-magnitude sweep
+│   ├── magnitude.py                   # Non-binary mask-value decode helpers
 │   ├── run_vlm_openai_batch.py        # OpenAI vision API batch judge
 │   ├── run_clip_probe.py              # CLIP multi-label linear probe
 │   ├── dino_embed.py                  # DINOv2 similarity

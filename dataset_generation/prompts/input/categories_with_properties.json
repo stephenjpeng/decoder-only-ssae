@@ -10,20 +10,18 @@
     "situation": [
         "walking down the street",
         "walking in the rain",
-        "at a market",
         "sitting at a cafe",
         "sitting in a bar",
-        "on horseback in the forest",
         "on horseback across a plain",
         "at the beach",
-        "on a boat",
         "driving a blue car",
         "driving a red car"
     ],
     "t_shirt": [
-        "wearing a blue t-shit",
-        "wearing a black t-shit",
-        "wearing a red t-shit"
+        "wearing a blue t-shirt",
+        "wearing a black t-shirt",
+        "wearing a red t-shirt",
+        "wearing a green t-shirt"
     ],
     "hat": [
         "and a hat",

@@ -3,9 +3,17 @@ Image-level compositional benchmark for held-out concept tuples.
 
 Compares **ground-truth embeddings**, **SSAE compositional** embeddings, **mean-direction**
 and **ridge** embedding baselines, and **prompt-only** generation. Uses matched seeds per
-sample (deterministic in ``base_seed``).
+sample (deterministic in ``base_seed``). Per-method image similarity vs. the ``gt_embed``
+rendering is reported via CLIP, LPIPS, DINO cosine, and pixel-space MSE/SSIM.
 
-Writes ``per_sample.csv``, ``summary.json``, and PNGs under ``<output>/images/<method>/``.
+With ``--locality_drop_one_attr``, also renders a same-seed **pre-edit** image per method
+(target attribute's mask bit zeroed / phrase dropped from the prompt) and reports pixel-space
+MSE/SSIM between the pre- and post-edit renders as an "edit surgical-ness" proxy: a method
+that only changes pixels tied to the edited attribute should score low MSE / high SSIM here.
+
+Writes ``per_sample.csv``, ``summary.json``, and PNGs under ``<output>/images/<method>/``
+(post-edit) and ``<output>/images_pre_edit/<method>/`` (pre-edit, only with
+``--locality_drop_one_attr``).
 """
 
 from __future__ import annotations
@@ -34,6 +42,7 @@ from evaluation.composition import (
 )
 from evaluation.io import ensure_folder_path, h5_dataset_for_folder, load_decoder_checkpoint
 from evaluation.lpips_metric import lpips_alex
+from evaluation.pixel_metrics import pixel_mse, ssim
 from evaluation.sd3_pack import pack_sd3_from_truncated_normalized
 from inference.image_generation.image_generator import ImageGenerator
 
@@ -70,6 +79,15 @@ def _active_phrases_from_mask(dataset, mask_row: torch.Tensor) -> list[str]:
         if m[pid].item() > 0:
             out.append(props.pid_to_property[pid])
     return out
+
+
+def _first_active_pid(mask_row: torch.Tensor) -> int | None:
+    """Property id of the first active attribute, matching ``_active_phrases_from_mask`` order."""
+    m = mask_row.flatten().long()
+    for pid in range(m.numel()):
+        if m[pid].item() > 0:
+            return pid
+    return None
 
 
 def _write_placeholder_png(path: Path) -> None:
@@ -111,6 +129,7 @@ def run_image_benchmark(
         "prompt_only",
     ),
     skip_lpips: bool = False,
+    skip_pixel_metrics: bool = False,
     ridge_lambda: float = 1e-2,
     skip_dino: bool = True,
     dino_device: str | None = None,
@@ -122,6 +141,9 @@ def run_image_benchmark(
     output_dir.mkdir(parents=True, exist_ok=True)
     img_root = output_dir / "images"
     img_root.mkdir(exist_ok=True)
+    img_root_pre = output_dir / "images_pre_edit"
+    if locality_drop_one_attr:
+        img_root_pre.mkdir(exist_ok=True)
 
     methods = _sort_methods(methods)
 
@@ -175,6 +197,9 @@ def run_image_benchmark(
         x_tgt = x_tgt.unsqueeze(0).to(dev_dec).float()
         mask_row_ds = mask_row_ds.to(dev_dec)
 
+        do_locality = locality_drop_one_attr and len(attrs) > 1
+        residual_prompt = ", ".join(attrs[1:]) if do_locality else ""
+
         pred_ssae = predict_embedding_compositional(
             decoder,
             model_name,
@@ -193,6 +218,24 @@ def run_image_benchmark(
 
         pred_ridge = predict_linear(M_row_cpu, W_ridge).to(dev_dec)
         mse_ridge = torch.nn.functional.mse_loss(pred_ridge, x_tgt).item()
+
+        pred_ssae_pre = pred_ma_pre = pred_ridge_pre = None
+        if do_locality:
+            edit_pid = _first_active_pid(mask_t)
+            mask_pre_ds = mask_row_ds.clone()
+            mask_pre_ds[edit_pid] = 0
+            pred_ssae_pre = predict_embedding_compositional(
+                decoder,
+                model_name,
+                mask_pre_ds,
+                mask_reduced_train=train_mask,
+                n_repeat=n_repeat,
+                device=dev_dec,
+                block_means=block_means,
+            )
+            M_pre_cpu = mask_pre_ds.float().cpu().unsqueeze(0)
+            pred_ma_pre = predict_mean_arithmetic(mu_ma, deltas_ma, M_pre_cpu).to(dev_dec)
+            pred_ridge_pre = predict_linear(M_pre_cpu, W_ridge).to(dev_dec)
 
         for method in methods:
             out_path = img_root / method / f"{idx:05d}.png"
@@ -238,6 +281,10 @@ def run_image_benchmark(
                 "cosine_embedding_vs_gt": "",
                 "dino_cosine_vs_gt_embed": "",
                 "clip_image_vs_residual_prompt": "",
+                "mse_pixel_vs_gt_embed": "",
+                "ssim_vs_gt_embed": "",
+                "mse_pixel_pre_post_edit": "",
+                "ssim_pre_post_edit": "",
             }
             if method == "ssae_compose":
                 row["mse_embedding_vs_gt"] = mse_ssae
@@ -255,8 +302,7 @@ def run_image_benchmark(
                 row["clip_mean_vs_attrs"] = al["mean_cosine_attr"]
                 row["clip_min_vs_attrs"] = al["min_cosine_attr"]
                 row["clip_fail"] = float(row["clip_image_vs_full_prompt"] < clip_failure_threshold)
-                if locality_drop_one_attr and len(attrs) > 1:
-                    residual_prompt = ", ".join(attrs[1:])
+                if do_locality:
                     row["clip_image_vs_residual_prompt"] = clip_scorer.image_text_cosine(
                         out_path, residual_prompt
                     )
@@ -284,6 +330,52 @@ def run_image_benchmark(
                 row["lpips_vs_gt_embed"] = lp if lp is not None else ""
             else:
                 row["lpips_vs_gt_embed"] = ""
+
+            if (
+                not skip_pixel_metrics
+                and method != "gt_embed"
+                and idx in ref_paths
+                and not simulated
+            ):
+                row["mse_pixel_vs_gt_embed"] = pixel_mse(ref_paths[idx], out_path)
+                row["ssim_vs_gt_embed"] = ssim(ref_paths[idx], out_path)
+
+            if do_locality and method != "gt_embed":
+                pre_path = img_root_pre / method / f"{idx:05d}.png"
+                pre_path.parent.mkdir(parents=True, exist_ok=True)
+
+                if method == "prompt_only":
+                    pe_pre, pp_pre = None, None
+                elif method == "ssae_compose":
+                    pe_pre, pp_pre = pack_sd3_from_truncated_normalized(
+                        holdout_ds, idx, pred_ssae_pre.detach().cpu()
+                    )
+                elif method == "mean_arithmetic":
+                    pe_pre, pp_pre = pack_sd3_from_truncated_normalized(
+                        holdout_ds, idx, pred_ma_pre.cpu()
+                    )
+                elif method == "ridge_embed":
+                    pe_pre, pp_pre = pack_sd3_from_truncated_normalized(
+                        holdout_ds, idx, pred_ridge_pre.cpu()
+                    )
+                else:
+                    raise ValueError(f"Unknown method {method}")
+
+                if not simulated:
+                    if method == "prompt_only":
+                        gen.generate_image_from_prompt(
+                            residual_prompt, pre_path, use_negative_prompts=False, seed=seed_i
+                        )
+                    else:
+                        pe_pre = pe_pre.to(sd_device)
+                        pp_pre = pp_pre.to(sd_device)
+                        gen.generate_image_from_embd(pe_pre, pp_pre, pre_path, seed=seed_i)
+                else:
+                    _write_placeholder_png(pre_path)
+
+                if not skip_pixel_metrics and not simulated:
+                    row["mse_pixel_pre_post_edit"] = pixel_mse(pre_path, out_path)
+                    row["ssim_pre_post_edit"] = ssim(pre_path, out_path)
 
             rows.append(row)
 
@@ -371,6 +463,27 @@ def _aggregate_summary(
             if r.get("clip_image_vs_residual_prompt") != ""
             and r["clip_image_vs_residual_prompt"] is not None
         ]
+        mse_pixel_vals = [
+            float(r["mse_pixel_vs_gt_embed"])
+            for r in xs
+            if r.get("mse_pixel_vs_gt_embed") != "" and r["mse_pixel_vs_gt_embed"] is not None
+        ]
+        ssim_vals = [
+            float(r["ssim_vs_gt_embed"])
+            for r in xs
+            if r.get("ssim_vs_gt_embed") != "" and r["ssim_vs_gt_embed"] is not None
+        ]
+        mse_pre_post_vals = [
+            float(r["mse_pixel_pre_post_edit"])
+            for r in xs
+            if r.get("mse_pixel_pre_post_edit") != ""
+            and r["mse_pixel_pre_post_edit"] is not None
+        ]
+        ssim_pre_post_vals = [
+            float(r["ssim_pre_post_edit"])
+            for r in xs
+            if r.get("ssim_pre_post_edit") != "" and r["ssim_pre_post_edit"] is not None
+        ]
 
         seed_m = base_seed + 17 * mi
         out["per_method"][m] = {
@@ -382,6 +495,10 @@ def _aggregate_summary(
             "lpips_vs_gt_embed": _ci_dict(lpips_vals, n_bootstrap, seed_m + 5),
             "dino_cosine_vs_gt_embed": _ci_dict(dino_vals, n_bootstrap, seed_m + 7),
             "clip_image_vs_residual_prompt": _ci_dict(resid_vals, n_bootstrap, seed_m + 9),
+            "mse_pixel_vs_gt_embed": _ci_dict(mse_pixel_vals, n_bootstrap, seed_m + 11),
+            "ssim_vs_gt_embed": _ci_dict(ssim_vals, n_bootstrap, seed_m + 13),
+            "mse_pixel_pre_post_edit": _ci_dict(mse_pre_post_vals, n_bootstrap, seed_m + 15),
+            "ssim_pre_post_edit": _ci_dict(ssim_pre_post_vals, n_bootstrap, seed_m + 17),
         }
 
     return out
@@ -405,6 +522,11 @@ def main() -> None:
         default="gt_embed,ssae_compose,mean_arithmetic,ridge_embed,prompt_only",
     )
     p.add_argument("--skip_lpips", action="store_true")
+    p.add_argument(
+        "--skip_pixel_metrics",
+        action="store_true",
+        help="Skip pixel-space MSE/SSIM vs gt_embed reference image.",
+    )
     p.add_argument("--ridge_lambda", type=float, default=1e-2)
     p.add_argument(
         "--dino",
@@ -415,7 +537,11 @@ def main() -> None:
     p.add_argument(
         "--locality_drop_one_attr",
         action="store_true",
-        help="CLIP image vs prompt with the first attribute phrase removed (locality proxy).",
+        help=(
+            "Locality proxy: CLIP image vs prompt with the first attribute phrase removed, "
+            "plus a same-seed pre-edit render per method and pixel MSE/SSIM vs the post-edit "
+            "image (edit surgical-ness)."
+        ),
     )
     args = p.parse_args()
 
@@ -433,6 +559,7 @@ def main() -> None:
         n_bootstrap=args.n_bootstrap,
         methods=methods,
         skip_lpips=args.skip_lpips,
+        skip_pixel_metrics=args.skip_pixel_metrics,
         ridge_lambda=args.ridge_lambda,
         skip_dino=not args.dino,
         dino_device=args.dino_device,

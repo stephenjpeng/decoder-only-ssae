@@ -7,7 +7,7 @@ training:
     model_name: "model_avg_feature"
     using_blocs: False
   dataloader:
-    folder_path: "results/mps_run/"
+    folder_path: "results/compositional_split/train/"
     truncate_n_prompts: null
     truncate_embds_topk: 1000
     add_property_is_the_same: True

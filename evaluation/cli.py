@@ -25,7 +25,10 @@ def main() -> None:
         "decorrelation_plot", help="Save concept cosine heatmap PNG from a checkpoint"
     )
     sub.add_parser("copy_truncation", help="Copy indices / min-max JSONs train -> holdout")
-    sub.add_parser("image_benchmark", help="SD3 images + CLIP/LPIPS/DINO vs baselines")
+    sub.add_parser("image_benchmark", help="SD3 images + CLIP/LPIPS/DINO/MSE/SSIM vs baselines")
+    sub.add_parser(
+        "magnitude_sensitivity", help="Concept-strength sweep: non-binary mask values"
+    )
     sub.add_parser("vlm_openai_batch", help="OpenAI vision judge on image_benchmark output")
     sub.add_parser("clip_probe", help="Train CLIP linear probe; eval on benchmark images")
     sub.add_parser("edit_summary", help="Aggregate per_sample.csv by edit_type manifest")
@@ -49,6 +52,8 @@ def main() -> None:
         sys.exit(_run("evaluation.run_copy_truncation", rest))
     if args.cmd == "image_benchmark":
         sys.exit(_run("evaluation.run_image_benchmark", rest))
+    if args.cmd == "magnitude_sensitivity":
+        sys.exit(_run("evaluation.run_magnitude_sensitivity", rest))
     if args.cmd == "vlm_openai_batch":
         sys.exit(_run("evaluation.run_vlm_openai_batch", rest))
     if args.cmd == "clip_probe":
