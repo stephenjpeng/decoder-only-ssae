@@ -1,0 +1,159 @@
+# Compositional Holdout Runbook
+
+End-to-end steps to generate prompts, extract embeddings, train, and evaluate the SSAE with a compositional (combinatorial) holdout split — i.e. whole property-combination tuples withheld from training, so evaluation tests generalization to unseen combinations rather than a random row-level split.
+
+Normal (non-split) training via `generate_prompts.py` does not hold out any combinations — every prompt goes into training. Use this runbook only when you specifically want a compositional-generalization experiment.
+
+## 1. Generate a disjoint train/holdout prompt split
+
+Skip `generate_prompts.py`. Use `dataset_generation/compositional_split.py`, which enumerates the full Cartesian product of `categories_with_properties.json`, shuffles by seed, and carves out whole tuples for holdout with an explicit disjointness check.
+
+```bash
+python dataset_generation/compositional_split.py \
+    --categories_json dataset_generation/prompts/input/categories_with_properties.json \
+    --output_root results/compositional_split \
+    --holdout_fraction 0.1 \
+    --seed 0 \
+    --properties_same_json results/mps_run/properties_same.json
+```
+
+- `--holdout_fraction` and `--n_holdout` are mutually exclusive (pick one).
+- `--properties_same_json` is not required by the script but **is required downstream** — see Gotchas below. Pass it here so it's copied into both output folders automatically.
+- Optional: `--max_train_prompts` / `--max_holdout_prompts` to cap dataset size after the split (subsampling only shrinks each side; never moves a tuple across the boundary).
+
+Output: `results/compositional_split/train/` and `.../holdout/`, each with `prompts.json` (includes a `tuple_key` field per prompt), `properties.json`, `metadata.json`, `{split}_tuples.json`, and (if passed) `properties_same.json`. Also `results/compositional_split/split_manifest.json` — a disjointness certificate with tuple counts; check `holdout_disjoint_from_train: true` and eyeball `n_train_written`/`n_holdout_written` for sane category coverage, especially if any category has few property values.
+
+## 2. Extract embeddings for both splits separately
+
+Run `get_embeddings.py` twice, once per split, pointing `--out` at the split folders so their `properties.json`/`properties_same.json` are preserved (the script does not clobber an existing `properties.json`):
+
+```bash
+python get_embeddings.py --backbone <name> \
+    --prompts results/compositional_split/train/prompts.json \
+    --out results/compositional_split/train
+
+python get_embeddings.py --backbone <name> \
+    --prompts results/compositional_split/holdout/prompts.json \
+    --out results/compositional_split/holdout
+```
+
+Output layout per folder: `prompts.json`, `properties.json`, `embds/manifest.json`, `embds/embds_<i>/{prompts.txt, <stream>.h5}`.
+
+## 3. Train on the train split only
+
+`training_cli.py` has no `--folder_path` flag — `folder_path` comes from the YAML. Copy `trainings/config/params_default.yaml` and set:
+
+```yaml
+dataloader:
+  folder_path: "results/compositional_split/train"
+```
+
+Do not point `folder_path` at the holdout folder. Then:
+
+```bash
+python training_cli.py \
+    --output_folder results/my_compositional_run \
+    --path_yaml trainings/config/params_default.yaml \
+    --overwrite_output True
+```
+
+Note `--overwrite_output` is `type=bool` in argparse — any non-empty string is truthy, so pass `True`/`False` literally.
+
+## 4. Copy truncation/normalization sidecars to holdout
+
+Holdout embeddings must use the same top-k truncation and normalization stats as train (`dim_output` is derived from the dataset, not the YAML). Run before any holdout evaluation:
+
+```bash
+python -m evaluation.run_copy_truncation \
+    --train_folder results/compositional_split/train \
+    --holdout_folder results/compositional_split/holdout
+```
+
+## 5. Run experiments against the holdout set
+
+**Compositional embedding reconstruction** — predicts each holdout embedding from per-property block means learned during training, decoded through the trained `W`:
+
+```bash
+python -m evaluation.run_compositional_embeddings \
+    --checkpoint results/my_compositional_run \
+    --holdout_folder results/compositional_split/holdout \
+    --output_json results/compositional_split/compositional_metrics.json
+```
+
+**Baselines** (mean-arithmetic / ridge / PCA) for comparison:
+
+```bash
+python -m baselines.run_baselines \
+    --checkpoint results/my_compositional_run \
+    --train_folder results/compositional_split/train \
+    --holdout_folder results/compositional_split/holdout \
+    --output_json results/compositional_split/baseline_metrics.json
+```
+
+**Image benchmark** (renders SD3 images, scores CLIP/LPIPS/DINO/pixel metrics):
+
+```bash
+python -m evaluation.run_image_benchmark \
+    --checkpoint results/my_compositional_run \
+    --holdout_folder results/compositional_split/holdout \
+    --output_dir results/bench_out \
+    --dino --locality_drop_one_attr
+```
+
+**Concept-strength / magnitude sensitivity** (works on either split; general diagnostic, not compositional-specific):
+
+```bash
+python -m evaluation.run_magnitude_sensitivity \
+    --checkpoint results/my_compositional_run \
+    --data_folder results/compositional_split/holdout \
+    --output_dir results/mag_out \
+    --concepts "holding a gun" \
+    --magnitudes -10,-2,-1,0,1,2,5,10
+```
+
+The same table (with current defaults for `ridge_lambda`, `n_bootstrap`, etc.) is also in `README.md` under "Evaluation & benchmarks" — check there for anything that's drifted since this runbook was written.
+
+## Gotchas
+
+- **Missing `properties_same.json` at train time.** `H5Dataset` always constructs `SameId`, which unconditionally requires `<folder_path>/properties_same.json` (`trainings/dataloader/properties/same_id.py:101`) and hard-checks its keys match your categories exactly. `compositional_split.py` only writes this file if `--properties_same_json` is passed — otherwise training fails with `FileNotFoundError`. Fix: pass `--properties_same_json` when running the split (recommended, see Step 1), or copy an existing one manually into both `train/` and `holdout/`:
+  ```bash
+  cp results/mps_run/properties_same.json results/compositional_split/train/properties_same.json
+  cp results/mps_run/properties_same.json results/compositional_split/holdout/properties_same.json
+  ```
+  Only reuse an existing `properties_same.json` if its category keys match your current `categories_with_properties.json` exactly. An all-`false` file (one key per category, value `false`) is a safe default meaning "never treat any prompt as same-id" — use this if you're not using the same-id feature.
+- **Missing embeddings manifest.** `MissingManifestError: No manifest.json at .../embds/manifest.json` means embeddings haven't been extracted yet for that folder, or `--out` pointed somewhere other than where `training_cli.py`'s YAML `folder_path` expects. Re-run `get_embeddings.py` with `--out` matching the YAML's `dataloader.folder_path`.
+- **Never train on the holdout folder.** There is no code-level guard against this — it's enforced only by convention (point `folder_path` at `train/`, never `holdout/`).
+
+## Interpreting `run_compositional_embeddings.py` output
+
+Output is one JSON dict: `checkpoint`, `holdout_folder`, `model_name`, `n_holdout`, `mse_mean`, `cosine_mean`, then two large per-sample arrays `per_index_mse`/`per_index_cosine`. The summary scalars print *before* the arrays — if a run appears to have "no summary stats," it's almost always the per-sample arrays flooding terminal scrollback, not a missing value. Isolate the scalars directly:
+
+```bash
+python3 -c "import json; d=json.load(open('results/compositional_split/compositional_metrics.json')); print({k: d[k] for k in ('mse_mean','cosine_mean','n_holdout')})"
+```
+
+## Interpreting `run_baselines.py` output
+
+```json
+{
+  "train_folder": "...",
+  "holdout_folder": "...",
+  "mean_arithmetic": {"mse_mean": ..., "cosine_mean": ...},
+  "ridge": {"mse_mean": ..., "cosine_mean": ..., "lambda": ...},
+  "pca": {"mse_mean": ..., "cosine_mean": ..., "k": ...}
+}
+```
+
+| Baseline | What it computes | How to read it |
+|---|---|---|
+| `mean_arithmetic` | Global mean + independently-fit per-property delta vectors (present-mean minus absent-mean), summed over active properties. | Simplest additive hypothesis: property effects are independent and just add. A floor, not a competitor. |
+| `ridge` | Single ridge regression jointly fit from the binary property mask (+ intercept) to the embedding, on train; applied to holdout masks. | Still linear in the mask, but jointly fit rather than independently per property — a meaningfully stronger linear baseline than mean-arithmetic. |
+| `pca` | Unsupervised PCA basis fit on train embeddings, then the **true holdout embedding** is projected onto that basis and reconstructed — it never uses property masks and it "sees" the answer. | Not a fair prediction baseline. It's a floor: the best reconstruction error achievable by any k-dim linear subspace given perfect knowledge of the target. Useful only as a reference ceiling on achievable performance, not a thing to "beat" in the usual sense. |
+
+Metrics: `mse_mean` (lower is better, scale depends on embedding normalization) and `cosine_mean` (higher is better, robust to overall scale).
+
+**Comparing the SSAE against these baselines is not a clean apples-to-apples test of expressiveness**, because of how `evaluation/composition.py` builds holdout predictions for `model_trainable_inputs`: property block means are averaged marginally per single property (never per co-occurring tuple), placed into disjoint per-property feature slices, then passed through a pointwise `ReLU` and a single shared linear decoder. Since ReLU is pointwise and blocks never overlap, the result collapses algebraically to `const + sum over active properties of (per-property vector)` — structurally identical to `mean_arithmetic`. This means:
+
+- A near-tie between SSAE and `ridge` does **not** imply the two models are equivalent in general. It means the compositional-holdout evaluation method itself is incapable of expressing property interactions for unseen combinations, regardless of what the trained `Y`/`W` actually encode for combinations seen during training.
+- To check whether the SSAE captures real interaction structure that this eval discards, compare **training-set reconstruction** (using actual per-prompt `Y` rows, not block means) against `ridge`/`mean_arithmetic` fit on the same train data. If the SSAE clearly wins there, the interaction structure exists but doesn't currently transfer to holdout composition via this method.
+- A genuinely more informative compositional predictor would use pairwise (or higher-order) co-occurrence means where available in train, rather than only single-property marginals — not currently implemented in `evaluation/composition.py`.
