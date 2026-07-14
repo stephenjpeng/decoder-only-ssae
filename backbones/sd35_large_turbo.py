@@ -60,8 +60,8 @@ class Sd35LargeTurboBackbone(Backbone):
             transformer=transformer,
             text_encoder_3=t5,
             torch_dtype=torch.bfloat16,
-            device_map="balanced",
         )
+        self.pipeline.to(self.device)
         try:
             self.pipeline.enable_xformers_memory_efficient_attention()
         except (ModuleNotFoundError, AttributeError):
