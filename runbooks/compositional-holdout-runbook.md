@@ -14,7 +14,7 @@ python dataset_generation/compositional_split.py \
     --output_root results/compositional_split \
     --holdout_fraction 0.1 \
     --seed 0 \
-    --properties_same_json results/mps_run/properties_same.json
+    --properties_same_json dataset_generation/prompts/input/properties_same.json
 ```
 
 - `--holdout_fraction` and `--n_holdout` are mutually exclusive (pick one).
@@ -117,10 +117,10 @@ The same table (with current defaults for `ridge_lambda`, `n_bootstrap`, etc.) i
 
 - **Missing `properties_same.json` at train time.** `H5Dataset` always constructs `SameId`, which unconditionally requires `<folder_path>/properties_same.json` (`trainings/dataloader/properties/same_id.py:101`) and hard-checks its keys match your categories exactly. `compositional_split.py` only writes this file if `--properties_same_json` is passed — otherwise training fails with `FileNotFoundError`. Fix: pass `--properties_same_json` when running the split (recommended, see Step 1), or copy an existing one manually into both `train/` and `holdout/`:
   ```bash
-  cp results/mps_run/properties_same.json results/compositional_split/train/properties_same.json
-  cp results/mps_run/properties_same.json results/compositional_split/holdout/properties_same.json
+  cp dataset_generation/prompts/input/properties_same.json results/compositional_split/train/properties_same.json
+  cp dataset_generation/prompts/input/properties_same.json results/compositional_split/holdout/properties_same.json
   ```
-  Only reuse an existing `properties_same.json` if its category keys match your current `categories_with_properties.json` exactly. An all-`false` file (one key per category, value `false`) is a safe default meaning "never treat any prompt as same-id" — use this if you're not using the same-id feature.
+  An all-`false` example matching the current `categories_with_properties.json` keys (`hair`, `eyes`, `situation`, `t_shirt`, `hat`, `action`, `pose`) is checked in at `dataset_generation/prompts/input/properties_same.json` — `false` per category is a safe default meaning "never treat any prompt as same-id," for when you're not using the same-id feature. Only reuse it as-is if your categories match those keys exactly; otherwise regenerate it with the same schema (one key per category, `false` or a list of "same" property names — see `trainings/dataloader/properties/same_id.py` for how non-`false` values are consumed).
 - **Missing embeddings manifest.** `MissingManifestError: No manifest.json at .../embds/manifest.json` means embeddings haven't been extracted yet for that folder, or `--out` pointed somewhere other than where `training_cli.py`'s YAML `folder_path` expects. Re-run `get_embeddings.py` with `--out` matching the YAML's `dataloader.folder_path`.
 - **Never train on the holdout folder.** There is no code-level guard against this — it's enforced only by convention (point `folder_path` at `train/`, never `holdout/`).
 
