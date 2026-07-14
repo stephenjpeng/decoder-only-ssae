@@ -72,7 +72,15 @@ class ImageGenerator:
             torch_dtype=torch.bfloat16,
         )
 
-        self.pipeline.enable_model_cpu_offload()
+        # NF4-quantized modules (transformer, text_encoder_3) are pinned to
+        # GPU by bitsandbytes at load time and refuse .to(). Both
+        # enable_model_cpu_offload and pipeline.to() try to move them and
+        # fail on current bnb + diffusers. Move only the non-quantized
+        # components so every call site finds tensors on the same device.
+        for attr in ("text_encoder", "text_encoder_2", "vae"):
+            module = getattr(self.pipeline, attr, None)
+            if module is not None:
+                module.to(self.device)
 
     @torch.no_grad()
     def generate_image_from_prompt(
