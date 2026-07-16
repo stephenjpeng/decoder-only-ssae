@@ -159,6 +159,7 @@ def run_image_benchmark(
     simulated: bool = False,
     sd_device: str = "cuda",
     ssae_device: str | None = None,
+    baseline_device: str | None = None,
     clip_device: str | None = None,
     clip_failure_threshold: float = 0.2,
     n_bootstrap: int = 2000,
@@ -178,6 +179,7 @@ def run_image_benchmark(
     locality_swap_one_attr: bool = False,
 ) -> dict:
     ssae_device = ssae_device or sd_device
+    baseline_device = baseline_device or ssae_device
     clip_device = clip_device or ("cuda" if torch.cuda.is_available() else "cpu")
     holdout_folder = Path(ensure_folder_path(holdout_folder))
     output_dir = Path(output_dir)
@@ -200,6 +202,7 @@ def run_image_benchmark(
     model_name = tp["model_name"]
     n_repeat = int(tp["n_repeat"])
     dev_dec = torch.device(ssae_device)
+    dev_base = torch.device(baseline_device)
 
     block_means = None
     train_mask = train_ds.mask_reduced.to(dev_dec)
@@ -244,6 +247,7 @@ def run_image_benchmark(
 
         x_tgt, mask_row_ds = holdout_ds[idx]
         x_tgt = x_tgt.unsqueeze(0).to(dev_dec).float()
+        x_tgt_base = x_tgt if dev_base == dev_dec else x_tgt.to(dev_base)
         mask_row_ds = mask_row_ds.to(dev_dec)
 
         sample_rng = random.Random(base_seed + idx)
@@ -299,11 +303,11 @@ def run_image_benchmark(
         cos_ssae = torch.nn.functional.cosine_similarity(pred_ssae, x_tgt, dim=-1).mean().item()
 
         M_row_cpu = mask_row_ds.float().cpu().unsqueeze(0)
-        pred_ma = predict_mean_arithmetic(mu_ma, deltas_ma, M_row_cpu).to(dev_dec)
-        mse_ma = torch.nn.functional.mse_loss(pred_ma, x_tgt).item()
+        pred_ma = predict_mean_arithmetic(mu_ma, deltas_ma, M_row_cpu).to(dev_base)
+        mse_ma = torch.nn.functional.mse_loss(pred_ma, x_tgt_base).item()
 
-        pred_ridge = predict_linear(M_row_cpu, W_ridge).to(dev_dec)
-        mse_ridge = torch.nn.functional.mse_loss(pred_ridge, x_tgt).item()
+        pred_ridge = predict_linear(M_row_cpu, W_ridge).to(dev_base)
+        mse_ridge = torch.nn.functional.mse_loss(pred_ridge, x_tgt_base).item()
 
         pred_ssae_pre = pred_ma_pre = pred_ridge_pre = None
         if do_drop:
@@ -319,8 +323,8 @@ def run_image_benchmark(
                 block_means=block_means,
             )
             M_pre_cpu = mask_pre_ds.float().cpu().unsqueeze(0)
-            pred_ma_pre = predict_mean_arithmetic(mu_ma, deltas_ma, M_pre_cpu).to(dev_dec)
-            pred_ridge_pre = predict_linear(M_pre_cpu, W_ridge).to(dev_dec)
+            pred_ma_pre = predict_mean_arithmetic(mu_ma, deltas_ma, M_pre_cpu).to(dev_base)
+            pred_ridge_pre = predict_linear(M_pre_cpu, W_ridge).to(dev_base)
 
         pred_ssae_swap = pred_ma_swap = pred_ridge_swap = None
         if do_swap:
@@ -338,8 +342,8 @@ def run_image_benchmark(
                 block_means=block_means,
             )
             M_swap_cpu = mask_swap_ds.float().cpu().unsqueeze(0)
-            pred_ma_swap = predict_mean_arithmetic(mu_ma, deltas_ma, M_swap_cpu).to(dev_dec)
-            pred_ridge_swap = predict_linear(M_swap_cpu, W_ridge).to(dev_dec)
+            pred_ma_swap = predict_mean_arithmetic(mu_ma, deltas_ma, M_swap_cpu).to(dev_base)
+            pred_ridge_swap = predict_linear(M_swap_cpu, W_ridge).to(dev_base)
 
         for method in methods:
             out_path = img_root / method / f"{idx:05d}.png"
@@ -699,6 +703,17 @@ def main() -> None:
             "(useful when the decoder is trained without top-k truncation)."
         ),
     )
+    p.add_argument(
+        "--baseline_device",
+        type=str,
+        default=None,
+        help=(
+            "Where to run the ridge / mean-arithmetic baseline predictions + MSE against "
+            "the holdout target. Fits always run on CPU regardless. Defaults to "
+            "--ssae_device; set to 'cpu' to keep the baselines fully off GPU even when "
+            "the SSAE runs on CUDA."
+        ),
+    )
     p.add_argument("--clip_device", type=str, default=None)
     p.add_argument("--clip_failure_threshold", type=float, default=0.2)
     p.add_argument("--n_bootstrap", type=int, default=2000)
@@ -754,6 +769,7 @@ def main() -> None:
         simulated=args.simulated,
         sd_device=args.sd_device,
         ssae_device=args.ssae_device,
+        baseline_device=args.baseline_device,
         clip_device=args.clip_device,
         clip_failure_threshold=args.clip_failure_threshold,
         n_bootstrap=args.n_bootstrap,
