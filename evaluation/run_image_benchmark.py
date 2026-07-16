@@ -6,22 +6,31 @@ and **ridge** embedding baselines, and **prompt-only** generation. Uses matched 
 sample (deterministic in ``base_seed``). Per-method image similarity vs. the ``gt_embed``
 rendering is reported via CLIP, LPIPS, DINO cosine, and pixel-space MSE/SSIM.
 
-With ``--locality_drop_one_attr``, also renders a same-seed **pre-edit** image per method
-(target attribute's mask bit zeroed / phrase dropped from the prompt) and reports pixel-space
-MSE/SSIM between the pre- and post-edit renders as an "edit surgical-ness" proxy: a method
-that only changes pixels tied to the edited attribute should score low MSE / high SSIM here.
+Locality tests (both optional; independently enable-able in the same run). A single
+attribute is randomly sampled per holdout row (seeded by ``base_seed + idx`` so the pick
+is reproducible), shared between the two tests when both are on:
+
+* ``--locality_drop_one_attr``: renders a same-seed **pre-edit** image per method with
+  the chosen attribute's mask bit zeroed (or its phrase dropped from the prompt for
+  ``prompt_only``). Reports pixel MSE/SSIM between the pre- and post-edit renders as an
+  "edit surgical-ness" proxy under attribute removal.
+* ``--locality_swap_one_attr``: renders a same-seed **swap** image per method with the
+  chosen attribute's mask bit flipped to a different property in the same category (e.g.
+  blond -> brunette), or the corresponding phrase substituted in the prompt for
+  ``prompt_only``. Reports pixel MSE/SSIM between the swap and normal renders (surgical-
+  ness under a value swap) and CLIP alignment of the swap image against the swapped prompt.
 
 Writes ``per_sample.csv``, ``summary.json``, and PNGs under ``<output>/images/<method>/``
-(post-edit) and ``<output>/images_pre_edit/<method>/`` (pre-edit, only with
-``--locality_drop_one_attr``).
+(post-edit), ``<output>/images_pre_edit/<method>/`` (only with ``--locality_drop_one_attr``),
+and ``<output>/images_swapped/<method>/`` (only with ``--locality_swap_one_attr``).
 """
 
 from __future__ import annotations
 
 import argparse
 import csv
-import hashlib
 import json
+import random
 from collections import defaultdict
 from pathlib import Path
 
@@ -81,13 +90,25 @@ def _active_phrases_from_mask(dataset, mask_row: torch.Tensor) -> list[str]:
     return out
 
 
-def _first_active_pid(mask_row: torch.Tensor) -> int | None:
-    """Property id of the first active attribute, matching ``_active_phrases_from_mask`` order."""
+def _choose_edit_pid(mask_row: torch.Tensor, rng: random.Random) -> int | None:
+    """Randomly sample one active-property id from ``mask_row``. None if no attribute is active."""
     m = mask_row.flatten().long()
-    for pid in range(m.numel()):
-        if m[pid].item() > 0:
-            return pid
-    return None
+    active = [pid for pid in range(m.numel()) if m[pid].item() > 0]
+    if not active:
+        return None
+    return rng.choice(active)
+
+
+def _choose_swap_target_pid(
+    dataset, active_pid: int, rng: random.Random
+) -> int | None:
+    """Return a random pid in the same category as ``active_pid`` but different from it, or None."""
+    props = dataset.properties
+    cid = props.pid_to_cid[active_pid]
+    alternatives = [p for p in props.cid_to_pids[cid] if p != active_pid]
+    if not alternatives:
+        return None
+    return rng.choice(alternatives)
 
 
 def _write_placeholder_png(path: Path) -> None:
@@ -97,9 +118,8 @@ def _write_placeholder_png(path: Path) -> None:
     Image.new("RGB", (224, 224), color=(120, 120, 120)).save(path)
 
 
-def _sample_seed(base_seed: int, idx: int, method: str) -> int:
-    h = int.from_bytes(hashlib.md5(method.encode()).digest()[:4], "big")
-    return base_seed + idx * 1_000_003 + (h % 1_000_000)
+def _sample_seed(base_seed: int, idx: int) -> int:
+    return base_seed + idx * 1_000_003
 
 
 def _ci_dict(vals: list[float], n_boot: int, seed: int) -> dict:
@@ -134,6 +154,7 @@ def run_image_benchmark(
     skip_dino: bool = True,
     dino_device: str | None = None,
     locality_drop_one_attr: bool = False,
+    locality_swap_one_attr: bool = False,
 ) -> dict:
     clip_device = clip_device or ("cuda" if torch.cuda.is_available() else "cpu")
     holdout_folder = Path(ensure_folder_path(holdout_folder))
@@ -144,6 +165,9 @@ def run_image_benchmark(
     img_root_pre = output_dir / "images_pre_edit"
     if locality_drop_one_attr:
         img_root_pre.mkdir(exist_ok=True)
+    img_root_swap = output_dir / "images_swapped"
+    if locality_swap_one_attr:
+        img_root_swap.mkdir(exist_ok=True)
 
     methods = _sort_methods(methods)
 
@@ -192,13 +216,51 @@ def run_image_benchmark(
         mask_row = holdout_ds.properties.tid_to_rm[idx]
         mask_t = torch.tensor(mask_row, dtype=torch.int16, device=dev_dec)
         attrs = _active_phrases_from_mask(holdout_ds, mask_t.float())
+        active_pids_sorted = [
+            pid for pid in range(mask_t.numel()) if mask_t[pid].item() > 0
+        ]
 
         x_tgt, mask_row_ds = holdout_ds[idx]
         x_tgt = x_tgt.unsqueeze(0).to(dev_dec).float()
         mask_row_ds = mask_row_ds.to(dev_dec)
 
-        do_locality = locality_drop_one_attr and len(attrs) > 1
-        residual_prompt = ", ".join(attrs[1:]) if do_locality else ""
+        sample_rng = random.Random(base_seed + idx)
+        do_drop = locality_drop_one_attr and len(attrs) > 1
+        do_swap = locality_swap_one_attr and len(attrs) > 1
+
+        edit_pid: int | None = None
+        edit_attribute = ""
+        swap_target_pid: int | None = None
+        swap_target_attribute = ""
+        residual_prompt = ""
+        swapped_prompt = ""
+
+        if do_drop or do_swap:
+            edit_pid = _choose_edit_pid(mask_t, sample_rng)
+            if edit_pid is None:
+                do_drop = False
+                do_swap = False
+            else:
+                edit_attribute = holdout_ds.properties.pid_to_property[edit_pid]
+                edit_position = active_pids_sorted.index(edit_pid)
+                if do_drop:
+                    residual_prompt = ", ".join(
+                        a for i, a in enumerate(attrs) if i != edit_position
+                    )
+                if do_swap:
+                    swap_target_pid = _choose_swap_target_pid(
+                        holdout_ds, edit_pid, sample_rng
+                    )
+                    if swap_target_pid is None:
+                        # category has only one property, nothing to swap to
+                        do_swap = False
+                    else:
+                        swap_target_attribute = holdout_ds.properties.pid_to_property[
+                            swap_target_pid
+                        ]
+                        swapped_prompt = prompt_text.replace(
+                            edit_attribute, swap_target_attribute, 1
+                        )
 
         pred_ssae = predict_embedding_compositional(
             decoder,
@@ -220,8 +282,7 @@ def run_image_benchmark(
         mse_ridge = torch.nn.functional.mse_loss(pred_ridge, x_tgt).item()
 
         pred_ssae_pre = pred_ma_pre = pred_ridge_pre = None
-        if do_locality:
-            edit_pid = _first_active_pid(mask_t)
+        if do_drop:
             mask_pre_ds = mask_row_ds.clone()
             mask_pre_ds[edit_pid] = 0
             pred_ssae_pre = predict_embedding_compositional(
@@ -237,10 +298,28 @@ def run_image_benchmark(
             pred_ma_pre = predict_mean_arithmetic(mu_ma, deltas_ma, M_pre_cpu).to(dev_dec)
             pred_ridge_pre = predict_linear(M_pre_cpu, W_ridge).to(dev_dec)
 
+        pred_ssae_swap = pred_ma_swap = pred_ridge_swap = None
+        if do_swap:
+            mask_swap_ds = mask_row_ds.clone()
+            mask_swap_ds[edit_pid] = 0
+            mask_swap_ds[swap_target_pid] = 1
+            pred_ssae_swap = predict_embedding_compositional(
+                decoder,
+                model_name,
+                mask_swap_ds,
+                mask_reduced_train=train_mask,
+                n_repeat=n_repeat,
+                device=dev_dec,
+                block_means=block_means,
+            )
+            M_swap_cpu = mask_swap_ds.float().cpu().unsqueeze(0)
+            pred_ma_swap = predict_mean_arithmetic(mu_ma, deltas_ma, M_swap_cpu).to(dev_dec)
+            pred_ridge_swap = predict_linear(M_swap_cpu, W_ridge).to(dev_dec)
+
         for method in methods:
             out_path = img_root / method / f"{idx:05d}.png"
             out_path.parent.mkdir(parents=True, exist_ok=True)
-            seed_i = _sample_seed(base_seed, idx, method)
+            seed_i = _sample_seed(base_seed, idx)
 
             if method == "gt_embed":
                 pe, pp = pack_sd3_from_truncated_normalized(holdout_ds, idx, x_tgt.cpu())
@@ -277,6 +356,11 @@ def run_image_benchmark(
                 "sample_idx": idx,
                 "method": method,
                 "prompt": prompt_text,
+                "edit_pid": edit_pid if edit_pid is not None else "",
+                "edit_attribute": edit_attribute,
+                "swap_target_pid": swap_target_pid if swap_target_pid is not None else "",
+                "swap_target_attribute": swap_target_attribute,
+                "swapped_prompt": swapped_prompt,
                 "mse_embedding_vs_gt": "",
                 "cosine_embedding_vs_gt": "",
                 "dino_cosine_vs_gt_embed": "",
@@ -285,6 +369,9 @@ def run_image_benchmark(
                 "ssim_vs_gt_embed": "",
                 "mse_pixel_pre_post_edit": "",
                 "ssim_pre_post_edit": "",
+                "mse_pixel_swap_vs_normal": "",
+                "ssim_swap_vs_normal": "",
+                "clip_swap_image_vs_swapped_prompt": "",
             }
             if method == "ssae_compose":
                 row["mse_embedding_vs_gt"] = mse_ssae
@@ -302,7 +389,7 @@ def run_image_benchmark(
                 row["clip_mean_vs_attrs"] = al["mean_cosine_attr"]
                 row["clip_min_vs_attrs"] = al["min_cosine_attr"]
                 row["clip_fail"] = float(row["clip_image_vs_full_prompt"] < clip_failure_threshold)
-                if do_locality:
+                if do_drop:
                     row["clip_image_vs_residual_prompt"] = clip_scorer.image_text_cosine(
                         out_path, residual_prompt
                     )
@@ -340,7 +427,7 @@ def run_image_benchmark(
                 row["mse_pixel_vs_gt_embed"] = pixel_mse(ref_paths[idx], out_path)
                 row["ssim_vs_gt_embed"] = ssim(ref_paths[idx], out_path)
 
-            if do_locality and method != "gt_embed":
+            if do_drop and method != "gt_embed":
                 pre_path = img_root_pre / method / f"{idx:05d}.png"
                 pre_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -376,6 +463,48 @@ def run_image_benchmark(
                 if not skip_pixel_metrics and not simulated:
                     row["mse_pixel_pre_post_edit"] = pixel_mse(pre_path, out_path)
                     row["ssim_pre_post_edit"] = ssim(pre_path, out_path)
+
+            if do_swap and method != "gt_embed":
+                swap_path = img_root_swap / method / f"{idx:05d}.png"
+                swap_path.parent.mkdir(parents=True, exist_ok=True)
+
+                if method == "prompt_only":
+                    pe_sw, pp_sw = None, None
+                elif method == "ssae_compose":
+                    pe_sw, pp_sw = pack_sd3_from_truncated_normalized(
+                        holdout_ds, idx, pred_ssae_swap.detach().cpu()
+                    )
+                elif method == "mean_arithmetic":
+                    pe_sw, pp_sw = pack_sd3_from_truncated_normalized(
+                        holdout_ds, idx, pred_ma_swap.cpu()
+                    )
+                elif method == "ridge_embed":
+                    pe_sw, pp_sw = pack_sd3_from_truncated_normalized(
+                        holdout_ds, idx, pred_ridge_swap.cpu()
+                    )
+                else:
+                    raise ValueError(f"Unknown method {method}")
+
+                if not simulated:
+                    if method == "prompt_only":
+                        gen.generate_image_from_prompt(
+                            swapped_prompt, swap_path, use_negative_prompts=False, seed=seed_i
+                        )
+                    else:
+                        pe_sw = pe_sw.to(sd_device)
+                        pp_sw = pp_sw.to(sd_device)
+                        gen.generate_image_from_embd(pe_sw, pp_sw, swap_path, seed=seed_i)
+                else:
+                    _write_placeholder_png(swap_path)
+
+                if not skip_pixel_metrics and not simulated:
+                    row["mse_pixel_swap_vs_normal"] = pixel_mse(swap_path, out_path)
+                    row["ssim_swap_vs_normal"] = ssim(swap_path, out_path)
+
+                if clip_scorer is not None:
+                    row["clip_swap_image_vs_swapped_prompt"] = (
+                        clip_scorer.image_text_cosine(swap_path, swapped_prompt)
+                    )
 
             rows.append(row)
 
@@ -484,6 +613,23 @@ def _aggregate_summary(
             for r in xs
             if r.get("ssim_pre_post_edit") != "" and r["ssim_pre_post_edit"] is not None
         ]
+        mse_swap_vals = [
+            float(r["mse_pixel_swap_vs_normal"])
+            for r in xs
+            if r.get("mse_pixel_swap_vs_normal") != ""
+            and r["mse_pixel_swap_vs_normal"] is not None
+        ]
+        ssim_swap_vals = [
+            float(r["ssim_swap_vs_normal"])
+            for r in xs
+            if r.get("ssim_swap_vs_normal") != "" and r["ssim_swap_vs_normal"] is not None
+        ]
+        clip_swap_vals = [
+            float(r["clip_swap_image_vs_swapped_prompt"])
+            for r in xs
+            if r.get("clip_swap_image_vs_swapped_prompt") != ""
+            and r["clip_swap_image_vs_swapped_prompt"] is not None
+        ]
 
         seed_m = base_seed + 17 * mi
         out["per_method"][m] = {
@@ -499,6 +645,11 @@ def _aggregate_summary(
             "ssim_vs_gt_embed": _ci_dict(ssim_vals, n_bootstrap, seed_m + 13),
             "mse_pixel_pre_post_edit": _ci_dict(mse_pre_post_vals, n_bootstrap, seed_m + 15),
             "ssim_pre_post_edit": _ci_dict(ssim_pre_post_vals, n_bootstrap, seed_m + 17),
+            "mse_pixel_swap_vs_normal": _ci_dict(mse_swap_vals, n_bootstrap, seed_m + 19),
+            "ssim_swap_vs_normal": _ci_dict(ssim_swap_vals, n_bootstrap, seed_m + 21),
+            "clip_swap_image_vs_swapped_prompt": _ci_dict(
+                clip_swap_vals, n_bootstrap, seed_m + 23
+            ),
         }
 
     return out
@@ -538,9 +689,22 @@ def main() -> None:
         "--locality_drop_one_attr",
         action="store_true",
         help=(
-            "Locality proxy: CLIP image vs prompt with the first attribute phrase removed, "
-            "plus a same-seed pre-edit render per method and pixel MSE/SSIM vs the post-edit "
-            "image (edit surgical-ness)."
+            "Locality proxy under attribute removal. A single active attribute is randomly "
+            "sampled per sample (seeded by base_seed + idx). Renders a same-seed pre-edit "
+            "image per method with that attribute's mask bit zeroed / phrase dropped, and "
+            "reports CLIP-vs-residual-prompt on the normal image plus pixel MSE/SSIM between "
+            "the pre- and post-edit renders (edit surgical-ness)."
+        ),
+    )
+    p.add_argument(
+        "--locality_swap_one_attr",
+        action="store_true",
+        help=(
+            "Locality proxy under attribute value swap. Same random attribute pick as "
+            "--locality_drop_one_attr; instead of dropping, swap the value to a different "
+            "property in the same category (e.g. blond -> brunette). Renders a same-seed "
+            "swap image per method and reports pixel MSE/SSIM vs the normal render plus "
+            "CLIP alignment of the swap image against the swapped prompt."
         ),
     )
     args = p.parse_args()
@@ -564,6 +728,7 @@ def main() -> None:
         skip_dino=not args.dino,
         dino_device=args.dino_device,
         locality_drop_one_attr=args.locality_drop_one_attr,
+        locality_swap_one_attr=args.locality_swap_one_attr,
     )
     print(json.dumps(summary, indent=2))
 

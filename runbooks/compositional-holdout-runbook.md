@@ -97,8 +97,16 @@ python -m evaluation.run_image_benchmark \
     --checkpoint results/my_compositional_run \
     --holdout_folder results/compositional_split/holdout \
     --output_dir results/bench_out \
-    --dino --locality_drop_one_attr
+    --dino --locality_drop_one_attr --locality_swap_one_attr
 ```
+
+Both locality flags are independent and can be combined. For each sample with more than one active attribute, one active attribute is picked at random (seeded by `base_seed + idx` so the pick is reproducible), and the two flags each apply a different edit to that same attribute:
+
+- `--locality_drop_one_attr`: zeros the attribute's mask bit for the embedding methods, or drops its phrase from the prompt for `prompt_only`. Writes pre-edit images to `<output_dir>/images_pre_edit/<method>/` and adds `mse_pixel_pre_post_edit` / `ssim_pre_post_edit` per sample (surgical-ness under removal), plus `clip_image_vs_residual_prompt` on the normal image.
+- `--locality_swap_one_attr`: flips the attribute's mask bit to a random *different* property in the same category (e.g. blond → brunette), or substitutes the corresponding phrase in the prompt for `prompt_only`. Writes swap images to `<output_dir>/images_swapped/<method>/` and adds `mse_pixel_swap_vs_normal` / `ssim_swap_vs_normal` (surgical-ness under value swap) plus `clip_swap_image_vs_swapped_prompt` (did the swap image match the swapped prompt).
+- Both flags share the same `edit_pid` per sample, so drop and swap results are directly comparable when run together. The chosen attribute, its phrase, and the swap target (if any) are recorded per row in `per_sample.csv` as `edit_pid`, `edit_attribute`, `swap_target_pid`, `swap_target_attribute`, `swapped_prompt`.
+
+Categories with only one property (there's nothing to swap to) fall out of the swap test for those samples; they're still counted in the drop test.
 
 **Concept-strength / magnitude sensitivity** (works on either split; general diagnostic, not compositional-specific):
 
