@@ -37,8 +37,9 @@ def pack_sd3_from_truncated_normalized(
     x_denorm = dataset.denormalize(x.unsqueeze(0)).view(-1)
     idx = dataset.indices_truncate_embds_topk
     if idx is None:
-        raise ValueError("dataset.indices_truncate_embds_topk must be set for SD3 packing")
-    full_embd[idx] = x_denorm.to(full_embd.dtype)
+        full_embd = x_denorm.to(full_embd.dtype)
+    else:
+        full_embd[idx] = x_denorm.to(full_embd.dtype)
 
     embd = full_embd[:-2048].reshape(1, 333, 4096).to(torch.bfloat16)
     pooled = full_embd[-2048:].unsqueeze(0).to(torch.bfloat16)
