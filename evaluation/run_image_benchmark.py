@@ -258,8 +258,9 @@ def run_image_benchmark(
                         swap_target_attribute = holdout_ds.properties.pid_to_property[
                             swap_target_pid
                         ]
-                        swapped_prompt = prompt_text.replace(
-                            edit_attribute, swap_target_attribute, 1
+                        swapped_prompt = ", ".join(
+                            swap_target_attribute if i == edit_position else a
+                            for i, a in enumerate(attrs)
                         )
 
         pred_ssae = predict_embedding_compositional(
