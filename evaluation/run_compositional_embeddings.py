@@ -21,42 +21,44 @@ def compositional_holdout_metrics(
     holdout_folder: Path | str,
     *,
     device: str | None = None,
+    ssae_device: str | None = None,
 ) -> dict:
     if device is None:
         device = "cuda" if torch.cuda.is_available() else "cpu"
     dev = torch.device(device)
+    dev_dec = torch.device(ssae_device) if ssae_device else dev
 
     holdout_folder = ensure_folder_path(holdout_folder)
 
-    decoder, tp, train_dataset = load_decoder_checkpoint(checkpoint_dir, device=device)
+    decoder, tp, train_dataset = load_decoder_checkpoint(checkpoint_dir, device=str(dev_dec))
     holdout_ds = h5_dataset_for_folder(checkpoint_dir, holdout_folder, device=device)
 
     decoder.eval()
-    decoder = decoder.to(dev)
+    decoder = decoder.to(dev_dec)
 
     model_name = tp["model_name"]
     n_repeat = int(tp["n_repeat"])
 
     block_means = None
-    train_mask = train_dataset.mask_reduced.to(dev)
+    train_mask = train_dataset.mask_reduced.to(dev_dec)
     if model_name == "model_trainable_inputs":
         block_means = property_block_means_trainable_inputs(
-            decoder, train_mask, n_repeat, dev
+            decoder, train_mask, n_repeat, dev_dec
         )
 
     mses = []
     cosines = []
     for idx in range(len(holdout_ds)):
         target, mask_row = holdout_ds[idx]
-        target = target.unsqueeze(0).to(dev).float()
-        mask_row = mask_row.to(dev)
+        target = target.unsqueeze(0).to(dev_dec).float()
+        mask_row = mask_row.to(dev_dec)
         pred = predict_embedding_compositional(
             decoder,
             model_name,
             mask_row,
             mask_reduced_train=train_mask,
             n_repeat=n_repeat,
-            device=dev,
+            device=dev_dec,
             block_means=block_means,
         )
         mses.append(torch.nn.functional.mse_loss(pred, target, reduction="mean").item())
@@ -83,10 +85,21 @@ def main() -> None:
     p.add_argument("--checkpoint", type=Path, required=True)
     p.add_argument("--holdout_folder", type=Path, required=True)
     p.add_argument("--device", type=str, default=None)
+    p.add_argument(
+        "--ssae_device",
+        type=str,
+        default=None,
+        help="Place the SSAE decoder on a different device than --device. Defaults to --device.",
+    )
     p.add_argument("--output_json", type=Path, default=None)
     args = p.parse_args()
 
-    out = compositional_holdout_metrics(args.checkpoint, args.holdout_folder, device=args.device)
+    out = compositional_holdout_metrics(
+        args.checkpoint,
+        args.holdout_folder,
+        device=args.device,
+        ssae_device=args.ssae_device,
+    )
     text = json.dumps(out, indent=2)
     print(text)
     if args.output_json is not None:

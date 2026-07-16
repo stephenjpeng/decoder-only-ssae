@@ -122,6 +122,26 @@ def _sample_seed(base_seed: int, idx: int) -> int:
     return base_seed + idx * 1_000_003
 
 
+def _find_ref_training_tid(
+    train_mask: torch.Tensor,
+    mask_swap: torch.Tensor,
+    swap_target_pid: int,
+) -> int:
+    """Return the training sample with swap_target_pid active and highest mask cosine similarity to mask_swap."""
+    target_active = train_mask[:, swap_target_pid].float() > 0.5
+    if target_active.any():
+        candidates = train_mask[target_active].float()
+        candidate_indices = torch.where(target_active)[0]
+    else:
+        candidates = train_mask.float()
+        candidate_indices = torch.arange(len(train_mask), device=train_mask.device)
+    mask_swap_f = mask_swap.float()
+    mask_swap_norm = mask_swap_f / (mask_swap_f.norm() + 1e-8)
+    cand_norms = candidates / (candidates.norm(dim=1, keepdim=True) + 1e-8)
+    sims = cand_norms @ mask_swap_norm
+    return int(candidate_indices[sims.argmax()].item())
+
+
 def _ci_dict(vals: list[float], n_boot: int, seed: int) -> dict:
     if not vals:
         return {"mean": float("nan"), "ci_low": float("nan"), "ci_high": float("nan"), "n": 0}
@@ -138,6 +158,7 @@ def run_image_benchmark(
     base_seed: int = 0,
     simulated: bool = False,
     sd_device: str = "cuda",
+    ssae_device: str | None = None,
     clip_device: str | None = None,
     clip_failure_threshold: float = 0.2,
     n_bootstrap: int = 2000,
@@ -156,6 +177,7 @@ def run_image_benchmark(
     locality_drop_one_attr: bool = False,
     locality_swap_one_attr: bool = False,
 ) -> dict:
+    ssae_device = ssae_device or sd_device
     clip_device = clip_device or ("cuda" if torch.cuda.is_available() else "cpu")
     holdout_folder = Path(ensure_folder_path(holdout_folder))
     output_dir = Path(output_dir)
@@ -171,13 +193,13 @@ def run_image_benchmark(
 
     methods = _sort_methods(methods)
 
-    decoder, tp, train_ds = load_decoder_checkpoint(checkpoint_dir, device=sd_device)
+    decoder, tp, train_ds = load_decoder_checkpoint(checkpoint_dir, device=ssae_device)
     holdout_ds = h5_dataset_for_folder(checkpoint_dir, holdout_folder)
     decoder.eval()
 
     model_name = tp["model_name"]
     n_repeat = int(tp["n_repeat"])
-    dev_dec = torch.device(sd_device)
+    dev_dec = torch.device(ssae_device)
 
     block_means = None
     train_mask = train_ds.mask_reduced.to(dev_dec)
@@ -232,6 +254,7 @@ def run_image_benchmark(
         edit_attribute = ""
         swap_target_pid: int | None = None
         swap_target_attribute = ""
+        ref_tid_swap: int | None = None
         residual_prompt = ""
         swapped_prompt = ""
 
@@ -304,6 +327,7 @@ def run_image_benchmark(
             mask_swap_ds = mask_row_ds.clone()
             mask_swap_ds[edit_pid] = 0
             mask_swap_ds[swap_target_pid] = 1
+            ref_tid_swap = _find_ref_training_tid(train_mask, mask_swap_ds, swap_target_pid)
             pred_ssae_swap = predict_embedding_compositional(
                 decoder,
                 model_name,
@@ -473,15 +497,15 @@ def run_image_benchmark(
                     pe_sw, pp_sw = None, None
                 elif method == "ssae_compose":
                     pe_sw, pp_sw = pack_sd3_from_truncated_normalized(
-                        holdout_ds, idx, pred_ssae_swap.detach().cpu()
+                        train_ds, ref_tid_swap, pred_ssae_swap.detach().cpu()
                     )
                 elif method == "mean_arithmetic":
                     pe_sw, pp_sw = pack_sd3_from_truncated_normalized(
-                        holdout_ds, idx, pred_ma_swap.cpu()
+                        train_ds, ref_tid_swap, pred_ma_swap.cpu()
                     )
                 elif method == "ridge_embed":
                     pe_sw, pp_sw = pack_sd3_from_truncated_normalized(
-                        holdout_ds, idx, pred_ridge_swap.cpu()
+                        train_ds, ref_tid_swap, pred_ridge_swap.cpu()
                     )
                 else:
                     raise ValueError(f"Unknown method {method}")
@@ -665,6 +689,16 @@ def main() -> None:
     p.add_argument("--base_seed", type=int, default=0)
     p.add_argument("--simulated", action="store_true")
     p.add_argument("--sd_device", type=str, default="cuda")
+    p.add_argument(
+        "--ssae_device",
+        type=str,
+        default=None,
+        help=(
+            "Where to load the SSAE decoder. Defaults to --sd_device. Set to 'cpu' or a "
+            "different CUDA index to free GPU memory shared with the SD3.5 pipeline "
+            "(useful when the decoder is trained without top-k truncation)."
+        ),
+    )
     p.add_argument("--clip_device", type=str, default=None)
     p.add_argument("--clip_failure_threshold", type=float, default=0.2)
     p.add_argument("--n_bootstrap", type=int, default=2000)
@@ -719,6 +753,7 @@ def main() -> None:
         base_seed=args.base_seed,
         simulated=args.simulated,
         sd_device=args.sd_device,
+        ssae_device=args.ssae_device,
         clip_device=args.clip_device,
         clip_failure_threshold=args.clip_failure_threshold,
         n_bootstrap=args.n_bootstrap,
