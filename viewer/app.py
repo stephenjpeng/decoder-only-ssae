@@ -9,6 +9,7 @@ from pathlib import Path
 
 import pandas as pd
 import streamlit as st
+import streamlit.components.v1 as components
 
 from viewer.data import (
     RunData,
@@ -133,6 +134,77 @@ def _render_full_metrics(runs: list[RunData], sample_id: int) -> None:
             st.write("No runs loaded.")
 
 
+_ARROW_SHORTCUT_JS = """
+<script>
+(function() {
+  const doc = window.parent.document;
+  if (doc.__arrowNavInstalled) return;
+  doc.__arrowNavInstalled = true;
+  doc.addEventListener('keydown', function(e) {
+    if (e.metaKey || e.ctrlKey || e.altKey) return;
+    if (e.key !== 'ArrowLeft' && e.key !== 'ArrowRight') return;
+    const t = e.target;
+    if (t && ['INPUT', 'TEXTAREA', 'SELECT'].includes(t.tagName)) return;
+    if (t && t.isContentEditable) return;
+    if (doc.querySelector('div[role="listbox"]')) return;
+    const label = e.key === 'ArrowLeft' ? 'Prev' : 'Next';
+    for (const btn of doc.querySelectorAll('button')) {
+      if (btn.innerText.trim() === label) {
+        btn.click();
+        e.preventDefault();
+        return;
+      }
+    }
+  });
+})();
+</script>
+"""
+
+
+def _render_navigator(candidate_ids: list[int], by_id: dict[int, dict]) -> int:
+    n = len(candidate_ids)
+    st.session_state.setdefault("prompt_position", 0)
+    if st.session_state.prompt_position >= n:
+        st.session_state.prompt_position = 0
+
+    st.session_state["jump_prompt"] = candidate_ids[st.session_state.prompt_position]
+
+    def _on_jump() -> None:
+        st.session_state.prompt_position = candidate_ids.index(st.session_state.jump_prompt)
+
+    def _prev() -> None:
+        st.session_state.prompt_position = max(0, st.session_state.prompt_position - 1)
+
+    def _next() -> None:
+        st.session_state.prompt_position = min(n - 1, st.session_state.prompt_position + 1)
+
+    cols = st.columns([1, 8, 1])
+    with cols[0]:
+        st.button("Prev", on_click=_prev, use_container_width=True, disabled=n <= 1)
+    with cols[2]:
+        st.button("Next", on_click=_next, use_container_width=True, disabled=n <= 1)
+    with cols[1]:
+        st.slider(
+            "Prompt position",
+            min_value=0,
+            max_value=max(0, n - 1),
+            key="prompt_position",
+            label_visibility="collapsed",
+            disabled=n <= 1,
+        )
+
+    st.selectbox(
+        "Jump to prompt",
+        options=candidate_ids,
+        key="jump_prompt",
+        on_change=_on_jump,
+        format_func=lambda i: f"[{i}] {by_id[i]['prompt'][:80]}",
+    )
+
+    components.html(_ARROW_SHORTCUT_JS, height=0)
+    return candidate_ids[st.session_state.prompt_position]
+
+
 def _render_summary(runs: list[RunData]) -> None:
     with st.expander("Run summary (aggregate)"):
         for run in runs:
@@ -173,11 +245,7 @@ def main() -> None:
             st.warning("No CLIP failures found across the loaded runs.")
             return
 
-    sample_id = st.selectbox(
-        "Holdout prompt",
-        options=candidate_ids,
-        format_func=lambda i: f"[{i}] {by_id[i]['prompt'][:80]}",
-    )
+    sample_id = _render_navigator(candidate_ids, by_id)
 
     _render_prompt_header(by_id[sample_id])
     _render_grid(runs, sample_id, caption_metrics)
