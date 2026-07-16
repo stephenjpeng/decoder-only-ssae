@@ -13,6 +13,7 @@ import streamlit.components.v1 as components
 
 from viewer.data import (
     RunData,
+    available_variants,
     discover_runs,
     image_path,
     load_holdout_prompts,
@@ -57,7 +58,7 @@ def _cached_run(label: str, output_dir: str) -> RunData:
     return load_run(label, Path(output_dir))
 
 
-def _sidebar() -> tuple[list[dict], list[RunData], list[str], bool]:
+def _sidebar() -> tuple[list[dict], list[RunData], list[str], list[str], bool]:
     st.sidebar.header("Data sources")
     holdout_folder = st.sidebar.text_input("Holdout folder", value=DEFAULT_HOLDOUT)
     prompts = _cached_holdout_prompts(holdout_folder)
@@ -73,6 +74,19 @@ def _sidebar() -> tuple[list[dict], list[RunData], list[str], bool]:
     run_entries = [(Path(p).name, p) for p in picked] + _parse_run_entries(extra_text)
     runs = [_cached_run(label, path) for label, path in run_entries]
 
+    st.sidebar.header("Images")
+    variant_options: list[str] = []
+    for run in runs:
+        for v in available_variants(run):
+            if v not in variant_options:
+                variant_options.append(v)
+    default_variants = ["post"] if "post" in variant_options else variant_options[:1]
+    variants = st.sidebar.multiselect(
+        "Image variants (side by side)",
+        options=variant_options,
+        default=default_variants,
+    )
+
     st.sidebar.header("Metrics")
     all_metrics = sorted({c for r in runs for c in numeric_metric_columns(r)})
     caption_metrics = st.sidebar.multiselect(
@@ -82,7 +96,7 @@ def _sidebar() -> tuple[list[dict], list[RunData], list[str], bool]:
     )
 
     only_failures = st.sidebar.checkbox("Only show CLIP failures", value=False)
-    return prompts, runs, caption_metrics, only_failures
+    return prompts, runs, caption_metrics, variants, only_failures
 
 
 def _sample_ids_with_failures(prompts: list[dict], runs: list[RunData]) -> set[int]:
@@ -101,22 +115,47 @@ def _render_prompt_header(prompt_entry: dict) -> None:
     st.caption(" | ".join(f"{k}: {v}" for k, v in choices.items()))
 
 
-def _render_grid(runs: list[RunData], sample_id: int, caption_metrics: list[str]) -> None:
+def _metric_caption_lines(metrics: dict, caption_metrics: list[str]) -> list[str]:
+    lines = []
+    for m in caption_metrics:
+        v = metrics.get(m)
+        if isinstance(v, (int, float)) and not isinstance(v, bool):
+            lines.append(f"{m}: {v:.3f}")
+    return lines
+
+
+def _render_grid(
+    runs: list[RunData],
+    sample_id: int,
+    caption_metrics: list[str],
+    variants: list[str],
+) -> None:
+    variants = variants or ["post"]
     for run in runs:
         st.markdown(f"**{run.label}**")
         cols = st.columns(len(run.methods) or 1)
         for col, method in zip(cols, run.methods):
             with col:
                 st.caption(method)
-                img_path = image_path(run, method, sample_id)
-                if img_path.exists():
-                    st.image(str(img_path), use_container_width=True)
+                if len(variants) == 1:
+                    p = image_path(run, method, sample_id, variants[0])
+                    if p.exists():
+                        st.image(str(p), use_container_width=True)
+                    else:
+                        st.write("(no image)")
                 else:
-                    st.write("(no image)")
-                metrics = metrics_for(run, sample_id, method)
-                lines = [
-                    f"{m}: {metrics[m]:.3f}" for m in caption_metrics if m in metrics
-                ]
+                    subcols = st.columns(len(variants))
+                    for scol, variant in zip(subcols, variants):
+                        with scol:
+                            st.caption(variant)
+                            p = image_path(run, method, sample_id, variant)
+                            if p.exists():
+                                st.image(str(p), use_container_width=True)
+                            else:
+                                st.write("(no image)")
+                lines = _metric_caption_lines(
+                    metrics_for(run, sample_id, method), caption_metrics
+                )
                 if lines:
                     st.caption("\n".join(lines))
 
@@ -227,7 +266,7 @@ def _render_summary(runs: list[RunData]) -> None:
 
 def main() -> None:
     st.title("Image benchmark viewer")
-    prompts, runs, caption_metrics, only_failures = _sidebar()
+    prompts, runs, caption_metrics, variants, only_failures = _sidebar()
 
     if not prompts:
         st.info("Enter a valid holdout folder in the sidebar.")
@@ -248,7 +287,7 @@ def main() -> None:
     sample_id = _render_navigator(candidate_ids, by_id)
 
     _render_prompt_header(by_id[sample_id])
-    _render_grid(runs, sample_id, caption_metrics)
+    _render_grid(runs, sample_id, caption_metrics, variants)
     _render_full_metrics(runs, sample_id)
     _render_summary(runs)
 

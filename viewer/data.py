@@ -41,8 +41,23 @@ def load_run(label: str, output_dir: Path) -> RunData:
     return RunData(label=label, output_dir=output_dir, per_sample=per_sample, summary=summary, methods=methods)
 
 
-def image_path(run: RunData, method: str, sample_idx: int) -> Path:
-    return run.output_dir / "images" / method / f"{sample_idx:05d}.png"
+def image_path(run: RunData, method: str, sample_idx: int, variant: str = "post") -> Path:
+    subdir = "images" if variant == "post" else f"images_{variant}"
+    return run.output_dir / subdir / method / f"{sample_idx:05d}.png"
+
+
+def available_variants(run: RunData) -> list[str]:
+    if not run.output_dir.is_dir():
+        return []
+    variants: list[str] = []
+    for d in sorted(run.output_dir.iterdir()):
+        if not d.is_dir():
+            continue
+        if d.name == "images":
+            variants.append("post")
+        elif d.name.startswith("images_"):
+            variants.append(d.name[len("images_"):])
+    return variants
 
 
 def metrics_for(run: RunData, sample_idx: int, method: str) -> dict:
@@ -57,4 +72,5 @@ def metrics_for(run: RunData, sample_idx: int, method: str) -> dict:
 
 def numeric_metric_columns(run: RunData) -> list[str]:
     non_metric = {"task", "sample_idx", "method", "prompt"}
-    return [c for c in run.per_sample.columns if c not in non_metric]
+    numeric = set(run.per_sample.select_dtypes(include="number").columns)
+    return [c for c in run.per_sample.columns if c in numeric and c not in non_metric]
