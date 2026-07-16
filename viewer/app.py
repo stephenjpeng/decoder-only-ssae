@@ -11,15 +11,19 @@ import pandas as pd
 import streamlit as st
 import streamlit.components.v1 as components
 
+from viewer.aggregate import render_aggregate_tab
 from viewer.data import (
     RunData,
+    available_sample_ids,
     available_variants,
     discover_runs,
+    edit_info_for,
     image_path,
     load_holdout_prompts,
     load_run,
     metrics_for,
     numeric_metric_columns,
+    run_progress,
 )
 
 DEFAULT_HOLDOUT = "results/compositional_split/holdout"
@@ -58,7 +62,7 @@ def _cached_run(label: str, output_dir: str) -> RunData:
     return load_run(label, Path(output_dir))
 
 
-def _sidebar() -> tuple[list[dict], list[RunData], list[str], list[str], bool]:
+def _sidebar() -> tuple[list[dict], list[RunData], list[str], list[str], list[str], bool]:
     st.sidebar.header("Data sources")
     holdout_folder = st.sidebar.text_input("Holdout folder", value=DEFAULT_HOLDOUT)
     prompts = _cached_holdout_prompts(holdout_folder)
@@ -70,11 +74,25 @@ def _sidebar() -> tuple[list[dict], list[RunData], list[str], list[str], bool]:
     extra_text = st.sidebar.text_area(
         "Additional runs (one per line, `label=path` or bare path)", value=""
     )
+    if st.sidebar.button("Reload runs", help="Re-read per_sample.csv / summary.json / images from disk"):
+        _cached_run.clear()
+        st.rerun()
 
     run_entries = [(Path(p).name, p) for p in picked] + _parse_run_entries(extra_text)
     runs = [_cached_run(label, path) for label, path in run_entries]
 
-    st.sidebar.header("Images")
+    st.sidebar.header("Filters")
+    all_methods: list[str] = []
+    for run in runs:
+        for m in run.methods:
+            if m not in all_methods:
+                all_methods.append(m)
+    selected_methods = st.sidebar.multiselect(
+        "Methods to show",
+        options=all_methods,
+        default=all_methods,
+    )
+
     variant_options: list[str] = []
     for run in runs:
         for v in available_variants(run):
@@ -87,6 +105,8 @@ def _sidebar() -> tuple[list[dict], list[RunData], list[str], list[str], bool]:
         default=default_variants,
     )
 
+    only_failures = st.sidebar.checkbox("Only show CLIP failures", value=False)
+
     st.sidebar.header("Metrics")
     all_metrics = sorted({c for r in runs for c in numeric_metric_columns(r)})
     caption_metrics = st.sidebar.multiselect(
@@ -95,14 +115,13 @@ def _sidebar() -> tuple[list[dict], list[RunData], list[str], list[str], bool]:
         default=[m for m in DEFAULT_CAPTION_METRICS if m in all_metrics],
     )
 
-    only_failures = st.sidebar.checkbox("Only show CLIP failures", value=False)
-    return prompts, runs, caption_metrics, variants, only_failures
+    return prompts, runs, caption_metrics, variants, selected_methods, only_failures
 
 
-def _sample_ids_with_failures(prompts: list[dict], runs: list[RunData]) -> set[int]:
+def _sample_ids_with_failures(runs: list[RunData]) -> set[int]:
     ids: set[int] = set()
     for run in runs:
-        if "clip_fail" not in run.per_sample.columns:
+        if run.per_sample.empty or "clip_fail" not in run.per_sample.columns:
             continue
         failing = run.per_sample.loc[run.per_sample["clip_fail"] == 1, "sample_idx"]
         ids.update(int(i) for i in failing)
@@ -115,6 +134,34 @@ def _render_prompt_header(prompt_entry: dict) -> None:
     st.caption(" | ".join(f"{k}: {v}" for k, v in choices.items()))
 
 
+def _render_edit_details(runs: list[RunData], sample_id: int) -> None:
+    """Show which attribute was dropped / swapped per run (if the run recorded any)."""
+    blocks = []
+    for run in runs:
+        info = edit_info_for(run, sample_id)
+        if not info:
+            continue
+        edit_attr = info.get("edit_attribute", "")
+        swap_attr = info.get("swap_target_attribute", "")
+        swapped_prompt = info.get("swapped_prompt", "")
+        if not edit_attr and not swap_attr:
+            continue
+        lines = [f"**{run.label}** —"]
+        if swap_attr:
+            lines.append(f"swapped `{edit_attr}` → `{swap_attr}`")
+            if swapped_prompt:
+                lines.append(f"resulting prompt: _{swapped_prompt}_")
+        else:
+            lines.append(f"dropped `{edit_attr}`")
+        blocks.append("  \n".join(lines))
+    if not blocks:
+        return
+    with st.container(border=True):
+        st.markdown("**Edit details**")
+        for block in blocks:
+            st.markdown(block)
+
+
 def _metric_caption_lines(metrics: dict, caption_metrics: list[str]) -> list[str]:
     lines = []
     for m in caption_metrics:
@@ -124,17 +171,38 @@ def _metric_caption_lines(metrics: dict, caption_metrics: list[str]) -> list[str
     return lines
 
 
+def _progress_badge(run: RunData) -> str:
+    p = run_progress(run)
+    if p["complete"] and p["has_summary"]:
+        return ""
+    parts = []
+    if not p["has_csv"]:
+        parts.append("no per_sample.csv yet")
+    elif p["expected_rows"]:
+        parts.append(f"{p['n_rows']}/{p['expected_rows']} rows")
+    else:
+        parts.append(f"{p['n_rows']} rows")
+    if not p["has_summary"]:
+        parts.append("no summary.json")
+    return " — in progress (" + ", ".join(parts) + ")"
+
+
 def _render_grid(
     runs: list[RunData],
     sample_id: int,
     caption_metrics: list[str],
     variants: list[str],
+    selected_methods: list[str],
 ) -> None:
     variants = variants or ["post"]
     for run in runs:
-        st.markdown(f"**{run.label}**")
-        cols = st.columns(len(run.methods) or 1)
-        for col, method in zip(cols, run.methods):
+        methods = [m for m in run.methods if m in selected_methods]
+        st.markdown(f"**{run.label}**{_progress_badge(run)}")
+        if not methods:
+            st.caption("(no methods selected for this run)")
+            continue
+        cols = st.columns(len(methods))
+        for col, method in zip(cols, methods):
             with col:
                 st.caption(method)
                 if len(variants) == 1:
@@ -160,17 +228,26 @@ def _render_grid(
                     st.caption("\n".join(lines))
 
 
-def _render_full_metrics(runs: list[RunData], sample_id: int) -> None:
+def _render_full_metrics(
+    runs: list[RunData], sample_id: int, selected_methods: list[str]
+) -> None:
     with st.expander("Full metrics"):
         frames = []
         for run in runs:
-            rows = run.per_sample[run.per_sample["sample_idx"] == sample_id].copy()
+            if run.per_sample.empty:
+                continue
+            rows = run.per_sample[
+                (run.per_sample["sample_idx"] == sample_id)
+                & (run.per_sample["method"].isin(selected_methods))
+            ].copy()
+            if rows.empty:
+                continue
             rows.insert(0, "run", run.label)
             frames.append(rows)
         if frames:
             st.dataframe(pd.concat(frames, ignore_index=True))
         else:
-            st.write("No runs loaded.")
+            st.write("No rows for the current selection.")
 
 
 _ARROW_SHORTCUT_JS = """
@@ -247,8 +324,8 @@ def _render_navigator(candidate_ids: list[int], by_id: dict[int, dict]) -> int:
 def _render_summary(runs: list[RunData]) -> None:
     with st.expander("Run summary (aggregate)"):
         for run in runs:
-            st.markdown(f"**{run.label}**")
-            per_method = run.summary.get("per_method", {})
+            st.markdown(f"**{run.label}**{_progress_badge(run)}")
+            per_method = run.summary.get("per_method", {}) if run.summary else {}
             if not per_method:
                 st.write("No summary.json found.")
                 continue
@@ -264,9 +341,52 @@ def _render_summary(runs: list[RunData]) -> None:
             st.dataframe(pd.DataFrame(table).T)
 
 
+def _candidate_ids(
+    prompts: list[dict], runs: list[RunData], only_failures: bool
+) -> list[int]:
+    """Holdout prompt ids that actually have data on disk across the loaded runs."""
+    by_id = {p["id"]: p for p in prompts}
+    available: set[int] = set()
+    for run in runs:
+        available |= available_sample_ids(run)
+    candidate = [i for i in by_id if i in available]
+    if only_failures:
+        failing = _sample_ids_with_failures(runs)
+        candidate = [i for i in candidate if i in failing]
+    return candidate
+
+
+def _render_browse_tab(
+    prompts: list[dict],
+    runs: list[RunData],
+    caption_metrics: list[str],
+    variants: list[str],
+    selected_methods: list[str],
+    only_failures: bool,
+) -> None:
+    by_id = {p["id"]: p for p in prompts}
+    candidate_ids = _candidate_ids(prompts, runs, only_failures)
+    if not candidate_ids:
+        if only_failures:
+            st.warning("No CLIP failures found across the loaded runs.")
+        else:
+            st.info(
+                "No samples on disk yet for the loaded runs."
+                " Use the Reload runs button in the sidebar once the benchmark has written some output."
+            )
+        return
+
+    sample_id = _render_navigator(candidate_ids, by_id)
+    _render_prompt_header(by_id[sample_id])
+    _render_edit_details(runs, sample_id)
+    _render_grid(runs, sample_id, caption_metrics, variants, selected_methods)
+    _render_full_metrics(runs, sample_id, selected_methods)
+    _render_summary(runs)
+
+
 def main() -> None:
     st.title("Image benchmark viewer")
-    prompts, runs, caption_metrics, variants, only_failures = _sidebar()
+    prompts, runs, caption_metrics, variants, selected_methods, only_failures = _sidebar()
 
     if not prompts:
         st.info("Enter a valid holdout folder in the sidebar.")
@@ -275,21 +395,11 @@ def main() -> None:
         st.info("Select or add at least one benchmark output_dir in the sidebar.")
         return
 
-    by_id = {p["id"]: p for p in prompts}
-    candidate_ids = list(by_id.keys())
-    if only_failures:
-        failing_ids = _sample_ids_with_failures(prompts, runs)
-        candidate_ids = [i for i in candidate_ids if i in failing_ids]
-        if not candidate_ids:
-            st.warning("No CLIP failures found across the loaded runs.")
-            return
-
-    sample_id = _render_navigator(candidate_ids, by_id)
-
-    _render_prompt_header(by_id[sample_id])
-    _render_grid(runs, sample_id, caption_metrics, variants)
-    _render_full_metrics(runs, sample_id)
-    _render_summary(runs)
+    browse, aggregates = st.tabs(["Browse", "Aggregates"])
+    with browse:
+        _render_browse_tab(prompts, runs, caption_metrics, variants, selected_methods, only_failures)
+    with aggregates:
+        render_aggregate_tab(runs, selected_methods)
 
 
 if __name__ == "__main__":
