@@ -140,7 +140,7 @@ def _render_grid(
                 if len(variants) == 1:
                     p = image_path(run, method, sample_id, variants[0])
                     if p.exists():
-                        st.image(str(p), use_container_width=True)
+                        st.image(str(p), width="stretch")
                     else:
                         st.write("(no image)")
                 else:
@@ -150,7 +150,7 @@ def _render_grid(
                             st.caption(variant)
                             p = image_path(run, method, sample_id, variant)
                             if p.exists():
-                                st.image(str(p), use_container_width=True)
+                                st.image(str(p), width="stretch")
                             else:
                                 st.write("(no image)")
                 lines = _metric_caption_lines(
@@ -219,9 +219,9 @@ def _render_navigator(candidate_ids: list[int], by_id: dict[int, dict]) -> int:
 
     cols = st.columns([1, 8, 1])
     with cols[0]:
-        st.button("Prev", on_click=_prev, use_container_width=True, disabled=n <= 1)
+        st.button("Prev", on_click=_prev, width="stretch", disabled=n <= 1)
     with cols[2]:
-        st.button("Next", on_click=_next, use_container_width=True, disabled=n <= 1)
+        st.button("Next", on_click=_next, width="stretch", disabled=n <= 1)
     with cols[1]:
         st.slider(
             "Prompt position",
