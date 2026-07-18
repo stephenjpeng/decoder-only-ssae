@@ -239,6 +239,37 @@ python training_cli.py \
 
 See [Configuration Reference](#configuration-reference) for all tunable hyperparameters.
 
+#### Opting into PCA truncation
+
+By default the dataloader keeps the top-K raw embedding dimensions selected by
+`max - min` range. To instead project onto the top-K principal components of the
+training embeddings, set:
+
+```yaml
+dataloader:
+  truncate_embds_topk: 64            # K
+  truncate_embds_method: "pca"       # replaces "range"
+  pca_semantics: "residual"          # "residual" (default) or "replace"
+```
+
+On the first run the dataloader computes `(mean, components, singular_values,
+explained_variance_ratio)` via `torch.pca_lowrank` (with an exact-SVD fallback
+for small matrices) and caches them next to the embeddings as
+`pca_top_<K>.npz`. Subsequent runs reload the cache. `MAX_MIN` normalisation
+statistics are similarly cached as `embds_{max,min}_pca_<K>.json`.
+
+At inference time (`inference.abstract.SFDInference.overwrite_full_embedding`):
+- `residual` keeps everything outside the top-K PC subspace from the source
+  prompt and edits only inside it. This mirrors the range-mode "edit K dims,
+  leave the rest" semantics.
+- `replace` outputs `P.T y + mean` verbatim, dropping the source residual. Use
+  this for ablations that want to isolate what the SSAE can express in the
+  chosen K-dim basis.
+
+The range and PCA caches are mutually exclusive: attempting to load one when
+the other is already on disk raises a clear error, so you cannot silently mix
+truncation modes across runs of the same folder.
+
 ### Step 4: Inference & Image Generation
 
 The recommended workflow uses the Jupyter notebook at `inference/notebooks/inference_and_testing_output_visuals.ipynb`.
@@ -316,7 +347,9 @@ All training parameters are defined in `trainings/config/params_default.yaml`:
 | `model.using_blocs` | `False` | Enable block-diagonal structure in the decoder |
 | `dataloader.folder_path` | `"prompts/your_directory/"` | Path to the generated prompts + embeddings folder |
 | `dataloader.truncate_n_prompts` | `null` | Limit number of prompts loaded (null = all) |
-| `dataloader.truncate_embds_topk` | `1000` | Keep only top-k embedding dimensions by variance |
+| `dataloader.truncate_embds_topk` | `1000` | Keep only top-k embedding dimensions (`range`) or top-k PCA components (`pca`) |
+| `dataloader.truncate_embds_method` | `"range"` | Truncation method: `range` (raw dim selection by max-min) or `pca` (project onto top-K PCs) |
+| `dataloader.pca_semantics` | `"residual"` | When `truncate_embds_method: pca`, how inference recombines the SSAE output with the source: `residual` (edit only the projected subspace, keep everything else from the source) or `replace` (drop the residual, fully replace with `P.T y + mean`) |
 | `dataloader.add_property_is_the_same` | `True` | Add shared "is the same" property features |
 | `dataloader.normalize` | `"MAX_MIN"` | Embedding normalization method |
 | `dataloader.num_workers` | `1` | DataLoader worker threads |
