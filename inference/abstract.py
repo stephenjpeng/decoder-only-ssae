@@ -4,6 +4,7 @@ from typing import List
 
 import torch
 
+from inference.sd35_constants import CLIP_POOLED_DIM, T5_HIDDEN_DIM, T5_SEQ_LEN
 from inference.utils import display_table, flatten_dict_of_list, is_in
 from trainings.config.config import (derive_shapes, initialise_instance,
                                      read_training_params_from_yaml)
@@ -133,10 +134,10 @@ class SFDInference:
 
         full_embd[self.dataset.indices_truncate_embds_topk] = embd_topk
 
-        embd = full_embd[:-2048]
-        pooled_embd = full_embd[-2048:]
+        embd = full_embd[:-CLIP_POOLED_DIM]
+        pooled_embd = full_embd[-CLIP_POOLED_DIM:]
 
-        embd = embd[None, :].reshape(1, 333, 4096).to(torch.bfloat16)
+        embd = embd[None, :].reshape(1, T5_SEQ_LEN, T5_HIDDEN_DIM).to(torch.bfloat16)
         pooled_embd = pooled_embd[None, :].to(torch.bfloat16)
 
         return embd, pooled_embd
