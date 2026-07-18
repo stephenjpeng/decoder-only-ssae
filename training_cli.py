@@ -13,9 +13,8 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--overwrite_output",
-        type=bool,
-        help="to overwrite the output if already exists",
-        default=True,
+        action="store_true",
+        help="overwrite the output folder if it already exists",
     )
     args = parser.parse_args()
 
