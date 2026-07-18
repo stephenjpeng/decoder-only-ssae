@@ -7,7 +7,11 @@ import torch.optim as optim
 import yaml
 from torch.utils.data import DataLoader
 
-from trainings.config.config import initialise_instance, read_training_params_from_yaml
+from trainings.config.config import (
+    derive_shapes,
+    initialise_instance,
+    read_training_params_from_yaml,
+)
 from trainings.dataloader.dataloader import H5Dataset
 from trainings.models.utils import import_model
 from trainings.utils.common import setup_seed
@@ -41,16 +45,7 @@ def training(
 
     dataset = initialise_instance(H5Dataset, tp)
 
-    tp["n_properties"] = dataset.properties.n_properties
-    tp["n_categories"] = dataset.properties.n_categories
-    tp["n_properties_situation"] = dataset.same_id.n_pid_never_same
-    tp["n_features"] = dataset.properties.n_properties * tp["n_repeat"]
-    tp["n_features_situation"] = (
-        dataset.properties.n_properties * dataset.same_id.n_pid_never_same
-    )
-    tp["tid_same"] = dataset.same_id.tid_same
-    tp["dim_output"] = dataset.dim_x
-    tp["n_prompts"] = len(dataset)
+    derive_shapes(tp, dataset)
 
     dataloader = DataLoader(
         dataset,
