@@ -312,26 +312,37 @@ class H5Dataset(Dataset):
         if self.X is None:
             _ = self.get_X()
         X = self.X.to(torch.float32)
-        n = X.shape[0]
+        n, d = X.shape
         K = self.truncate_embds_topk
-        q = min(K, min(X.shape) - 1) if min(X.shape) > 1 else min(K, min(X.shape))
-        q = max(1, q)
 
         mean = X.mean(dim=0)
         X_centered = X - mean
-        U, S, V = torch.pca_lowrank(X_centered, q=q, niter=6)
 
-        if q < K:
-            pad_v = torch.zeros(V.shape[0], K - q, dtype=V.dtype)
-            pad_s = torch.zeros(K - q, dtype=S.dtype)
+        # torch.pca_lowrank uses randomised SVD and becomes numerically unstable
+        # as q approaches min(n, d); fall back to torch.linalg.svd for the
+        # small-scale case where an exact decomposition is cheap. The threshold
+        # here (>= min(n, d) / 2) is conservative; PROPOSAL.md's real-training
+        # workloads stay well below it.
+        capacity = min(n, d)
+        if K >= capacity // 2 or capacity <= 128:
+            U, S, Vh = torch.linalg.svd(X_centered, full_matrices=False)
+            V = Vh.T
+        else:
+            U, S, V = torch.pca_lowrank(X_centered, q=min(K, capacity), niter=6)
+
+        available = S.shape[0]
+        if available < K:
+            pad_v = torch.zeros(V.shape[0], K - available, dtype=V.dtype)
+            pad_s = torch.zeros(K - available, dtype=S.dtype)
             V = torch.cat([V, pad_v], dim=1)
             S = torch.cat([S, pad_s], dim=0)
 
         components = V[:, :K].T.contiguous()
         singular_values = S[:K].contiguous()
 
-        total_var = (X_centered ** 2).sum() / max(n - 1, 1)
-        component_var = singular_values ** 2 / max(n - 1, 1)
+        denom = max(n - 1, 1)
+        total_var = (X_centered ** 2).sum() / denom
+        component_var = singular_values ** 2 / denom
         explained_variance_ratio = component_var / (total_var + 1e-12)
 
         self.pca_mean = mean
