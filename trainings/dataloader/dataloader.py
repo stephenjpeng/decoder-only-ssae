@@ -17,6 +17,11 @@ from trainings.dataloader.properties.same_id import SameId
 MAX_MIN = "MAX_MIN"
 MANIFEST_FILENAME = "manifest.json"
 
+TRUNCATE_RANGE = "range"
+TRUNCATE_PCA = "pca"
+PCA_RESIDUAL = "residual"
+PCA_REPLACE = "replace"
+
 
 class MissingManifestError(FileNotFoundError):
     """Embedding folder was produced by an older extraction script.
@@ -32,6 +37,8 @@ class H5Dataset(Dataset):
         folder_path,
         truncate_n_prompts=None,
         truncate_embds_topk=None,
+        truncate_embds_method=TRUNCATE_RANGE,
+        pca_semantics=PCA_RESIDUAL,
         add_property_is_the_same=False,
         simulated=False,
         dim_clip_simulated=5000,
@@ -43,7 +50,17 @@ class H5Dataset(Dataset):
         self.logger = logger
         self.log_print = print if self.logger is None else logger.print
         self.truncate_embds_topk = truncate_embds_topk
+        self.truncate_embds_method = check_yaml_params(
+            truncate_embds_method, possible_values=[TRUNCATE_RANGE, TRUNCATE_PCA]
+        )
+        self.pca_semantics = check_yaml_params(
+            pca_semantics, possible_values=[PCA_RESIDUAL, PCA_REPLACE]
+        )
         self.indices_truncate_embds_topk = None
+        self.pca_mean = None
+        self.pca_components = None
+        self.pca_singular_values = None
+        self.pca_explained_variance_ratio = None
         self.normalize = None  # we init the dateset with self.normalize = None and overwrite it to its actual value (normalize) at the end of the init
 
         self.X = None
