@@ -326,8 +326,6 @@ decoder-only-ssae/
 ├── get_embeddings_large_turbo_many_h5.py  # Embedding extraction script
 ├── training_cli.py                    # Training CLI entry point
 ├── trainable_inputs_all_clips.py      # Alternative training script
-├── config/
-│   └── models.yaml                    # Model configuration
 ├── dataset_generation/
 │   ├── functions.py                   # PromptsGenerator class
 │   └── prompts/input/
