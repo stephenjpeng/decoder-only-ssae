@@ -88,7 +88,15 @@ def training(
     start = time.time()
     log_print("Start training...")
 
+    # inv variant refits W in closed form each epoch against the full X
+    X_full_for_refit = (
+        dataset.get_X().to(device).to(torch.float32) if hasattr(decoder, "refit_W") else None
+    )
+
     for epoch in range(tp["n_epochs"]):
+        if X_full_for_refit is not None:
+            decoder.refit_W(X_full_for_refit)
+
         for batch_idx, (y, mask) in enumerate(dataloader):
             y = y.to(device).to(torch.float32)
             mask = mask.to(device)
