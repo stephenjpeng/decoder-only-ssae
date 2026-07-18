@@ -185,7 +185,9 @@ class H5Dataset(Dataset):
             parts.append(torch.from_numpy(arr).to(torch.float32).flatten())
 
         embds = torch.cat(parts) if len(parts) > 1 else parts[0]
-        if self.indices_truncate_embds_topk is not None:
+        if self.pca_components is not None:
+            embds = (embds - self.pca_mean) @ self.pca_components.T
+        elif self.indices_truncate_embds_topk is not None:
             embds = embds[self.indices_truncate_embds_topk]
 
         if self.normalize is not None and self.normalize == MAX_MIN:
@@ -200,7 +202,14 @@ class H5Dataset(Dataset):
             return self._get_item_real(idx)
 
     def _get_item_simulated(self, idx):
-        return self.X_simulated[idx, :], self.mask_reduced[idx]
+        embds = self.X_simulated[idx, :]
+        if self.pca_components is not None:
+            embds = (embds - self.pca_mean) @ self.pca_components.T
+        elif self.indices_truncate_embds_topk is not None:
+            embds = embds[self.indices_truncate_embds_topk]
+        if self.normalize is not None and self.normalize == MAX_MIN:
+            embds = (embds - self.embds_min) / (self.embds_max - self.embds_min + 1e-6)
+        return embds, self.mask_reduced[idx]
 
     def _get_X_simulated(self):
         self.X = self.X_simulated
@@ -228,25 +237,107 @@ class H5Dataset(Dataset):
         pass
 
     def truncate_embds(self):
-        if self.truncate_embds_topk is not None:
-            self.log_print(
-                f"Truncating embeddings from {self.dim_x} to {self.truncate_embds_topk}..."
+        if self.truncate_embds_topk is None:
+            return
+
+        self.log_print(
+            f"Truncating embeddings from {self.dim_x} to "
+            f"{self.truncate_embds_topk} via method={self.truncate_embds_method}..."
+        )
+
+        if self.truncate_embds_method == TRUNCATE_PCA:
+            self._truncate_embds_pca()
+        else:
+            self._truncate_embds_range()
+
+        self.dim_x = self.truncate_embds_topk
+        self.log_print(f"dim_x is now {self.truncate_embds_topk}.")
+
+    def _truncate_embds_range(self):
+        K = self.truncate_embds_topk
+        file = f"indices_top_{K}.json"
+        pca_file = f"pca_top_{K}.npz"
+        if os.path.exists(os.path.join(self.folder_path, pca_file)):
+            raise RuntimeError(
+                f"Range truncation requested but {pca_file} exists at "
+                f"{self.folder_path}. Refusing to mix cache formats. "
+                f"Remove {pca_file} or switch truncate_embds_method to 'pca'."
             )
-            file = f"indices_top_{self.truncate_embds_topk}.json"
-            if os.path.exists(os.path.join(self.folder_path, file)):
-                self.log_print(f"Found {file}")
-                with open(os.path.join(self.folder_path, file), "r") as f:
-                    self.indices_truncate_embds_topk = json.load(f)
-            else:
-                self.log_print(f"Did not find {file}. Re-calculating it...")
-                self.indices_truncate_embds_topk = (
-                    self.get_indices_truncate_embds_topk()
-                )
-                self.log_print(f"Saving {file}.")
-                with open(os.path.join(self.folder_path, file), "w") as f:
-                    json.dump(self.indices_truncate_embds_topk, f)
-            self.dim_x = self.truncate_embds_topk
-            self.log_print(f"dim_x is now {self.truncate_embds_topk}.")
+        if os.path.exists(os.path.join(self.folder_path, file)):
+            self.log_print(f"Found {file}")
+            with open(os.path.join(self.folder_path, file), "r") as f:
+                self.indices_truncate_embds_topk = json.load(f)
+        else:
+            self.log_print(f"Did not find {file}. Re-calculating it...")
+            self.indices_truncate_embds_topk = self.get_indices_truncate_embds_topk()
+            self.log_print(f"Saving {file}.")
+            with open(os.path.join(self.folder_path, file), "w") as f:
+                json.dump(self.indices_truncate_embds_topk, f)
+
+    def _truncate_embds_pca(self):
+        K = self.truncate_embds_topk
+        pca_file = f"pca_top_{K}.npz"
+        range_file = f"indices_top_{K}.json"
+        pca_path = os.path.join(self.folder_path, pca_file)
+        if os.path.exists(os.path.join(self.folder_path, range_file)) and not os.path.exists(pca_path):
+            raise RuntimeError(
+                f"PCA truncation requested but only {range_file} is cached "
+                f"at {self.folder_path}. Remove it (or move it aside) to "
+                f"regenerate PCA caches, or switch truncate_embds_method to 'range'."
+            )
+        if os.path.exists(pca_path):
+            self.log_print(f"Found {pca_file}")
+            data = np.load(pca_path)
+            self.pca_mean = torch.tensor(data["mean"], dtype=torch.float32)
+            self.pca_components = torch.tensor(data["components"], dtype=torch.float32)
+            self.pca_singular_values = torch.tensor(
+                data["singular_values"], dtype=torch.float32
+            )
+            self.pca_explained_variance_ratio = torch.tensor(
+                data["explained_variance_ratio"], dtype=torch.float32
+            )
+        else:
+            self.log_print(f"Did not find {pca_file}. Computing PCA projection...")
+            self._compute_pca_projection()
+            np.savez(
+                pca_path,
+                mean=self.pca_mean.cpu().numpy(),
+                components=self.pca_components.cpu().numpy(),
+                singular_values=self.pca_singular_values.cpu().numpy(),
+                explained_variance_ratio=self.pca_explained_variance_ratio.cpu().numpy(),
+            )
+            self.log_print(f"Saved {pca_file}.")
+
+    def _compute_pca_projection(self):
+        if self.X is None:
+            _ = self.get_X()
+        X = self.X.to(torch.float32)
+        n = X.shape[0]
+        K = self.truncate_embds_topk
+        q = min(K, min(X.shape) - 1) if min(X.shape) > 1 else min(K, min(X.shape))
+        q = max(1, q)
+
+        mean = X.mean(dim=0)
+        X_centered = X - mean
+        U, S, V = torch.pca_lowrank(X_centered, q=q, niter=6)
+
+        if q < K:
+            pad_v = torch.zeros(V.shape[0], K - q, dtype=V.dtype)
+            pad_s = torch.zeros(K - q, dtype=S.dtype)
+            V = torch.cat([V, pad_v], dim=1)
+            S = torch.cat([S, pad_s], dim=0)
+
+        components = V[:, :K].T.contiguous()
+        singular_values = S[:K].contiguous()
+
+        total_var = (X_centered ** 2).sum() / max(n - 1, 1)
+        component_var = singular_values ** 2 / max(n - 1, 1)
+        explained_variance_ratio = component_var / (total_var + 1e-12)
+
+        self.pca_mean = mean
+        self.pca_components = components
+        self.pca_singular_values = singular_values
+        self.pca_explained_variance_ratio = explained_variance_ratio
 
     def get_indices_truncate_embds_topk(self):
         if self.X is None:
@@ -272,16 +363,15 @@ class H5Dataset(Dataset):
     def get_min_max_X(self):
         if self.normalize == MAX_MIN:
             self.log_print(f"Setting up {MAX_MIN} normalization")
-            file_max = (
-                f"embds_max_top_{self.truncate_embds_topk}.json"
-                if self.truncate_embds_topk is not None
-                else "embds_max.json"
-            )
-            file_min = (
-                f"embds_min_top_{self.truncate_embds_topk}.json"
-                if self.truncate_embds_topk is not None
-                else "embds_min.json"
-            )
+            if self.truncate_embds_topk is None:
+                file_max = "embds_max.json"
+                file_min = "embds_min.json"
+            elif self.truncate_embds_method == TRUNCATE_PCA:
+                file_max = f"embds_max_pca_{self.truncate_embds_topk}.json"
+                file_min = f"embds_min_pca_{self.truncate_embds_topk}.json"
+            else:
+                file_max = f"embds_max_top_{self.truncate_embds_topk}.json"
+                file_min = f"embds_min_top_{self.truncate_embds_topk}.json"
             if os.path.exists(os.path.join(self.folder_path, file_max)):
                 self.log_print(f"Found {file_max}")
                 with open(os.path.join(self.folder_path, file_max), "r") as f:
@@ -305,6 +395,10 @@ class H5Dataset(Dataset):
     def _get_min_max_X(self):
         if self.X is None:
             _ = self.get_X()
+
+        if self.pca_components is not None:
+            X_proj = (self.X - self.pca_mean) @ self.pca_components.T
+            return torch.max(X_proj, dim=0)[0], torch.min(X_proj, dim=0)[0]
 
         if self.indices_truncate_embds_topk is not None:
             return (
