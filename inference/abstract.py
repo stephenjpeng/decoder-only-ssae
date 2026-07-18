@@ -142,7 +142,19 @@ class SFDInference:
         full_embd = self.get_full_embedding(idx)
 
         embd_topk = self.dataset.denormalize(embd_topk)
-        full_embd[self.dataset.indices_truncate_embds_topk] = embd_topk
+
+        if getattr(self.dataset, "pca_components", None) is not None:
+            P = self.dataset.pca_components.to(embd_topk.device, embd_topk.dtype)
+            mean = self.dataset.pca_mean.to(embd_topk.device, embd_topk.dtype)
+            source = full_embd.to(embd_topk.device, embd_topk.dtype)
+            semantics = getattr(self.dataset, "pca_semantics", "residual")
+            if semantics == "residual":
+                projected = (source - mean) @ P.T
+                full_embd = source + (embd_topk - projected) @ P
+            else:
+                full_embd = embd_topk @ P + mean
+        else:
+            full_embd[self.dataset.indices_truncate_embds_topk] = embd_topk
 
         streams: dict[str, torch.Tensor] = {}
         offset = 0
@@ -168,12 +180,17 @@ class SFDInference:
     def get_full_embedding(self, idx: int) -> torch.tensor:
         indices_truncate_embds_topk = self.dataset.indices_truncate_embds_topk
         normalize = self.dataset.normalize
+        pca_components = getattr(self.dataset, "pca_components", None)
         self.dataset.indices_truncate_embds_topk = None
         self.dataset.normalize = None
+        if pca_components is not None:
+            self.dataset.pca_components = None
 
         full_embd, _ = self.dataset.__getitem__(idx)
 
         self.dataset.indices_truncate_embds_topk = indices_truncate_embds_topk
         self.dataset.normalize = normalize
+        if pca_components is not None:
+            self.dataset.pca_components = pca_components
 
         return full_embd
