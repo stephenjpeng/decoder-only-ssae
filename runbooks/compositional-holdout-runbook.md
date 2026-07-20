@@ -100,6 +100,8 @@ python -m evaluation.run_image_benchmark \
     --dino --locality_drop_one_attr --locality_swap_one_attr
 ```
 
+For VRAM-constrained runs (typically untruncated `W`, which is multi-GB and OOMs when colocated with SD3.5), pass `--ssae_device cpu` to move the SSAE decoder off the SD3 device, and `--baseline_device cpu` to keep ridge/mean-arithmetic per-sample prediction off GPU as well. `--baseline_device` defaults to `--ssae_device`. `--ssae_device` is also accepted by `evaluation.run_compositional_embeddings` (Step 5, first block).
+
 Both locality flags are independent and can be combined. For each sample with more than one active attribute, one active attribute is picked at random (seeded by `base_seed + idx` so the pick is reproducible), and the two flags each apply a different edit to that same attribute:
 
 - `--locality_drop_one_attr`: zeros the attribute's mask bit for the embedding methods, or drops its phrase from the prompt for `prompt_only`. Writes pre-edit images to `<output_dir>/images_pre_edit/<method>/` and adds `mse_pixel_pre_post_edit` / `ssim_pre_post_edit` per sample (surgical-ness under removal), plus `clip_image_vs_residual_prompt` on the normal image.
@@ -107,6 +109,14 @@ Both locality flags are independent and can be combined. For each sample with mo
 - Both flags share the same `edit_pid` per sample, so drop and swap results are directly comparable when run together. The chosen attribute, its phrase, and the swap target (if any) are recorded per row in `per_sample.csv` as `edit_pid`, `edit_attribute`, `swap_target_pid`, `swap_target_attribute`, `swapped_prompt`.
 
 Categories with only one property (there's nothing to swap to) fall out of the swap test for those samples; they're still counted in the drop test.
+
+Browse benchmark output side-by-side with the streamlit viewer:
+
+```bash
+streamlit run viewer/app.py
+```
+
+Sidebar defaults point at `results/compositional_split/holdout` and auto-discover benchmark runs under `results/`; override or add more via the sidebar inputs. Reads `per_sample.csv` / `summary.json` / `images/` directly, works on in-progress runs, and supports method filtering, image-variant switching (normal / pre-edit / swapped), aggregate plots, and an edit-details panel.
 
 **Concept-strength / magnitude sensitivity** (works on either split; general diagnostic, not compositional-specific):
 
