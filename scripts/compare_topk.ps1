@@ -1,14 +1,17 @@
 <#
 .SYNOPSIS
-    Sweep 1-layer SSAE performance across truncate_embds_topk in {500, 1000, 2000, 5000}.
+    Sweep SSAE performance across truncate_embds_topk and num_layers.
 
 .DESCRIPTION
+    Trains the cross product TopK x Layers. For num_layers > 1, each hidden
+    layer is HiddenDim wide (build_head broadcasts the single int).
+
     Pipeline:
       1. (Optional) Regenerate the compositional split (prompts.json for train/ + holdout/).
       2. (Optional) Extract SD3.5 text embeddings for both splits.
-      3. For each topk value:
-           - Write a per-run YAML with truncate_embds_topk = k.
-           - Train a 1-layer SSAE (num_layers=1, hidden_dims=null).
+      3. For each (topk, layers) pair:
+           - Write a per-run YAML with truncate_embds_topk = k and num_layers = L.
+           - Train the SSAE.
            - Copy the training folder's truncation sidecars to holdout/.
            - Run evaluation.run_compositional_embeddings; capture mse/cosine.
       4. Aggregate all runs into <RunsRoot>/sweep_summary.csv.
@@ -26,10 +29,17 @@
     Directory holding train/ and holdout/ subfolders.
 
 .PARAMETER RunsRoot
-    Where per-topk checkpoints and the summary CSV live.
+    Where per-run checkpoints and the summary CSV live.
 
 .PARAMETER TopK
     Truncation values to sweep.
+
+.PARAMETER Layers
+    Decoder-head layer counts to sweep. 1 = single Linear (historical).
+    N > 1 = N Linears with ReLU between; each hidden layer is HiddenDim wide.
+
+.PARAMETER HiddenDim
+    Width of each hidden layer when Layers > 1. Ignored for Layers == 1.
 
 .PARAMETER HoldoutFraction
     Fraction of the full factorial reserved as holdout (compositional_split).
@@ -53,10 +63,16 @@
     Python interpreter (default: python).
 
 .EXAMPLE
+    # Default: 4 topk x 1 layer count = 4 runs
     ./scripts/compare_topk.ps1
 
 .EXAMPLE
-    ./scripts/compare_topk.ps1 -RecreateSplit -RecreateEmbeddings -TopK 500,1000,2000,5000
+    # 4 topk x 3 layer counts = 12 runs, wide hidden
+    ./scripts/compare_topk.ps1 -TopK 500,1000,2000,5000 -Layers 1,2,3 -HiddenDim 1024
+
+.EXAMPLE
+    # Just sweep depth at a fixed topk
+    ./scripts/compare_topk.ps1 -TopK 1000 -Layers 1,2,3,4 -HiddenDim 2048
 #>
 
 [CmdletBinding()]
@@ -66,6 +82,8 @@ param(
     [string]$SplitRoot = "results/compositional_split",
     [string]$RunsRoot = "results/topk_sweep",
     [int[]]$TopK = @(500, 1000, 2000, 5000),
+    [int[]]$Layers = @(1),
+    [int]$HiddenDim = 1024,
     [double]$HoldoutFraction = 0.1,
     [int]$MaxTrainPrompts = 0,
     [int]$MaxHoldoutPrompts = 0,
@@ -74,6 +92,11 @@ param(
     [switch]$RecreateEmbeddings,
     [string]$Python = "python"
 )
+
+if ($Layers | Where-Object { $_ -lt 1 }) { throw "Layers must all be >= 1" }
+if (($Layers | Where-Object { $_ -gt 1 }) -and $HiddenDim -lt 1) {
+    throw "HiddenDim must be >= 1 when Layers contains values > 1"
+}
 
 $ErrorActionPreference = "Stop"
 Set-Location $RepoRoot
@@ -137,22 +160,29 @@ Extract-Embeddings $HoldoutDir
 
 # 3. Sweep -------------------------------------------------------------------
 $SummaryCsv = Join-Path $RunsRoot "sweep_summary.csv"
-"topk,mse_mean,cosine_mean,n_holdout,elapsed_sec,output_folder" | Set-Content $SummaryCsv -Encoding utf8
+"topk,layers,hidden_dim,mse_mean,cosine_mean,n_holdout,elapsed_sec,output_folder" | Set-Content $SummaryCsv -Encoding utf8
+
+$trainDirPosix = ToPosix $TrainDir
 
 foreach ($k in $TopK) {
-    Write-Host "== topk = $k ==" -ForegroundColor Green
-    $runDir     = Join-Path $RunsRoot ("topk_{0}" -f $k)
-    $yamlPath   = Join-Path $RunsRoot ("topk_{0}.yaml" -f $k)
-    $metricsOut = Join-Path $runDir "holdout_compositional_metrics.json"
+    foreach ($L in $Layers) {
+        $tag = if ($L -eq 1) { "topk_${k}_L1" } else { "topk_${k}_L${L}_h${HiddenDim}" }
+        Write-Host "== $tag ==" -ForegroundColor Green
 
-    $trainDirPosix = ToPosix $TrainDir
+        $runDir     = Join-Path $RunsRoot $tag
+        $yamlPath   = Join-Path $RunsRoot "$tag.yaml"
+        $metricsOut = Join-Path $runDir "holdout_compositional_metrics.json"
+
+        # YAML head shape. `num_layers` and `hidden_dims` are also overridden by
+        # the CLI below; keeping them in the YAML too keeps the file self-describing.
+        $hiddenYaml = if ($L -eq 1) { "null" } else { "$HiddenDim" }
 @"
 training:
   model:
     model_name: "model_avg_feature"
     using_blocs: False
-    num_layers: 1
-    hidden_dims: null
+    num_layers: $L
+    hidden_dims: $hiddenYaml
   dataloader:
     folder_path: "$trainDirPosix/"
     truncate_n_prompts: null
@@ -181,42 +211,48 @@ training:
     n_repeat: 10
 "@ | Set-Content -Path $yamlPath -Encoding utf8
 
-    $t0 = Get-Date
-    Invoke-Py @(
-        "training_cli.py",
-        "--output_folder", $runDir,
-        "--path_yaml", $yamlPath,
-        "--overwrite_output", "True",
-        "--num_layers", "1"
-    )
-    $elapsed = [int]((Get-Date) - $t0).TotalSeconds
+        $trainArgs = @(
+            "training_cli.py",
+            "--output_folder", $runDir,
+            "--path_yaml", $yamlPath,
+            "--overwrite_output", "True",
+            "--num_layers", "$L"
+        )
+        if ($L -gt 1) { $trainArgs += @("--hidden_dims", "$HiddenDim") }
 
-    # The training run just wrote indices_top_{k}.json + embds_{max,min}_top_{k}.json
-    # under $TrainDir. Copy them next to the holdout so the eval reuses the same
-    # coordinate selection and per-dim normalization.
-    Invoke-Py @(
-        "-m", "evaluation.run_copy_truncation",
-        "--train_folder",   $TrainDir,
-        "--holdout_folder", $HoldoutDir
-    )
+        $t0 = Get-Date
+        Invoke-Py @trainArgs
+        $elapsed = [int]((Get-Date) - $t0).TotalSeconds
 
-    Invoke-Py @(
-        "-m", "evaluation.run_compositional_embeddings",
-        "--checkpoint",     $runDir,
-        "--holdout_folder", $HoldoutDir,
-        "--ssae_device",    "cpu",
-        "--output_json",    $metricsOut
-    )
+        # The first run at each topk k wrote indices_top_{k}.json +
+        # embds_{max,min}_top_{k}.json into $TrainDir. Re-copy every time — cheap
+        # and keeps the holdout sidecars in sync even when the training folder
+        # changes across layer sweeps.
+        Invoke-Py @(
+            "-m", "evaluation.run_copy_truncation",
+            "--train_folder",   $TrainDir,
+            "--holdout_folder", $HoldoutDir
+        )
 
-    $mse = ""; $cos = ""; $nHold = ""
-    if (Test-Path $metricsOut) {
-        $obj = Get-Content $metricsOut -Raw | ConvertFrom-Json
-        if ($null -ne $obj.mse_mean)    { $mse   = $obj.mse_mean }
-        if ($null -ne $obj.cosine_mean) { $cos   = $obj.cosine_mean }
-        if ($null -ne $obj.n_holdout)   { $nHold = $obj.n_holdout }
+        Invoke-Py @(
+            "-m", "evaluation.run_compositional_embeddings",
+            "--checkpoint",     $runDir,
+            "--holdout_folder", $HoldoutDir,
+            "--ssae_device",    "cpu",
+            "--output_json",    $metricsOut
+        )
+
+        $mse = ""; $cos = ""; $nHold = ""
+        if (Test-Path $metricsOut) {
+            $obj = Get-Content $metricsOut -Raw | ConvertFrom-Json
+            if ($null -ne $obj.mse_mean)    { $mse   = $obj.mse_mean }
+            if ($null -ne $obj.cosine_mean) { $cos   = $obj.cosine_mean }
+            if ($null -ne $obj.n_holdout)   { $nHold = $obj.n_holdout }
+        }
+        $hiddenCol = if ($L -eq 1) { "" } else { "$HiddenDim" }
+        "$k,$L,$hiddenCol,$mse,$cos,$nHold,$elapsed,$runDir" | Add-Content $SummaryCsv
+        Write-Host ("  topk={0} L={1} h={2} mse={3} cosine={4} elapsed={5}s" -f $k, $L, $hiddenCol, $mse, $cos, $elapsed) -ForegroundColor Green
     }
-    "$k,$mse,$cos,$nHold,$elapsed,$runDir" | Add-Content $SummaryCsv
-    Write-Host ("  topk={0} mse={1} cosine={2} elapsed={3}s" -f $k, $mse, $cos, $elapsed) -ForegroundColor Green
 }
 
 Write-Host "== Sweep complete ==" -ForegroundColor Green
