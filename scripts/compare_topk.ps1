@@ -128,15 +128,14 @@ $HoldoutDir = ToPosix (Join-Path $SplitRoot "holdout")
 New-Item -ItemType Directory -Path $RunsRoot -Force | Out-Null
 
 function Invoke-Py {
-    param([Parameter(ValueFromRemainingArguments=$true)][string[]]$Argv)
+    # NOTE: Callers pass a single array (positional). `@(...)` is an array
+    # literal, not a splat — using ValueFromRemainingArguments here would nest
+    # the array and Python would see the whole arg list as one filename.
+    param([Parameter(Mandatory=$true, Position=0)][string[]]$Argv)
     # POSIX-normalize every arg that looks like a path (any backslash present).
     $normalized = @()
     foreach ($a in $Argv) {
-        if ($a -is [string] -and $a -match '\\') {
-            $normalized += (ToPosix $a)
-        } else {
-            $normalized += $a
-        }
+        if ($a -match '\\') { $normalized += (ToPosix $a) } else { $normalized += $a }
     }
     Write-Host ">> $Python $($normalized -join ' ')" -ForegroundColor Cyan
     & $Python @normalized
@@ -156,7 +155,7 @@ if ($RecreateSplit -or -not (Test-Path $trainPrompts)) {
     )
     if ($MaxTrainPrompts   -gt 0) { $splitArgs += @("--max_train_prompts",   "$MaxTrainPrompts") }
     if ($MaxHoldoutPrompts -gt 0) { $splitArgs += @("--max_holdout_prompts", "$MaxHoldoutPrompts") }
-    Invoke-Py @splitArgs
+    Invoke-Py $splitArgs
 } else {
     Write-Host "Split already at $SplitRoot; use -RecreateSplit to rebuild." -ForegroundColor Yellow
 }
@@ -251,7 +250,7 @@ training:
         if ($L -gt 1) { $trainArgs += @("--hidden_dims", "$HiddenDim") }
 
         $t0 = Get-Date
-        Invoke-Py @trainArgs
+        Invoke-Py $trainArgs
         $elapsed = [int]((Get-Date) - $t0).TotalSeconds
 
         # The first run at each topk k wrote indices_top_{k}.json +
