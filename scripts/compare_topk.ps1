@@ -99,19 +99,48 @@ if (($Layers | Where-Object { $_ -gt 1 }) -and $HiddenDim -lt 1) {
 }
 
 $ErrorActionPreference = "Stop"
-Set-Location $RepoRoot
-
-$TrainDir   = Join-Path $SplitRoot "train"
-$HoldoutDir = Join-Path $SplitRoot "holdout"
-New-Item -ItemType Directory -Path $RunsRoot -Force | Out-Null
 
 function ToPosix([string]$p) { return ($p -replace '\\', '/') }
 
+# Resolve $RepoRoot to an absolute POSIX path so every downstream Python call
+# gets forward slashes only. On Windows, backslashed paths passed through the
+# python launcher shim can get doubled up as "\\", which argparse then treats
+# as a literal path containing a real backslash sequence.
+$RepoRoot = ToPosix (Resolve-Path -LiteralPath $RepoRoot).Path
+Set-Location -LiteralPath $RepoRoot
+
+function Resolve-Under([string]$Base, [string]$Path) {
+    if ([System.IO.Path]::IsPathRooted($Path)) { return (ToPosix $Path) }
+    return (ToPosix (Join-Path $Base $Path))
+}
+
+$Categories = Resolve-Under $RepoRoot $Categories
+$SplitRoot  = Resolve-Under $RepoRoot $SplitRoot
+$RunsRoot   = Resolve-Under $RepoRoot $RunsRoot
+
+if (-not (Test-Path -LiteralPath $Categories)) {
+    throw "Categories file not found: $Categories`n" +
+          "Pass -Categories <path> or run from the repo root. RepoRoot is currently: $RepoRoot"
+}
+
+$TrainDir   = ToPosix (Join-Path $SplitRoot "train")
+$HoldoutDir = ToPosix (Join-Path $SplitRoot "holdout")
+New-Item -ItemType Directory -Path $RunsRoot -Force | Out-Null
+
 function Invoke-Py {
     param([Parameter(ValueFromRemainingArguments=$true)][string[]]$Argv)
-    Write-Host ">> $Python $($Argv -join ' ')" -ForegroundColor Cyan
-    & $Python @Argv
-    if ($LASTEXITCODE -ne 0) { throw "Command failed (exit $LASTEXITCODE): $Python $($Argv -join ' ')" }
+    # POSIX-normalize every arg that looks like a path (any backslash present).
+    $normalized = @()
+    foreach ($a in $Argv) {
+        if ($a -is [string] -and $a -match '\\') {
+            $normalized += (ToPosix $a)
+        } else {
+            $normalized += $a
+        }
+    }
+    Write-Host ">> $Python $($normalized -join ' ')" -ForegroundColor Cyan
+    & $Python @normalized
+    if ($LASTEXITCODE -ne 0) { throw "Command failed (exit $LASTEXITCODE): $Python $($normalized -join ' ')" }
 }
 
 # 1. Compositional split -----------------------------------------------------
@@ -159,19 +188,20 @@ Write-Host "== Extracting embeddings (holdout) ==" -ForegroundColor Green
 Extract-Embeddings $HoldoutDir
 
 # 3. Sweep -------------------------------------------------------------------
-$SummaryCsv = Join-Path $RunsRoot "sweep_summary.csv"
-"topk,layers,hidden_dim,mse_mean,cosine_mean,n_holdout,elapsed_sec,output_folder" | Set-Content $SummaryCsv -Encoding utf8
+$SummaryCsv = ToPosix (Join-Path $RunsRoot "sweep_summary.csv")
+"topk,layers,hidden_dim,mse_mean,cosine_mean,n_holdout,elapsed_sec,output_folder" | Set-Content -Path $SummaryCsv -Encoding utf8
 
-$trainDirPosix = ToPosix $TrainDir
+# $TrainDir is already POSIX at this point.
+$trainDirPosix = $TrainDir
 
 foreach ($k in $TopK) {
     foreach ($L in $Layers) {
         $tag = if ($L -eq 1) { "topk_${k}_L1" } else { "topk_${k}_L${L}_h${HiddenDim}" }
         Write-Host "== $tag ==" -ForegroundColor Green
 
-        $runDir     = Join-Path $RunsRoot $tag
-        $yamlPath   = Join-Path $RunsRoot "$tag.yaml"
-        $metricsOut = Join-Path $runDir "holdout_compositional_metrics.json"
+        $runDir     = ToPosix (Join-Path $RunsRoot $tag)
+        $yamlPath   = ToPosix (Join-Path $RunsRoot "$tag.yaml")
+        $metricsOut = ToPosix (Join-Path $runDir "holdout_compositional_metrics.json")
 
         # YAML head shape. `num_layers` and `hidden_dims` are also overridden by
         # the CLI below; keeping them in the YAML too keeps the file self-describing.
