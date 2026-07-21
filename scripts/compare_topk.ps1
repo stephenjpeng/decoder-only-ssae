@@ -25,6 +25,11 @@
 .PARAMETER Categories
     Path to categories_with_properties.json (relative to RepoRoot ok).
 
+.PARAMETER PropertiesSame
+    Path to properties_same.json — copied into train/ and holdout/ by
+    compositional_split so the H5Dataset can load it. Defaults to
+    dataset_generation/prompts/input/properties_same.json.
+
 .PARAMETER SplitRoot
     Directory holding train/ and holdout/ subfolders.
 
@@ -79,6 +84,7 @@
 param(
     [string]$RepoRoot = (Get-Location).Path,
     [string]$Categories = "dataset_generation/prompts/input/categories_with_properties.json",
+    [string]$PropertiesSame = "dataset_generation/prompts/input/properties_same.json",
     [string]$SplitRoot = "results/compositional_split",
     [string]$RunsRoot = "results/topk_sweep",
     [int[]]$TopK = @(500, 1000, 2000, 5000),
@@ -114,13 +120,18 @@ function Resolve-Under([string]$Base, [string]$Path) {
     return (ToPosix (Join-Path $Base $Path))
 }
 
-$Categories = Resolve-Under $RepoRoot $Categories
-$SplitRoot  = Resolve-Under $RepoRoot $SplitRoot
-$RunsRoot   = Resolve-Under $RepoRoot $RunsRoot
+$Categories     = Resolve-Under $RepoRoot $Categories
+$PropertiesSame = Resolve-Under $RepoRoot $PropertiesSame
+$SplitRoot      = Resolve-Under $RepoRoot $SplitRoot
+$RunsRoot       = Resolve-Under $RepoRoot $RunsRoot
 
 if (-not (Test-Path -LiteralPath $Categories)) {
     throw "Categories file not found: $Categories`n" +
           "Pass -Categories <path> or run from the repo root. RepoRoot is currently: $RepoRoot"
+}
+if (-not (Test-Path -LiteralPath $PropertiesSame)) {
+    throw "properties_same.json not found: $PropertiesSame`n" +
+          "Pass -PropertiesSame <path>. RepoRoot is currently: $RepoRoot"
 }
 
 $TrainDir   = ToPosix (Join-Path $SplitRoot "train")
@@ -151,13 +162,24 @@ if ($RecreateSplit -or -not (Test-Path $trainPrompts)) {
         "dataset_generation/compositional_split.py",
         "--categories_json", $Categories,
         "--output_root", $SplitRoot,
-        "--holdout_fraction", $HoldoutFraction
+        "--holdout_fraction", $HoldoutFraction,
+        "--properties_same_json", $PropertiesSame
     )
     if ($MaxTrainPrompts   -gt 0) { $splitArgs += @("--max_train_prompts",   "$MaxTrainPrompts") }
     if ($MaxHoldoutPrompts -gt 0) { $splitArgs += @("--max_holdout_prompts", "$MaxHoldoutPrompts") }
     Invoke-Py $splitArgs
 } else {
     Write-Host "Split already at $SplitRoot; use -RecreateSplit to rebuild." -ForegroundColor Yellow
+}
+
+# The dataloader reads <split>/properties_same.json directly. Older splits made
+# before compositional_split copied it don't have this file — top it up now.
+foreach ($d in @($TrainDir, $HoldoutDir)) {
+    $dst = Join-Path $d "properties_same.json"
+    if (-not (Test-Path -LiteralPath $dst)) {
+        Copy-Item -LiteralPath $PropertiesSame -Destination $dst
+        Write-Host "Copied properties_same.json -> $dst" -ForegroundColor Yellow
+    }
 }
 
 # 2. Embeddings --------------------------------------------------------------
