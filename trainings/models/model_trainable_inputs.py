@@ -1,6 +1,8 @@
 import torch
 import torch.nn as nn
 
+from trainings.models.mlp import build_head
+
 
 class Decoder(nn.Module):
     def __init__(
@@ -12,6 +14,8 @@ class Decoder(nn.Module):
         tid_same,
         n_features_situation=0,
         trainable_input_init_range=1,
+        num_layers=1,
+        hidden_dims=None,
         logger=None,
     ):
         super(Decoder, self).__init__()
@@ -47,7 +51,13 @@ class Decoder(nn.Module):
 
         self.mask = None
 
-        self.linear = nn.Linear(self.n_features, self.dim_output, bias=True)
+        self.linear = build_head(
+            in_features=self.n_features,
+            out_features=self.dim_output,
+            num_layers=num_layers,
+            hidden_dims=hidden_dims,
+            activation_factory=nn.ReLU,
+        )
         self.activation = nn.ReLU()
 
         self.log_print(

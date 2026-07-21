@@ -9,6 +9,7 @@ from torch.utils.data import DataLoader
 
 from trainings.config.config import initialise_instance, read_training_params_from_yaml
 from trainings.dataloader.dataloader import H5Dataset
+from trainings.models.mlp import parse_hidden_dims
 from trainings.models.utils import import_model
 from trainings.utils.common import setup_seed
 from trainings.utils.learning_rate_scheduler import LRScheduler
@@ -19,8 +20,20 @@ def training(
     output_folder: str | Path,
     path_yaml: str | Path = None,
     overwrite_output: bool = False,
+    num_layers: int | None = None,
+    hidden_dims=None,
 ) -> None:
     tp, path_yaml = read_training_params_from_yaml(path_yaml)
+
+    if num_layers is not None:
+        tp["num_layers"] = num_layers
+    if hidden_dims is not None:
+        tp["hidden_dims"] = hidden_dims
+
+    tp["num_layers"] = tp.get("num_layers", 1) or 1
+    tp["hidden_dims"] = parse_hidden_dims(
+        tp.get("hidden_dims"), tp["num_layers"]
+    )
 
     setup_seed(tp["seed"])
 

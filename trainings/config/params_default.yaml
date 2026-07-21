@@ -6,6 +6,8 @@ training:
   model:
     model_name: "model_avg_feature"
     using_blocs: False
+    num_layers: 1
+    hidden_dims: null
   dataloader:
     folder_path: "results/compositional_split/train/"
     truncate_n_prompts: null
