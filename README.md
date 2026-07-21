@@ -81,7 +81,7 @@ where:
 - **Y** is the learned sparse feature matrix (one row per prompt)
 - **M** is a binary mask derived from the category/property structure
 - **&sigma;** is a nonlinear activation (ReLU or LeakyReLU)
-- **W** and **b** are the linear decoder weights and bias
+- **W** and **b** are the decoder weights and bias — a single `Linear` by default, or an MLP head when `model.num_layers > 1` (see the Configuration Reference)
 
 ```mermaid
 graph LR
@@ -231,6 +231,8 @@ python training_cli.py \
 | `--output_folder` | Directory for model checkpoint, logs, and plots |
 | `--path_yaml` | Path to the YAML configuration file |
 | `--overwrite_output` | Overwrite existing output folder if `True` |
+| `--num_layers` | Number of `Linear` layers in the decoder head (default from YAML, currently `1`). Overrides `model.num_layers`. |
+| `--hidden_dims` | Hidden widths for the MLP head as an int or comma-separated ints (e.g. `512` or `512,256`). Broadcast when a single int is given; length must be `num_layers - 1`. Overrides `model.hidden_dims`. |
 
 **Training outputs:**
 - `model.pt` -- saved model state dict
@@ -314,6 +316,8 @@ All training parameters are defined in `trainings/config/params_default.yaml`:
 |---|---|---|
 | `model.model_name` | `"model_trainable_inputs"` | Decoder variant to use (`model_trainable_inputs`, `model_avg_feature`, `model_trainable_input_inv`) |
 | `model.using_blocs` | `False` | Enable block-diagonal structure in the decoder |
+| `model.num_layers` | `1` | Number of `Linear` layers in the decoder head. `1` matches the historical single-`Linear` architecture; `>1` inserts hidden layers with the variant's activation between them. |
+| `model.hidden_dims` | `null` | Hidden layer widths (int or list of ints of length `num_layers - 1`). Ignored when `num_layers == 1`; required otherwise. A single int is broadcast to all hidden layers. |
 | `dataloader.folder_path` | `"prompts/your_directory/"` | Path to the generated prompts + embeddings folder |
 | `dataloader.truncate_n_prompts` | `null` | Limit number of prompts loaded (null = all) |
 | `dataloader.truncate_embds_topk` | `1000` | Keep only top-k embedding dimensions by variance |
