@@ -100,6 +100,22 @@ python -m evaluation.run_image_benchmark \
     --dino --locality_drop_one_attr --locality_swap_one_attr
 ```
 
+Non-SSAE baselines (`gt_embed`, `mean_arithmetic`, `ridge_embed`, `prompt_only`) land in a shared cache at `results/bench_baseline_cache/<dataset_id>/`, keyed by (holdout `prompts.json`, training embeddings + mask, `--base_seed`, `--ridge_lambda`, SD3.5 pipeline fingerprint). The run folder holds SSAE outputs plus a `manifest.json` pointing at the cache. Comparing several checkpoints on the same holdout only re-renders SSAE:
+
+```bash
+# First run — populates baselines and SSAE-A
+python -m evaluation.run_image_benchmark \
+    --checkpoint results/ssae_A --holdout_folder results/compositional_split/holdout \
+    --output_dir results/bench_out/ssae_A --dino --locality_drop_one_attr
+
+# Second run — hits the cache; only ssae_compose is re-rendered
+python -m evaluation.run_image_benchmark \
+    --checkpoint results/ssae_B --holdout_folder results/compositional_split/holdout \
+    --output_dir results/bench_out/ssae_B --dino --locality_drop_one_attr
+```
+
+Pre-warm the cache without any SSAE work via `--baselines_only`. Turn caching off entirely (legacy layout) with `--no_baseline_cache`. Locality flags grow an existing cache in place; changing `--ridge_lambda` or `--base_seed` (or any other key component) creates a fresh `dataset_id`. The MA/ridge fits also depend on the checkpoint's *training* data, so checkpoints trained on different splits do not share these baselines even against the same holdout. Optional per-row metrics (LPIPS, DINO) are captured at population time — if you'll want DINO, populate the cache with `--dino` set once.
+
 For VRAM-constrained runs (typically untruncated `W`, which is multi-GB and OOMs when colocated with SD3.5), pass `--ssae_device cpu` to move the SSAE decoder off the SD3 device, and `--baseline_device cpu` to keep ridge/mean-arithmetic per-sample prediction off GPU as well. `--baseline_device` defaults to `--ssae_device`. `--ssae_device` is also accepted by `evaluation.run_compositional_embeddings` (Step 5, first block).
 
 Both locality flags are independent and can be combined. For each sample with more than one active attribute, one active attribute is picked at random (seeded by `base_seed + idx` so the pick is reproducible), and the two flags each apply a different edit to that same attribute:
@@ -116,7 +132,7 @@ Browse benchmark output side-by-side with the streamlit viewer:
 streamlit run viewer/app.py
 ```
 
-Sidebar defaults point at `results/compositional_split/holdout` and auto-discover benchmark runs under `results/`; override or add more via the sidebar inputs. Reads `per_sample.csv` / `summary.json` / `images/` directly, works on in-progress runs, and supports method filtering, image-variant switching (normal / pre-edit / swapped), aggregate plots, and an edit-details panel.
+Sidebar defaults point at `results/compositional_split/holdout` and auto-discover benchmark runs under `results/`; override or add more via the sidebar inputs. Reads `per_sample.csv` / `summary.json` / `images/` directly, works on in-progress runs, and supports method filtering, image-variant switching (normal / pre-edit / swapped), aggregate plots, and an edit-details panel. Cache-backed runs (with a `manifest.json` pointing at a shared baseline cache) are handled transparently — baseline images and rows are pulled from the cache directory. The baseline cache directories themselves are excluded from run discovery. Moving or copying a run folder without its cache will lose the baseline images.
 
 **Concept-strength / magnitude sensitivity** (works on either split; general diagnostic, not compositional-specific):
 

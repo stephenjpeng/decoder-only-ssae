@@ -297,7 +297,8 @@ The repo includes scripts for **held-out tuple splits**, **embedding and image m
 | Embedding baselines (mean / ridge / PCA) | `python -m baselines.run_baselines --checkpoint ... --train_folder ... --holdout_folder ...` |
 | Unsupervised sparse AE (MSE + L1) | `python -m baselines.run_unsup_sae_holdout --checkpoint ... --train_folder ... --holdout_folder ...` |
 | Concept cosine matrix + stats | `python -m evaluation.decorrelation --checkpoint ...` ; heatmap: `python -m evaluation.run_decorrelation_plot --checkpoint ... --output_png fig.png` |
-| Image benchmark (SD3 + CLIP + LPIPS; optional DINO / locality CLIP) | `python -m evaluation.run_image_benchmark --checkpoint ... --holdout_folder ... --output_dir bench_out --dino --locality_drop_one_attr` |
+| Image benchmark (SD3 + CLIP + LPIPS; optional DINO / locality CLIP; baselines cached per dataset — see below) | `python -m evaluation.run_image_benchmark --checkpoint ... --holdout_folder ... --output_dir bench_out --dino --locality_drop_one_attr` |
+| Pre-warm baseline cache only (no SSAE) | `python -m evaluation.run_image_benchmark --checkpoint ... --holdout_folder ... --output_dir bench_out/warm --baselines_only` |
 | Concept-strength / magnitude sensitivity (non-binary mask values, e.g. 2/10/-10) | `python -m evaluation.run_magnitude_sensitivity --checkpoint ... --data_folder ... --output_dir mag_out --concepts "holding a gun" --magnitudes -10,-2,-1,0,1,2,5,10` |
 | OpenAI vision judge (batch; works on `bench_out` or `mag_out`, same `per_sample.csv`/`images/` layout) | `python -m evaluation.run_vlm_openai_batch --benchmark_dir bench_out --model gpt-4o-mini` |
 | CLIP linear probe on images | `python -m evaluation.run_clip_probe --train_folder .../train --train_images_subdir path/to/00000.png_folder --holdout_folder .../holdout --benchmark_dir bench_out` |
@@ -305,6 +306,24 @@ The repo includes scripts for **held-out tuple splits**, **embedding and image m
 | Ablation YAML grid | `python experiments/sweep_generate.py --output_dir configs/sweep1` |
 
 Unified CLI: `python -m evaluation.cli <subcommand> ...` (see `evaluation/cli.py`).
+
+#### Baseline cache (image benchmark)
+
+`run_image_benchmark` caches the non-SSAE baselines (`gt_embed`, `mean_arithmetic`, `ridge_embed`, `prompt_only`) under `results/bench_baseline_cache/<dataset_id>/` and reuses them across runs. A run folder then holds only SSAE outputs plus a `manifest.json` pointing at the cache. The Streamlit viewer merges the two transparently.
+
+Dataset identity (`dataset_id`) is a short hash of: the holdout `prompts.json`, the training embeddings + mask, `--base_seed`, `--ridge_lambda`, and the SD3.5 pipeline fingerprint (model id, steps, guidance, sequence length). Changing any of these creates a fresh cache directory; locality flags grow an existing cache in place.
+
+Flags:
+
+- `--baseline_cache_root PATH` — override the cache root (default `results/bench_baseline_cache`).
+- `--no_baseline_cache` — legacy monolithic layout (everything under the run folder).
+- `--baselines_only` — populate the cache and exit (pre-warm before comparing several SSAE checkpoints).
+
+Caveats:
+
+- The `mean_arithmetic` / `ridge_embed` fits depend on the checkpoint's *training* data, not just the holdout — the cache key includes both. Checkpoints trained on different splits do not share these baselines.
+- Optional per-row metrics (LPIPS, DINO) are captured at population time. If the cache was built without `--dino`, downstream runs won't have DINO for baselines; pre-warm with the flags you want.
+- Copying a run folder without its baseline cache loses the baseline images.
 
 ---
 
@@ -362,6 +381,7 @@ decoder-only-ssae/
 ├── evaluation/
 │   ├── cli.py                         # Unified evaluation CLI
 │   ├── run_image_benchmark.py         # Image-level benchmark + CSV/summary
+│   ├── baseline_cache.py              # Shared per-dataset baseline cache
 │   ├── run_magnitude_sensitivity.py   # Concept-strength / mask-magnitude sweep
 │   ├── magnitude.py                   # Non-binary mask-value decode helpers
 │   ├── run_vlm_openai_batch.py        # OpenAI vision API batch judge

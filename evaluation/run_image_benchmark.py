@@ -43,6 +43,7 @@ from baselines.run_baselines import (
     predict_linear,
     predict_mean_arithmetic,
 )
+from evaluation.baseline_cache import BASELINE_METHODS, BaselineCache, load_or_create
 from evaluation.bootstrap import bootstrap_mean_ci
 from evaluation.clip_scorer import CLIPScorer
 from evaluation.composition import (
@@ -54,6 +55,8 @@ from evaluation.lpips_metric import lpips_alex
 from evaluation.pixel_metrics import pixel_mse, ssim
 from evaluation.sd3_pack import pack_sd3_from_truncated_normalized
 from inference.image_generation.image_generator import ImageGenerator
+
+DEFAULT_BASELINE_CACHE_ROOT = Path("results/bench_baseline_cache")
 
 _METHOD_ORDER = (
     "gt_embed",
@@ -142,6 +145,16 @@ def _find_ref_training_tid(
     return int(candidate_indices[sims.argmax()].item())
 
 
+def _merge_row(cached: dict, fresh: dict) -> dict:
+    """Fresh values win iff non-empty; else keep cached."""
+    merged = dict(cached)
+    for k, v in fresh.items():
+        if v == "" or v is None:
+            continue
+        merged[k] = v
+    return merged
+
+
 def _ci_dict(vals: list[float], n_boot: int, seed: int) -> dict:
     if not vals:
         return {"mean": float("nan"), "ci_low": float("nan"), "ci_high": float("nan"), "n": 0}
@@ -177,6 +190,9 @@ def run_image_benchmark(
     dino_device: str | None = None,
     locality_drop_one_attr: bool = False,
     locality_swap_one_attr: bool = False,
+    baseline_cache_root: Path | None = None,
+    use_baseline_cache: bool = True,
+    baselines_only: bool = False,
 ) -> dict:
     ssae_device = ssae_device or sd_device
     baseline_device = baseline_device or ssae_device
@@ -193,6 +209,8 @@ def run_image_benchmark(
     if locality_swap_one_attr:
         img_root_swap.mkdir(exist_ok=True)
 
+    if baselines_only:
+        methods = tuple(m for m in methods if m != "ssae_compose")
     methods = _sort_methods(methods)
 
     decoder, tp, train_ds = load_decoder_checkpoint(checkpoint_dir, device=ssae_device)
@@ -204,16 +222,40 @@ def run_image_benchmark(
     dev_dec = torch.device(ssae_device)
     dev_base = torch.device(baseline_device)
 
+    want_ssae = ("ssae_compose" in methods) and not baselines_only
     block_means = None
     train_mask = train_ds.mask_reduced.to(dev_dec)
-    if model_name == "model_trainable_inputs":
+    if want_ssae and model_name == "model_trainable_inputs":
         block_means = property_block_means_trainable_inputs(
             decoder, train_mask, n_repeat, dev_dec
         )
 
     X_tr_cpu, M_tr_cpu = _stack_cpu(train_ds)
-    mu_ma, deltas_ma = fit_mean_arithmetic(X_tr_cpu, M_tr_cpu)
-    W_ridge = fit_ridge(M_tr_cpu, X_tr_cpu, ridge_lambda)
+
+    cache: BaselineCache | None = None
+    cache_methods: set[str] = set()
+    if use_baseline_cache:
+        cache_root = Path(baseline_cache_root) if baseline_cache_root else DEFAULT_BASELINE_CACHE_ROOT
+        cache = load_or_create(
+            cache_root,
+            holdout_folder=holdout_folder,
+            train_x=X_tr_cpu,
+            train_mask=M_tr_cpu,
+            base_seed=base_seed,
+            ridge_lambda=ridge_lambda,
+            sd3_fingerprint=ImageGenerator.fingerprint(),
+        )
+        cache_methods = {m for m in methods if m in BASELINE_METHODS}
+        loaded_fits = cache.load_fits()
+        if loaded_fits is not None:
+            mu_ma, deltas_ma, W_ridge = loaded_fits
+        else:
+            mu_ma, deltas_ma = fit_mean_arithmetic(X_tr_cpu, M_tr_cpu)
+            W_ridge = fit_ridge(M_tr_cpu, X_tr_cpu, ridge_lambda)
+            cache.save_fits(mu_ma=mu_ma, deltas_ma=deltas_ma, W_ridge=W_ridge)
+    else:
+        mu_ma, deltas_ma = fit_mean_arithmetic(X_tr_cpu, M_tr_cpu)
+        W_ridge = fit_ridge(M_tr_cpu, X_tr_cpu, ridge_lambda)
 
     prompts_path = holdout_folder / "prompts.json"
     with open(prompts_path, "r", encoding="utf-8") as f:
@@ -290,17 +332,22 @@ def run_image_benchmark(
                             for i, a in enumerate(attrs)
                         )
 
-        pred_ssae = predict_embedding_compositional(
-            decoder,
-            model_name,
-            mask_row_ds,
-            mask_reduced_train=train_mask,
-            n_repeat=n_repeat,
-            device=dev_dec,
-            block_means=block_means,
-        )
-        mse_ssae = torch.nn.functional.mse_loss(pred_ssae, x_tgt).item()
-        cos_ssae = torch.nn.functional.cosine_similarity(pred_ssae, x_tgt, dim=-1).mean().item()
+        if want_ssae:
+            pred_ssae = predict_embedding_compositional(
+                decoder,
+                model_name,
+                mask_row_ds,
+                mask_reduced_train=train_mask,
+                n_repeat=n_repeat,
+                device=dev_dec,
+                block_means=block_means,
+            )
+            mse_ssae = torch.nn.functional.mse_loss(pred_ssae, x_tgt).item()
+            cos_ssae = torch.nn.functional.cosine_similarity(pred_ssae, x_tgt, dim=-1).mean().item()
+        else:
+            pred_ssae = None
+            mse_ssae = float("nan")
+            cos_ssae = float("nan")
 
         M_row_cpu = mask_row_ds.float().cpu().unsqueeze(0)
         pred_ma = predict_mean_arithmetic(mu_ma, deltas_ma, M_row_cpu).to(dev_base)
@@ -313,15 +360,16 @@ def run_image_benchmark(
         if do_drop:
             mask_pre_ds = mask_row_ds.clone()
             mask_pre_ds[edit_pid] = 0
-            pred_ssae_pre = predict_embedding_compositional(
-                decoder,
-                model_name,
-                mask_pre_ds,
-                mask_reduced_train=train_mask,
-                n_repeat=n_repeat,
-                device=dev_dec,
-                block_means=block_means,
-            )
+            if want_ssae:
+                pred_ssae_pre = predict_embedding_compositional(
+                    decoder,
+                    model_name,
+                    mask_pre_ds,
+                    mask_reduced_train=train_mask,
+                    n_repeat=n_repeat,
+                    device=dev_dec,
+                    block_means=block_means,
+                )
             M_pre_cpu = mask_pre_ds.float().cpu().unsqueeze(0)
             pred_ma_pre = predict_mean_arithmetic(mu_ma, deltas_ma, M_pre_cpu).to(dev_base)
             pred_ridge_pre = predict_linear(M_pre_cpu, W_ridge).to(dev_base)
@@ -332,53 +380,65 @@ def run_image_benchmark(
             mask_swap_ds[edit_pid] = 0
             mask_swap_ds[swap_target_pid] = 1
             ref_tid_swap = _find_ref_training_tid(train_mask, mask_swap_ds, swap_target_pid)
-            pred_ssae_swap = predict_embedding_compositional(
-                decoder,
-                model_name,
-                mask_swap_ds,
-                mask_reduced_train=train_mask,
-                n_repeat=n_repeat,
-                device=dev_dec,
-                block_means=block_means,
-            )
+            if want_ssae:
+                pred_ssae_swap = predict_embedding_compositional(
+                    decoder,
+                    model_name,
+                    mask_swap_ds,
+                    mask_reduced_train=train_mask,
+                    n_repeat=n_repeat,
+                    device=dev_dec,
+                    block_means=block_means,
+                )
             M_swap_cpu = mask_swap_ds.float().cpu().unsqueeze(0)
             pred_ma_swap = predict_mean_arithmetic(mu_ma, deltas_ma, M_swap_cpu).to(dev_base)
             pred_ridge_swap = predict_linear(M_swap_cpu, W_ridge).to(dev_base)
 
         for method in methods:
-            out_path = img_root / method / f"{idx:05d}.png"
-            out_path.parent.mkdir(parents=True, exist_ok=True)
+            is_cached_method = cache is not None and method in cache_methods
             seed_i = _sample_seed(base_seed, idx)
 
-            if method == "gt_embed":
-                pe, pp = pack_sd3_from_truncated_normalized(holdout_ds, idx, x_tgt.cpu())
-            elif method == "ssae_compose":
-                pe, pp = pack_sd3_from_truncated_normalized(
-                    holdout_ds, idx, pred_ssae.detach().cpu()
-                )
-            elif method == "mean_arithmetic":
-                pe, pp = pack_sd3_from_truncated_normalized(holdout_ds, idx, pred_ma.cpu())
-            elif method == "ridge_embed":
-                pe, pp = pack_sd3_from_truncated_normalized(holdout_ds, idx, pred_ridge.cpu())
-            elif method == "prompt_only":
-                pe, pp = None, None
+            if is_cached_method:
+                out_path = cache.image_path(method, idx, "post")
+                cache.ensure_variant_dir(method, "post")
             else:
-                raise ValueError(f"Unknown method {method}")
+                out_path = img_root / method / f"{idx:05d}.png"
+                out_path.parent.mkdir(parents=True, exist_ok=True)
 
-            if not simulated:
-                if method == "prompt_only":
-                    gen.generate_image_from_prompt(
-                        prompt_text, out_path, use_negative_prompts=False, seed=seed_i
-                    )
-                else:
-                    pe = pe.to(sd_device)
-                    pp = pp.to(sd_device)
-                    gen.generate_image_from_embd(pe, pp, out_path, seed=seed_i)
-            else:
-                _write_placeholder_png(out_path)
-
+            post_cached = is_cached_method and out_path.exists() and cache.has_row(method, idx)
             if method == "gt_embed":
                 ref_paths[idx] = out_path
+
+            if post_cached:
+                # image and row already in cache; nothing to generate for this variant
+                pass
+            else:
+                if method == "gt_embed":
+                    pe, pp = pack_sd3_from_truncated_normalized(holdout_ds, idx, x_tgt.cpu())
+                elif method == "ssae_compose":
+                    pe, pp = pack_sd3_from_truncated_normalized(
+                        holdout_ds, idx, pred_ssae.detach().cpu()
+                    )
+                elif method == "mean_arithmetic":
+                    pe, pp = pack_sd3_from_truncated_normalized(holdout_ds, idx, pred_ma.cpu())
+                elif method == "ridge_embed":
+                    pe, pp = pack_sd3_from_truncated_normalized(holdout_ds, idx, pred_ridge.cpu())
+                elif method == "prompt_only":
+                    pe, pp = None, None
+                else:
+                    raise ValueError(f"Unknown method {method}")
+
+                if not simulated:
+                    if method == "prompt_only":
+                        gen.generate_image_from_prompt(
+                            prompt_text, out_path, use_negative_prompts=False, seed=seed_i
+                        )
+                    else:
+                        pe = pe.to(sd_device)
+                        pp = pp.to(sd_device)
+                        gen.generate_image_from_embd(pe, pp, out_path, seed=seed_i)
+                else:
+                    _write_placeholder_png(out_path)
 
             row = {
                 "task": "holdout_unseen_tuple",
@@ -402,140 +462,160 @@ def run_image_benchmark(
                 "ssim_swap_vs_normal": "",
                 "clip_swap_image_vs_swapped_prompt": "",
             }
-            if method == "ssae_compose":
-                row["mse_embedding_vs_gt"] = mse_ssae
-                row["cosine_embedding_vs_gt"] = cos_ssae
-            elif method == "mean_arithmetic":
-                row["mse_embedding_vs_gt"] = mse_ma
-            elif method == "ridge_embed":
-                row["mse_embedding_vs_gt"] = mse_ridge
+            if not post_cached:
+                if method == "ssae_compose":
+                    row["mse_embedding_vs_gt"] = mse_ssae
+                    row["cosine_embedding_vs_gt"] = cos_ssae
+                elif method == "mean_arithmetic":
+                    row["mse_embedding_vs_gt"] = mse_ma
+                elif method == "ridge_embed":
+                    row["mse_embedding_vs_gt"] = mse_ridge
 
-            if clip_scorer is not None:
-                row["clip_image_vs_full_prompt"] = clip_scorer.image_text_cosine(
-                    out_path, prompt_text
-                )
-                al = clip_scorer.image_attribute_alignment(out_path, attrs)
-                row["clip_mean_vs_attrs"] = al["mean_cosine_attr"]
-                row["clip_min_vs_attrs"] = al["min_cosine_attr"]
-                row["clip_fail"] = float(row["clip_image_vs_full_prompt"] < clip_failure_threshold)
-                if do_drop:
-                    row["clip_image_vs_residual_prompt"] = clip_scorer.image_text_cosine(
-                        out_path, residual_prompt
+                if clip_scorer is not None:
+                    row["clip_image_vs_full_prompt"] = clip_scorer.image_text_cosine(
+                        out_path, prompt_text
                     )
-            else:
-                row["clip_image_vs_full_prompt"] = ""
-                row["clip_mean_vs_attrs"] = ""
-                row["clip_min_vs_attrs"] = ""
-                row["clip_fail"] = ""
+                    al = clip_scorer.image_attribute_alignment(out_path, attrs)
+                    row["clip_mean_vs_attrs"] = al["mean_cosine_attr"]
+                    row["clip_min_vs_attrs"] = al["min_cosine_attr"]
+                    row["clip_fail"] = float(row["clip_image_vs_full_prompt"] < clip_failure_threshold)
+                    if do_drop:
+                        row["clip_image_vs_residual_prompt"] = clip_scorer.image_text_cosine(
+                            out_path, residual_prompt
+                        )
+                else:
+                    row["clip_image_vs_full_prompt"] = ""
+                    row["clip_mean_vs_attrs"] = ""
+                    row["clip_min_vs_attrs"] = ""
+                    row["clip_fail"] = ""
 
-            if (
-                dino_bundle is not None
-                and method != "gt_embed"
-                and idx in ref_paths
-                and not simulated
-            ):
-                from evaluation.dino_embed import dino_cosine_similarity
+                if (
+                    dino_bundle is not None
+                    and method != "gt_embed"
+                    and idx in ref_paths
+                    and not simulated
+                ):
+                    from evaluation.dino_embed import dino_cosine_similarity
 
-                d_m, d_tf, d_dev = dino_bundle
-                row["dino_cosine_vs_gt_embed"] = dino_cosine_similarity(
-                    ref_paths[idx], out_path, d_m, d_tf, d_dev
-                )
+                    d_m, d_tf, d_dev = dino_bundle
+                    row["dino_cosine_vs_gt_embed"] = dino_cosine_similarity(
+                        ref_paths[idx], out_path, d_m, d_tf, d_dev
+                    )
 
-            if not skip_lpips and method != "gt_embed" and idx in ref_paths and not simulated:
-                lp = lpips_alex(ref_paths[idx], out_path, device=clip_device)
-                row["lpips_vs_gt_embed"] = lp if lp is not None else ""
-            else:
-                row["lpips_vs_gt_embed"] = ""
+                if not skip_lpips and method != "gt_embed" and idx in ref_paths and not simulated:
+                    lp = lpips_alex(ref_paths[idx], out_path, device=clip_device)
+                    row["lpips_vs_gt_embed"] = lp if lp is not None else ""
+                else:
+                    row["lpips_vs_gt_embed"] = ""
 
-            if (
-                not skip_pixel_metrics
-                and method != "gt_embed"
-                and idx in ref_paths
-                and not simulated
-            ):
-                row["mse_pixel_vs_gt_embed"] = pixel_mse(ref_paths[idx], out_path)
-                row["ssim_vs_gt_embed"] = ssim(ref_paths[idx], out_path)
+                if (
+                    not skip_pixel_metrics
+                    and method != "gt_embed"
+                    and idx in ref_paths
+                    and not simulated
+                ):
+                    row["mse_pixel_vs_gt_embed"] = pixel_mse(ref_paths[idx], out_path)
+                    row["ssim_vs_gt_embed"] = ssim(ref_paths[idx], out_path)
 
             if do_drop and method != "gt_embed":
-                pre_path = img_root_pre / method / f"{idx:05d}.png"
-                pre_path.parent.mkdir(parents=True, exist_ok=True)
-
-                if method == "prompt_only":
-                    pe_pre, pp_pre = None, None
-                elif method == "ssae_compose":
-                    pe_pre, pp_pre = pack_sd3_from_truncated_normalized(
-                        holdout_ds, idx, pred_ssae_pre.detach().cpu()
-                    )
-                elif method == "mean_arithmetic":
-                    pe_pre, pp_pre = pack_sd3_from_truncated_normalized(
-                        holdout_ds, idx, pred_ma_pre.cpu()
-                    )
-                elif method == "ridge_embed":
-                    pe_pre, pp_pre = pack_sd3_from_truncated_normalized(
-                        holdout_ds, idx, pred_ridge_pre.cpu()
-                    )
+                if is_cached_method:
+                    pre_path = cache.image_path(method, idx, "pre_edit")
+                    cache.ensure_variant_dir(method, "pre_edit")
                 else:
-                    raise ValueError(f"Unknown method {method}")
+                    pre_path = img_root_pre / method / f"{idx:05d}.png"
+                    pre_path.parent.mkdir(parents=True, exist_ok=True)
+                pre_cached = is_cached_method and pre_path.exists()
 
-                if not simulated:
+                if not pre_cached:
                     if method == "prompt_only":
-                        gen.generate_image_from_prompt(
-                            residual_prompt, pre_path, use_negative_prompts=False, seed=seed_i
+                        pe_pre, pp_pre = None, None
+                    elif method == "ssae_compose":
+                        pe_pre, pp_pre = pack_sd3_from_truncated_normalized(
+                            holdout_ds, idx, pred_ssae_pre.detach().cpu()
+                        )
+                    elif method == "mean_arithmetic":
+                        pe_pre, pp_pre = pack_sd3_from_truncated_normalized(
+                            holdout_ds, idx, pred_ma_pre.cpu()
+                        )
+                    elif method == "ridge_embed":
+                        pe_pre, pp_pre = pack_sd3_from_truncated_normalized(
+                            holdout_ds, idx, pred_ridge_pre.cpu()
                         )
                     else:
-                        pe_pre = pe_pre.to(sd_device)
-                        pp_pre = pp_pre.to(sd_device)
-                        gen.generate_image_from_embd(pe_pre, pp_pre, pre_path, seed=seed_i)
-                else:
-                    _write_placeholder_png(pre_path)
+                        raise ValueError(f"Unknown method {method}")
 
-                if not skip_pixel_metrics and not simulated:
+                    if not simulated:
+                        if method == "prompt_only":
+                            gen.generate_image_from_prompt(
+                                residual_prompt, pre_path, use_negative_prompts=False, seed=seed_i
+                            )
+                        else:
+                            pe_pre = pe_pre.to(sd_device)
+                            pp_pre = pp_pre.to(sd_device)
+                            gen.generate_image_from_embd(pe_pre, pp_pre, pre_path, seed=seed_i)
+                    else:
+                        _write_placeholder_png(pre_path)
+
+                if not skip_pixel_metrics and not simulated and not pre_cached:
                     row["mse_pixel_pre_post_edit"] = pixel_mse(pre_path, out_path)
                     row["ssim_pre_post_edit"] = ssim(pre_path, out_path)
 
             if do_swap and method != "gt_embed":
-                swap_path = img_root_swap / method / f"{idx:05d}.png"
-                swap_path.parent.mkdir(parents=True, exist_ok=True)
-
-                if method == "prompt_only":
-                    pe_sw, pp_sw = None, None
-                elif method == "ssae_compose":
-                    pe_sw, pp_sw = pack_sd3_from_truncated_normalized(
-                        train_ds, ref_tid_swap, pred_ssae_swap.detach().cpu()
-                    )
-                elif method == "mean_arithmetic":
-                    pe_sw, pp_sw = pack_sd3_from_truncated_normalized(
-                        train_ds, ref_tid_swap, pred_ma_swap.cpu()
-                    )
-                elif method == "ridge_embed":
-                    pe_sw, pp_sw = pack_sd3_from_truncated_normalized(
-                        train_ds, ref_tid_swap, pred_ridge_swap.cpu()
-                    )
+                if is_cached_method:
+                    swap_path = cache.image_path(method, idx, "swapped")
+                    cache.ensure_variant_dir(method, "swapped")
                 else:
-                    raise ValueError(f"Unknown method {method}")
+                    swap_path = img_root_swap / method / f"{idx:05d}.png"
+                    swap_path.parent.mkdir(parents=True, exist_ok=True)
+                swap_cached = is_cached_method and swap_path.exists()
 
-                if not simulated:
+                if not swap_cached:
                     if method == "prompt_only":
-                        gen.generate_image_from_prompt(
-                            swapped_prompt, swap_path, use_negative_prompts=False, seed=seed_i
+                        pe_sw, pp_sw = None, None
+                    elif method == "ssae_compose":
+                        pe_sw, pp_sw = pack_sd3_from_truncated_normalized(
+                            train_ds, ref_tid_swap, pred_ssae_swap.detach().cpu()
+                        )
+                    elif method == "mean_arithmetic":
+                        pe_sw, pp_sw = pack_sd3_from_truncated_normalized(
+                            train_ds, ref_tid_swap, pred_ma_swap.cpu()
+                        )
+                    elif method == "ridge_embed":
+                        pe_sw, pp_sw = pack_sd3_from_truncated_normalized(
+                            train_ds, ref_tid_swap, pred_ridge_swap.cpu()
                         )
                     else:
-                        pe_sw = pe_sw.to(sd_device)
-                        pp_sw = pp_sw.to(sd_device)
-                        gen.generate_image_from_embd(pe_sw, pp_sw, swap_path, seed=seed_i)
-                else:
-                    _write_placeholder_png(swap_path)
+                        raise ValueError(f"Unknown method {method}")
 
-                if not skip_pixel_metrics and not simulated:
+                    if not simulated:
+                        if method == "prompt_only":
+                            gen.generate_image_from_prompt(
+                                swapped_prompt, swap_path, use_negative_prompts=False, seed=seed_i
+                            )
+                        else:
+                            pe_sw = pe_sw.to(sd_device)
+                            pp_sw = pp_sw.to(sd_device)
+                            gen.generate_image_from_embd(pe_sw, pp_sw, swap_path, seed=seed_i)
+                    else:
+                        _write_placeholder_png(swap_path)
+
+                if not skip_pixel_metrics and not simulated and not swap_cached:
                     row["mse_pixel_swap_vs_normal"] = pixel_mse(swap_path, out_path)
                     row["ssim_swap_vs_normal"] = ssim(swap_path, out_path)
 
-                if clip_scorer is not None:
+                if clip_scorer is not None and not swap_cached:
                     row["clip_swap_image_vs_swapped_prompt"] = (
                         clip_scorer.image_text_cosine(swap_path, swapped_prompt)
                     )
 
-            rows.append(row)
+            if is_cached_method:
+                cached_row = cache.get_row(method, idx)
+                merged = _merge_row(cached_row, row) if cached_row else row
+                cache.upsert_row(merged)
+            else:
+                rows.append(row)
+
+    local_methods = [m for m in methods if not (cache is not None and m in cache_methods)]
 
     csv_path = output_dir / "per_sample.csv"
     if rows:
@@ -546,13 +626,13 @@ def run_image_benchmark(
 
     summary = _aggregate_summary(
         rows,
-        methods=list(methods),
+        methods=local_methods,
         clip_failure_threshold=clip_failure_threshold,
         n_bootstrap=n_bootstrap,
         base_seed=base_seed,
     )
     summary["ridge_lambda"] = ridge_lambda
-    summary["methods"] = list(methods)
+    summary["methods"] = list(local_methods)
 
     mse_ssae = [float(r["mse_embedding_vs_gt"]) for r in rows if r["method"] == "ssae_compose" and r["mse_embedding_vs_gt"] != ""]
     cos_ssae = [float(r["cosine_embedding_vs_gt"]) for r in rows if r["method"] == "ssae_compose" and r["cosine_embedding_vs_gt"] != ""]
@@ -566,6 +646,41 @@ def run_image_benchmark(
 
     with open(output_dir / "summary.json", "w", encoding="utf-8") as f:
         json.dump(summary, f, indent=2)
+
+    if cache is not None:
+        cache_method_list = [m for m in methods if m in cache_methods]
+        cache_rows = list(cache.rows.values())
+        cache_summary = _aggregate_summary(
+            cache_rows,
+            methods=cache_method_list,
+            clip_failure_threshold=clip_failure_threshold,
+            n_bootstrap=n_bootstrap,
+            base_seed=base_seed,
+        )
+        cache_summary["ridge_lambda"] = ridge_lambda
+        cache_summary["methods"] = list(cache_method_list)
+        cache.write(
+            methods=cache_method_list,
+            summary=cache_summary,
+            extra_manifest={
+                "locality_drop_populated": locality_drop_one_attr,
+                "locality_swap_populated": locality_swap_one_attr,
+                "n_samples": n,
+            },
+        )
+        manifest = {
+            "dataset_id": cache.dataset_id,
+            "baseline_cache_dir": str(cache.dir.resolve()),
+            "baseline_methods": cache_method_list,
+            "local_methods": local_methods,
+            "methods": list(methods),
+            "base_seed": base_seed,
+            "ridge_lambda": ridge_lambda,
+            "locality_drop_one_attr": locality_drop_one_attr,
+            "locality_swap_one_attr": locality_swap_one_attr,
+            "n_samples": n,
+        }
+        (output_dir / "manifest.json").write_text(json.dumps(manifest, indent=2))
 
     return summary
 
@@ -757,6 +872,33 @@ def main() -> None:
             "CLIP alignment of the swap image against the swapped prompt."
         ),
     )
+    p.add_argument(
+        "--baseline_cache_root",
+        type=Path,
+        default=DEFAULT_BASELINE_CACHE_ROOT,
+        help=(
+            "Root directory holding the shared per-dataset baseline cache. Non-SSAE methods "
+            "(gt_embed, mean_arithmetic, ridge_embed, prompt_only) are populated here once "
+            "per (holdout, training data, base_seed, ridge_lambda, SD3.5 fingerprint) tuple "
+            "and reused by subsequent runs. Default: results/bench_baseline_cache."
+        ),
+    )
+    p.add_argument(
+        "--no_baseline_cache",
+        action="store_true",
+        help=(
+            "Disable the shared baseline cache; write baselines into the run folder as in "
+            "the legacy monolithic layout."
+        ),
+    )
+    p.add_argument(
+        "--baselines_only",
+        action="store_true",
+        help=(
+            "Skip SSAE rendering; populate the baseline cache and exit. Useful for pre-"
+            "warming a dataset's baselines before comparing several SSAE checkpoints."
+        ),
+    )
     args = p.parse_args()
 
     methods = tuple(m.strip() for m in args.methods.split(",") if m.strip())
@@ -781,6 +923,9 @@ def main() -> None:
         dino_device=args.dino_device,
         locality_drop_one_attr=args.locality_drop_one_attr,
         locality_swap_one_attr=args.locality_swap_one_attr,
+        baseline_cache_root=args.baseline_cache_root,
+        use_baseline_cache=not args.no_baseline_cache,
+        baselines_only=args.baselines_only,
     )
     print(json.dumps(summary, indent=2))
 

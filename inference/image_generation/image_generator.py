@@ -26,6 +26,20 @@ def check_tensor_shape(tensor, tensor_name, correct_shape):
 
 
 class ImageGenerator:
+    MODEL_ID = "stabilityai/stable-diffusion-3.5-large-turbo"
+    NUM_INFERENCE_STEPS = 4
+    GUIDANCE_SCALE = 0.0
+    MAX_SEQUENCE_LENGTH = 512
+
+    @classmethod
+    def fingerprint(cls) -> dict:
+        return {
+            "model_id": cls.MODEL_ID,
+            "num_inference_steps": cls.NUM_INFERENCE_STEPS,
+            "guidance_scale": cls.GUIDANCE_SCALE,
+            "max_sequence_length": cls.MAX_SEQUENCE_LENGTH,
+        }
+
     def __init__(self, simulated: bool = True, device: str = "cpu") -> None:
         self.simulated = simulated
         self.device = device
@@ -47,7 +61,7 @@ class ImageGenerator:
         )
         from transformers import T5EncoderModel
 
-        model_id = "stabilityai/stable-diffusion-3.5-large-turbo"
+        model_id = self.MODEL_ID
 
         nf4_config = BitsAndBytesConfig(
             load_in_4bit=True,
@@ -151,9 +165,9 @@ class ImageGenerator:
             negative_prompt_embeds=negative_prompt_embeds,
             pooled_prompt_embeds=pooled_prompt_embeds,
             negative_pooled_prompt_embeds=negative_pooled_prompt_embeds,
-            num_inference_steps=4,
-            guidance_scale=0.0,
-            max_sequence_length=512,
+            num_inference_steps=self.NUM_INFERENCE_STEPS,
+            guidance_scale=self.GUIDANCE_SCALE,
+            max_sequence_length=self.MAX_SEQUENCE_LENGTH,
         ).images[0]
         image.save(image_name)
         print(f"Image saved in {image_name}")
