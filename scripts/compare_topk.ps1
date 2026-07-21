@@ -11,13 +11,20 @@
       2. (Optional) Extract SD3.5 text embeddings for both splits.
       3. For each (topk, layers) pair:
            - Write a per-run YAML with truncate_embds_topk = k and num_layers = L.
-           - Train the SSAE.
+           - Train the SSAE (unless -SkipTraining).
            - Copy the training folder's truncation sidecars to holdout/.
            - Run evaluation.run_compositional_embeddings; capture mse/cosine.
+           - Optionally run evaluation.run_image_benchmark (with -RunImageBenchmark).
       4. Aggregate all runs into <RunsRoot>/sweep_summary.csv.
 
     Existing splits and embeddings are reused unless the corresponding
-    -Recreate* switch is set. Training always runs (that's the sweep).
+    -Recreate* switch is set. Training always runs (that's the sweep), unless
+    -SkipTraining is passed (useful with -RunImageBenchmark for a
+    benchmarks-only pass over previously trained checkpoints).
+
+    The image benchmark shares baselines across runs via the per-dataset cache
+    at results/bench_baseline_cache/<dataset_id>/ — the first run populates
+    baselines, subsequent runs render only ssae_compose.
 
 .PARAMETER RepoRoot
     Repository root; defaults to the current directory.
@@ -64,6 +71,50 @@
 .PARAMETER RecreateEmbeddings
     Re-extract embeddings even if <split>/embds/manifest.json exists.
 
+.PARAMETER SkipTraining
+    Skip the training step. Existing run folders under <RunsRoot>/<tag>/ are
+    assumed to hold a trained checkpoint. Meant to be combined with
+    -RunImageBenchmark.
+
+.PARAMETER RunImageBenchmark
+    After (or instead of) training each (topk, layers) checkpoint, run
+    evaluation.run_image_benchmark against the holdout. Baselines share the
+    per-dataset cache at -BaselineCacheRoot.
+
+.PARAMETER BenchRoot
+    Root directory for image-benchmark output folders. Each run lands under
+    <BenchRoot>/<tag>. Default: results/bench_out.
+
+.PARAMETER BaselineCacheRoot
+    Shared per-dataset baseline cache root passed to run_image_benchmark.
+    Default: results/bench_baseline_cache.
+
+.PARAMETER BenchmarkMaxSamples
+    Cap on holdout samples rendered per method. 0 = no cap.
+
+.PARAMETER BenchmarkSdDevice
+    Device for the SD3.5 pipeline (default: cuda).
+
+.PARAMETER BenchmarkSsaeDevice
+    Device for the SSAE decoder. Empty = defaults to BenchmarkSdDevice.
+
+.PARAMETER BenchmarkBaselineDevice
+    Device for ridge / mean-arithmetic predictions. Empty = defaults to
+    BenchmarkSsaeDevice.
+
+.PARAMETER LocalityDrop
+    Enable the drop-one-attribute locality test.
+
+.PARAMETER LocalitySwap
+    Enable the value-swap locality test.
+
+.PARAMETER BenchmarkDino
+    Compute DINOv2 cosine similarity vs the GT-embed reference image.
+
+.PARAMETER BenchmarkSimulated
+    Skip real SD3 rendering; write placeholder PNGs. For smoke-testing the
+    pipeline end-to-end.
+
 .PARAMETER Python
     Python interpreter (default: python).
 
@@ -72,12 +123,12 @@
     ./scripts/compare_topk.ps1
 
 .EXAMPLE
-    # 4 topk x 3 layer counts = 12 runs, wide hidden
-    ./scripts/compare_topk.ps1 -TopK 500,1000,2000,5000 -Layers 1,2,3 -HiddenDim 1024
+    # Sweep + image benchmark in one go
+    ./scripts/compare_topk.ps1 -Layers 1,2 -HiddenDim 1024 -RunImageBenchmark -LocalityDrop
 
 .EXAMPLE
-    # Just sweep depth at a fixed topk
-    ./scripts/compare_topk.ps1 -TopK 1000 -Layers 1,2,3,4 -HiddenDim 2048
+    # Skip training; run image benchmarks over existing checkpoints
+    ./scripts/compare_topk.ps1 -TopK 500,1000,2000,5000 -Layers 1,2 -SkipTraining -RunImageBenchmark
 #>
 
 [CmdletBinding()]
@@ -96,6 +147,18 @@ param(
     [string]$Backbone = "sd35_turbo_text_only",
     [switch]$RecreateSplit,
     [switch]$RecreateEmbeddings,
+    [switch]$SkipTraining,
+    [switch]$RunImageBenchmark,
+    [string]$BenchRoot = "results/bench_out",
+    [string]$BaselineCacheRoot = "results/bench_baseline_cache",
+    [int]$BenchmarkMaxSamples = 0,
+    [string]$BenchmarkSdDevice = "cuda",
+    [string]$BenchmarkSsaeDevice = "",
+    [string]$BenchmarkBaselineDevice = "",
+    [switch]$LocalityDrop,
+    [switch]$LocalitySwap,
+    [switch]$BenchmarkDino,
+    [switch]$BenchmarkSimulated,
     [string]$Python = "python"
 )
 
@@ -120,10 +183,12 @@ function Resolve-Under([string]$Base, [string]$Path) {
     return (ToPosix (Join-Path $Base $Path))
 }
 
-$Categories     = Resolve-Under $RepoRoot $Categories
-$PropertiesSame = Resolve-Under $RepoRoot $PropertiesSame
-$SplitRoot      = Resolve-Under $RepoRoot $SplitRoot
-$RunsRoot       = Resolve-Under $RepoRoot $RunsRoot
+$Categories        = Resolve-Under $RepoRoot $Categories
+$PropertiesSame    = Resolve-Under $RepoRoot $PropertiesSame
+$SplitRoot         = Resolve-Under $RepoRoot $SplitRoot
+$RunsRoot          = Resolve-Under $RepoRoot $RunsRoot
+$BenchRoot         = Resolve-Under $RepoRoot $BenchRoot
+$BaselineCacheRoot = Resolve-Under $RepoRoot $BaselineCacheRoot
 
 if (-not (Test-Path -LiteralPath $Categories)) {
     throw "Categories file not found: $Categories`n" +
@@ -210,7 +275,9 @@ Extract-Embeddings $HoldoutDir
 
 # 3. Sweep -------------------------------------------------------------------
 $SummaryCsv = ToPosix (Join-Path $RunsRoot "sweep_summary.csv")
-"topk,layers,hidden_dim,mse_mean,cosine_mean,n_holdout,elapsed_sec,output_folder" | Set-Content -Path $SummaryCsv -Encoding utf8
+"topk,layers,hidden_dim,mse_mean,cosine_mean,n_holdout,elapsed_sec,output_folder,bench_dir" | Set-Content -Path $SummaryCsv -Encoding utf8
+
+if ($RunImageBenchmark) { New-Item -ItemType Directory -Path $BenchRoot -Force | Out-Null }
 
 # $TrainDir is already POSIX at this point.
 $trainDirPosix = $TrainDir
@@ -262,23 +329,31 @@ training:
     n_repeat: 10
 "@ | Set-Content -Path $yamlPath -Encoding utf8
 
-        $trainArgs = @(
-            "training_cli.py",
-            "--output_folder", $runDir,
-            "--path_yaml", $yamlPath,
-            "--overwrite_output", "True",
-            "--num_layers", "$L"
-        )
-        if ($L -gt 1) { $trainArgs += @("--hidden_dims", "$HiddenDim") }
+        $elapsed = 0
+        if ($SkipTraining) {
+            if (-not (Test-Path -LiteralPath (Join-Path $runDir "model.pt"))) {
+                throw "Missing checkpoint at $runDir/model.pt; drop -SkipTraining or train it first."
+            }
+            Write-Host "  -SkipTraining set; reusing checkpoint at $runDir" -ForegroundColor Yellow
+        } else {
+            $trainArgs = @(
+                "training_cli.py",
+                "--output_folder", $runDir,
+                "--path_yaml", $yamlPath,
+                "--overwrite_output", "True",
+                "--num_layers", "$L"
+            )
+            if ($L -gt 1) { $trainArgs += @("--hidden_dims", "$HiddenDim") }
 
-        $t0 = Get-Date
-        Invoke-Py $trainArgs
-        $elapsed = [int]((Get-Date) - $t0).TotalSeconds
+            $t0 = Get-Date
+            Invoke-Py $trainArgs
+            $elapsed = [int]((Get-Date) - $t0).TotalSeconds
+        }
 
-        # The first run at each topk k wrote indices_top_{k}.json +
-        # embds_{max,min}_top_{k}.json into $TrainDir. Re-copy every time — cheap
-        # and keeps the holdout sidecars in sync even when the training folder
-        # changes across layer sweeps.
+        # The first training run at each topk k writes indices_top_{k}.json +
+        # embds_{max,min}_top_{k}.json into $TrainDir. Copy them onto the holdout
+        # so downstream eval reuses the same coordinate selection + normalization.
+        # Cheap; run every time to stay in sync across layer sweeps.
         Invoke-Py @(
             "-m", "evaluation.run_copy_truncation",
             "--train_folder",   $TrainDir,
@@ -300,9 +375,32 @@ training:
             if ($null -ne $obj.cosine_mean) { $cos   = $obj.cosine_mean }
             if ($null -ne $obj.n_holdout)   { $nHold = $obj.n_holdout }
         }
+
+        $benchDir = ""
+        if ($RunImageBenchmark) {
+            $benchDir = ToPosix (Join-Path $BenchRoot $tag)
+            Write-Host "  -- image benchmark -> $benchDir" -ForegroundColor Cyan
+            $benchArgs = @(
+                "-m", "evaluation.run_image_benchmark",
+                "--checkpoint",         $runDir,
+                "--holdout_folder",     $HoldoutDir,
+                "--output_dir",         $benchDir,
+                "--baseline_cache_root", $BaselineCacheRoot,
+                "--sd_device",          $BenchmarkSdDevice
+            )
+            if ($BenchmarkSsaeDevice)     { $benchArgs += @("--ssae_device",     $BenchmarkSsaeDevice) }
+            if ($BenchmarkBaselineDevice) { $benchArgs += @("--baseline_device", $BenchmarkBaselineDevice) }
+            if ($BenchmarkMaxSamples -gt 0) { $benchArgs += @("--max_samples", "$BenchmarkMaxSamples") }
+            if ($LocalityDrop)       { $benchArgs += "--locality_drop_one_attr" }
+            if ($LocalitySwap)       { $benchArgs += "--locality_swap_one_attr" }
+            if ($BenchmarkDino)      { $benchArgs += "--dino" }
+            if ($BenchmarkSimulated) { $benchArgs += "--simulated" }
+            Invoke-Py $benchArgs
+        }
+
         $hiddenCol = if ($L -eq 1) { "" } else { "$HiddenDim" }
-        "$k,$L,$hiddenCol,$mse,$cos,$nHold,$elapsed,$runDir" | Add-Content $SummaryCsv
-        Write-Host ("  topk={0} L={1} h={2} mse={3} cosine={4} elapsed={5}s" -f $k, $L, $hiddenCol, $mse, $cos, $elapsed) -ForegroundColor Green
+        "$k,$L,$hiddenCol,$mse,$cos,$nHold,$elapsed,$runDir,$benchDir" | Add-Content $SummaryCsv
+        Write-Host ("  topk={0} L={1} h={2} mse={3} cosine={4} elapsed={5}s bench={6}" -f $k, $L, $hiddenCol, $mse, $cos, $elapsed, $benchDir) -ForegroundColor Green
     }
 }
 
