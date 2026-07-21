@@ -53,7 +53,11 @@ from evaluation.composition import (
 from evaluation.io import ensure_folder_path, h5_dataset_for_folder, load_decoder_checkpoint
 from evaluation.lpips_metric import lpips_alex
 from evaluation.pixel_metrics import pixel_mse, ssim
-from evaluation.sd3_pack import pack_sd3_from_truncated_normalized
+from evaluation.sd3_pack import (
+    compute_or_load_full_mean,
+    pack_sd3_from_truncated_normalized,
+    packer_fingerprint,
+)
 from inference.image_generation.image_generator import ImageGenerator
 
 DEFAULT_BASELINE_CACHE_ROOT = Path("results/bench_baseline_cache")
@@ -232,6 +236,12 @@ def run_image_benchmark(
 
     X_tr_cpu, M_tr_cpu = _stack_cpu(train_ds)
 
+    # Training-set mean of the full untruncated embedding — used to fill the
+    # non-top-k coordinates when packing SSAE/baseline predictions for SD3. Keeps
+    # image-space rendering free of ground-truth holdout leakage into the
+    # ~99.93% of dims the SSAE doesn't predict.
+    pack_template = compute_or_load_full_mean(train_ds).cpu()
+
     cache: BaselineCache | None = None
     cache_methods: set[str] = set()
     if use_baseline_cache:
@@ -244,6 +254,7 @@ def run_image_benchmark(
             base_seed=base_seed,
             ridge_lambda=ridge_lambda,
             sd3_fingerprint=ImageGenerator.fingerprint(),
+            packer_fingerprint=packer_fingerprint(),
         )
         cache_methods = {m for m in methods if m in BASELINE_METHODS}
         loaded_fits = cache.load_fits()
@@ -414,15 +425,15 @@ def run_image_benchmark(
                 pass
             else:
                 if method == "gt_embed":
-                    pe, pp = pack_sd3_from_truncated_normalized(holdout_ds, idx, x_tgt.cpu())
+                    pe, pp = pack_sd3_from_truncated_normalized(holdout_ds, idx, x_tgt.cpu(), template=pack_template)
                 elif method == "ssae_compose":
                     pe, pp = pack_sd3_from_truncated_normalized(
-                        holdout_ds, idx, pred_ssae.detach().cpu()
+                        holdout_ds, idx, pred_ssae.detach().cpu(), template=pack_template
                     )
                 elif method == "mean_arithmetic":
-                    pe, pp = pack_sd3_from_truncated_normalized(holdout_ds, idx, pred_ma.cpu())
+                    pe, pp = pack_sd3_from_truncated_normalized(holdout_ds, idx, pred_ma.cpu(), template=pack_template)
                 elif method == "ridge_embed":
-                    pe, pp = pack_sd3_from_truncated_normalized(holdout_ds, idx, pred_ridge.cpu())
+                    pe, pp = pack_sd3_from_truncated_normalized(holdout_ds, idx, pred_ridge.cpu(), template=pack_template)
                 elif method == "prompt_only":
                     pe, pp = None, None
                 else:
@@ -531,15 +542,15 @@ def run_image_benchmark(
                         pe_pre, pp_pre = None, None
                     elif method == "ssae_compose":
                         pe_pre, pp_pre = pack_sd3_from_truncated_normalized(
-                            holdout_ds, idx, pred_ssae_pre.detach().cpu()
+                            holdout_ds, idx, pred_ssae_pre.detach().cpu(), template=pack_template
                         )
                     elif method == "mean_arithmetic":
                         pe_pre, pp_pre = pack_sd3_from_truncated_normalized(
-                            holdout_ds, idx, pred_ma_pre.cpu()
+                            holdout_ds, idx, pred_ma_pre.cpu(), template=pack_template
                         )
                     elif method == "ridge_embed":
                         pe_pre, pp_pre = pack_sd3_from_truncated_normalized(
-                            holdout_ds, idx, pred_ridge_pre.cpu()
+                            holdout_ds, idx, pred_ridge_pre.cpu(), template=pack_template
                         )
                     else:
                         raise ValueError(f"Unknown method {method}")
@@ -574,15 +585,15 @@ def run_image_benchmark(
                         pe_sw, pp_sw = None, None
                     elif method == "ssae_compose":
                         pe_sw, pp_sw = pack_sd3_from_truncated_normalized(
-                            train_ds, ref_tid_swap, pred_ssae_swap.detach().cpu()
+                            train_ds, ref_tid_swap, pred_ssae_swap.detach().cpu(), template=pack_template
                         )
                     elif method == "mean_arithmetic":
                         pe_sw, pp_sw = pack_sd3_from_truncated_normalized(
-                            train_ds, ref_tid_swap, pred_ma_swap.cpu()
+                            train_ds, ref_tid_swap, pred_ma_swap.cpu(), template=pack_template
                         )
                     elif method == "ridge_embed":
                         pe_sw, pp_sw = pack_sd3_from_truncated_normalized(
-                            train_ds, ref_tid_swap, pred_ridge_swap.cpu()
+                            train_ds, ref_tid_swap, pred_ridge_swap.cpu(), template=pack_template
                         )
                     else:
                         raise ValueError(f"Unknown method {method}")

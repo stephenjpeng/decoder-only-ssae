@@ -74,6 +74,7 @@ def compute_dataset_id(
     base_seed: int,
     ridge_lambda: float,
     sd3_fingerprint: dict,
+    packer_fingerprint: dict | None = None,
 ) -> tuple[str, dict]:
     holdout_hash = _sha256_file(Path(holdout_folder) / "prompts.json")
     train_x_np = train_x.detach().to(torch.float32).cpu().contiguous().numpy()
@@ -87,6 +88,7 @@ def compute_dataset_id(
         "base_seed": int(base_seed),
         "ridge_lambda": float(ridge_lambda),
         "sd3_fingerprint": sd3_fingerprint,
+        "packer_fingerprint": packer_fingerprint or {},
     }
     canonical = json.dumps(key, sort_keys=True).encode("utf-8")
     return _sha256_bytes(canonical)[:16], key
@@ -231,6 +233,7 @@ def load_or_create(
     base_seed: int,
     ridge_lambda: float,
     sd3_fingerprint: dict,
+    packer_fingerprint: dict | None = None,
 ) -> BaselineCache:
     dataset_id, key = compute_dataset_id(
         holdout_folder=holdout_folder,
@@ -239,5 +242,6 @@ def load_or_create(
         base_seed=base_seed,
         ridge_lambda=ridge_lambda,
         sd3_fingerprint=sd3_fingerprint,
+        packer_fingerprint=packer_fingerprint,
     )
     return BaselineCache(root=Path(root), dataset_id=dataset_id, key=key)

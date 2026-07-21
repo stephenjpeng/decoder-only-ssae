@@ -311,7 +311,9 @@ Unified CLI: `python -m evaluation.cli <subcommand> ...` (see `evaluation/cli.py
 
 `run_image_benchmark` caches the non-SSAE baselines (`gt_embed`, `mean_arithmetic`, `ridge_embed`, `prompt_only`) under `results/bench_baseline_cache/<dataset_id>/` and reuses them across runs. A run folder then holds only SSAE outputs plus a `manifest.json` pointing at the cache. The Streamlit viewer merges the two transparently.
 
-Dataset identity (`dataset_id`) is a short hash of: the holdout `prompts.json`, the training embeddings + mask, `--base_seed`, `--ridge_lambda`, and the SD3.5 pipeline fingerprint (model id, steps, guidance, sequence length). Changing any of these creates a fresh cache directory; locality flags grow an existing cache in place.
+Dataset identity (`dataset_id`) is a short hash of: the holdout `prompts.json`, the training embeddings + mask, `--base_seed`, `--ridge_lambda`, the SD3.5 pipeline fingerprint (model id, steps, guidance, sequence length), and the packer fingerprint (`fill_policy` + `packer_version`; currently `train_mean_fill` / v2). Changing any of these creates a fresh cache directory; locality flags grow an existing cache in place.
+
+**Fill policy for non-top-k dimensions.** `run_image_benchmark` fills the ~1.36M non-top-k coordinates of the SD3.5 conditioning tensor with the **training-set mean** (cached at `<train_folder>/full_embd_mean.pt`), not with the holdout row's true embedding. This avoids leaking ground truth through the coordinates the SSAE doesn't predict; every method sees the same template and the metrics reflect only the top-k prediction. Legacy oracle-fill behavior (used by `run_magnitude_sensitivity` and inference notebooks that don't pass `template=`) is still available for callers that want it, but any cache populated under one policy is invalidated by the packer fingerprint when the other policy runs.
 
 Flags:
 
