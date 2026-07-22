@@ -3,6 +3,17 @@ import argparse
 from trainable_inputs_all_clips import training
 
 
+def _parse_bool_cli(value: str):
+    if value is None:
+        return None
+    v = value.strip().lower()
+    if v in ("true", "1", "yes", "y"):
+        return True
+    if v in ("false", "0", "no", "n"):
+        return False
+    raise argparse.ArgumentTypeError(f"expected True/False, got {value!r}")
+
+
 def _parse_hidden_dims_cli(value: str):
     if value is None:
         return None
@@ -55,6 +66,13 @@ if __name__ == "__main__":
         "Length must be num_layers-1 (or a single int to broadcast). "
         "Overrides YAML when set.",
     )
+    parser.add_argument(
+        "--pca_rotation",
+        type=_parse_bool_cli,
+        default=None,
+        help="If True, rotate embeddings into a top-k PCA basis before "
+        "truncation. Overrides YAML when set.",
+    )
     args = parser.parse_args()
 
     training(
@@ -63,4 +81,5 @@ if __name__ == "__main__":
         overwrite_output=args.overwrite_output,
         num_layers=args.num_layers,
         hidden_dims=args.hidden_dims,
+        pca_rotation=args.pca_rotation,
     )

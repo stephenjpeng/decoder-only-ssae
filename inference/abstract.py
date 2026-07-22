@@ -142,7 +142,14 @@ class SFDInference:
         full_embd = self.get_full_embedding(idx)
 
         embd_topk = self.dataset.denormalize(embd_topk)
-        full_embd[self.dataset.indices_truncate_embds_topk] = embd_topk
+
+        if self.dataset.pca_rotation:
+            # slot the edited top-k dims into the rotated full vector, then invert
+            full_rot = (full_embd - self.dataset.pca_mean) @ self.dataset.pca_components
+            full_rot[self.dataset.indices_truncate_embds_topk] = embd_topk
+            full_embd = self.dataset.pca_mean + full_rot @ self.dataset.pca_components.T
+        else:
+            full_embd[self.dataset.indices_truncate_embds_topk] = embd_topk
 
         streams: dict[str, torch.Tensor] = {}
         offset = 0
@@ -168,12 +175,15 @@ class SFDInference:
     def get_full_embedding(self, idx: int) -> torch.tensor:
         indices_truncate_embds_topk = self.dataset.indices_truncate_embds_topk
         normalize = self.dataset.normalize
+        pca_rotation = self.dataset.pca_rotation
         self.dataset.indices_truncate_embds_topk = None
         self.dataset.normalize = None
+        self.dataset.pca_rotation = False
 
         full_embd, _ = self.dataset.__getitem__(idx)
 
         self.dataset.indices_truncate_embds_topk = indices_truncate_embds_topk
         self.dataset.normalize = normalize
+        self.dataset.pca_rotation = pca_rotation
 
         return full_embd

@@ -12,6 +12,7 @@ training:
     folder_path: "results/compositional_split/train/"
     truncate_n_prompts: null
     truncate_embds_topk: 1000
+    pca_rotation: False
     add_property_is_the_same: True
     normalize: "MAX_MIN"
     num_workers: 1

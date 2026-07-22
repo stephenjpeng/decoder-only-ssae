@@ -37,6 +37,7 @@ class H5Dataset(Dataset):
         dim_clip_simulated=5000,
         logger=None,
         normalize=None,
+        pca_rotation=False,
     ):
         self.folder_path = folder_path
         self.truncate_n_prompts = truncate_n_prompts
@@ -44,6 +45,9 @@ class H5Dataset(Dataset):
         self.log_print = print if self.logger is None else logger.print
         self.truncate_embds_topk = truncate_embds_topk
         self.indices_truncate_embds_topk = None
+        self.pca_rotation = bool(pca_rotation)
+        self.pca_mean = None
+        self.pca_components = None
         self.normalize = None  # we init the dateset with self.normalize = None and overwrite it to its actual value (normalize) at the end of the init
 
         self.X = None
@@ -141,6 +145,9 @@ class H5Dataset(Dataset):
         self.dim_x = int(vector_0.size()[0])
         self.log_print(f"dim_x = {self.dim_x}")
 
+        # PCA rotation (must run before truncate_embds so top-k operates on rotated X)
+        self.fit_or_load_pca()
+
         # truncate_embds_topk
         self.truncate_embds()
 
@@ -168,6 +175,10 @@ class H5Dataset(Dataset):
             parts.append(torch.from_numpy(arr).to(torch.float32).flatten())
 
         embds = torch.cat(parts) if len(parts) > 1 else parts[0]
+
+        if self.pca_rotation and self.pca_components is not None:
+            embds = (embds - self.pca_mean) @ self.pca_components
+
         if self.indices_truncate_embds_topk is not None:
             embds = embds[self.indices_truncate_embds_topk]
 
@@ -210,12 +221,60 @@ class H5Dataset(Dataset):
     def build_property_is_the_same(self):
         pass
 
+    def _cache_suffix(self):
+        # keeps PCA and non-PCA cached artifacts against the same folder_path
+        # from clobbering each other
+        return "_pca" if self.pca_rotation else ""
+
+    def fit_or_load_pca(self):
+        if not self.pca_rotation:
+            return
+        if self.truncate_embds_topk is None:
+            raise ValueError(
+                "pca_rotation=True requires truncate_embds_topk to be set: "
+                "the number of PCA components is tied to top-k."
+            )
+
+        mean_path = os.path.join(self.folder_path, "pca_mean.pt")
+        comp_path = os.path.join(self.folder_path, "pca_components.pt")
+
+        if os.path.exists(mean_path) and os.path.exists(comp_path):
+            self.log_print(f"Found {mean_path} and {comp_path}; loading PCA basis.")
+            self.pca_mean = torch.load(mean_path)
+            self.pca_components = torch.load(comp_path)
+            self.dim_x = int(self.pca_components.shape[1])
+            return
+
+        self.log_print(
+            f"Fitting PCA basis (q={self.truncate_embds_topk}) on raw X..."
+        )
+        # temporarily disable rotation so get_X() fetches the raw D-dim vectors
+        self.pca_rotation = False
+        X_raw = self.get_X()
+        self.pca_rotation = True
+
+        mu = X_raw.mean(dim=0)
+        Xc = X_raw - mu
+        _, _, V = torch.pca_lowrank(Xc, q=self.truncate_embds_topk, niter=4)
+
+        self.pca_mean = mu
+        self.pca_components = V
+        self.dim_x = int(V.shape[1])
+
+        torch.save(self.pca_mean, mean_path)
+        torch.save(self.pca_components, comp_path)
+        self.log_print(f"Saved PCA basis to {mean_path} and {comp_path}.")
+
+        # replace cached raw X with its rotated form so downstream (top-k,
+        # min/max) sees the rotated space without re-reading H5
+        self.X = Xc @ self.pca_components
+
     def truncate_embds(self):
         if self.truncate_embds_topk is not None:
             self.log_print(
                 f"Truncating embeddings from {self.dim_x} to {self.truncate_embds_topk}..."
             )
-            file = f"indices_top_{self.truncate_embds_topk}.json"
+            file = f"indices_top_{self.truncate_embds_topk}{self._cache_suffix()}.json"
             if os.path.exists(os.path.join(self.folder_path, file)):
                 self.log_print(f"Found {file}")
                 with open(os.path.join(self.folder_path, file), "r") as f:
@@ -245,9 +304,10 @@ class H5Dataset(Dataset):
         self.log_print(
             "Highest diff (max - min) in new dataset : ", diff[diff_argsort[0]]
         )
+        last_idx = min(self.truncate_embds_topk, diff_argsort.numel()) - 1
         self.log_print(
-            "Lowest diff (max - min) in new dataset : ",
-            diff[diff_argsort[self.truncate_embds_topk]],
+            "Lowest diff (max - min) in kept dims : ",
+            diff[diff_argsort[last_idx]],
         )
 
         return diff_argsort[: self.truncate_embds_topk].tolist()
@@ -255,15 +315,16 @@ class H5Dataset(Dataset):
     def get_min_max_X(self):
         if self.normalize == MAX_MIN:
             self.log_print(f"Setting up {MAX_MIN} normalization")
+            suffix = self._cache_suffix()
             file_max = (
-                f"embds_max_top_{self.truncate_embds_topk}.json"
+                f"embds_max_top_{self.truncate_embds_topk}{suffix}.json"
                 if self.truncate_embds_topk is not None
-                else "embds_max.json"
+                else f"embds_max{suffix}.json"
             )
             file_min = (
-                f"embds_min_top_{self.truncate_embds_topk}.json"
+                f"embds_min_top_{self.truncate_embds_topk}{suffix}.json"
                 if self.truncate_embds_topk is not None
-                else "embds_min.json"
+                else f"embds_min{suffix}.json"
             )
             if os.path.exists(os.path.join(self.folder_path, file_max)):
                 self.log_print(f"Found {file_max}")

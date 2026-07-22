@@ -53,6 +53,12 @@
 .PARAMETER HiddenDim
     Width of each hidden layer when Layers > 1. Ignored for Layers == 1.
 
+.PARAMETER PcaRotation
+    Rotate embeddings into a top-k PCA basis before truncation. The basis is
+    fit once per unique TopK value against the train split and cached as
+    pca_mean.pt / pca_components.pt in the split folder. Run tags are
+    suffixed with "_pca" so PCA and non-PCA sweeps don't collide.
+
 .PARAMETER HoldoutFraction
     Fraction of the full factorial reserved as holdout (compositional_split).
 
@@ -141,6 +147,7 @@ param(
     [int[]]$TopK = @(500, 1000, 2000, 5000),
     [int[]]$Layers = @(1),
     [int]$HiddenDim = 1024,
+    [switch]$PcaRotation,
     [double]$HoldoutFraction = 0.1,
     [int]$MaxTrainPrompts = 0,
     [int]$MaxHoldoutPrompts = 0,
@@ -285,6 +292,7 @@ $trainDirPosix = $TrainDir
 foreach ($k in $TopK) {
     foreach ($L in $Layers) {
         $tag = if ($L -eq 1) { "topk_${k}_L1" } else { "topk_${k}_L${L}_h${HiddenDim}" }
+        if ($PcaRotation) { $tag = "${tag}_pca" }
         Write-Host "== $tag ==" -ForegroundColor Green
 
         $runDir     = ToPosix (Join-Path $RunsRoot $tag)
@@ -294,6 +302,7 @@ foreach ($k in $TopK) {
         # YAML head shape. `num_layers` and `hidden_dims` are also overridden by
         # the CLI below; keeping them in the YAML too keeps the file self-describing.
         $hiddenYaml = if ($L -eq 1) { "null" } else { "$HiddenDim" }
+        $pcaYaml    = if ($PcaRotation) { "True" } else { "False" }
 @"
 training:
   model:
@@ -305,6 +314,7 @@ training:
     folder_path: "$trainDirPosix/"
     truncate_n_prompts: null
     truncate_embds_topk: $k
+    pca_rotation: $pcaYaml
     add_property_is_the_same: True
     normalize: "MAX_MIN"
     num_workers: 1
@@ -344,6 +354,7 @@ training:
                 "--num_layers", "$L"
             )
             if ($L -gt 1) { $trainArgs += @("--hidden_dims", "$HiddenDim") }
+            if ($PcaRotation) { $trainArgs += @("--pca_rotation", "True") }
 
             $t0 = Get-Date
             Invoke-Py $trainArgs
