@@ -161,6 +161,20 @@ class H5Dataset(Dataset):
             properties=self.properties, same_id=self.same_id, logger=self.logger
         )
 
+        # final invariant: what the dataloader actually emits must match dim_x.
+        # If this fails, something in the truncation / PCA / normalization
+        # pipeline is out of sync with what the decoder gets built against.
+        probe, _ = self.__getitem__(0)
+        if int(probe.shape[0]) != self.dim_x:
+            raise RuntimeError(
+                f"H5Dataset produced a vector of size {int(probe.shape[0])} but "
+                f"dim_x={self.dim_x}. "
+                f"truncate_embds_topk={self.truncate_embds_topk}, "
+                f"pca_rotation={self.pca_rotation}, "
+                f"indices_len={None if self.indices_truncate_embds_topk is None else len(self.indices_truncate_embds_topk)}, "
+                f"pca_components_shape={None if self.pca_components is None else tuple(self.pca_components.shape)}."
+            )
+
     def __len__(self):
         return self.mask_reduced.shape[0]
 
@@ -294,6 +308,16 @@ class H5Dataset(Dataset):
                 self.log_print(f"Found {file}")
                 with open(os.path.join(self.folder_path, file), "r") as f:
                     self.indices_truncate_embds_topk = json.load(f)
+                if len(self.indices_truncate_embds_topk) != self.truncate_embds_topk:
+                    self.log_print(
+                        f"Stale {file}: has {len(self.indices_truncate_embds_topk)} "
+                        f"entries, expected {self.truncate_embds_topk}. Recomputing."
+                    )
+                    self.indices_truncate_embds_topk = (
+                        self.get_indices_truncate_embds_topk()
+                    )
+                    with open(os.path.join(self.folder_path, file), "w") as f:
+                        json.dump(self.indices_truncate_embds_topk, f)
             else:
                 self.log_print(f"Did not find {file}. Re-calculating it...")
                 self.indices_truncate_embds_topk = (
