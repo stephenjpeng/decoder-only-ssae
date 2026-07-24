@@ -376,6 +376,17 @@ class H5Dataset(Dataset):
                     self.embds_max = json.load(f)
                 with open(os.path.join(self.folder_path, file_min), "r") as f:
                     self.embds_min = json.load(f)
+                if len(self.embds_max) != self.dim_x or len(self.embds_min) != self.dim_x:
+                    self.log_print(
+                        f"Stale {file_max}/{file_min}: len={len(self.embds_max)}/"
+                        f"{len(self.embds_min)}, expected {self.dim_x}. Recomputing."
+                    )
+                    self.embds_max, self.embds_min = self._get_min_max_X()
+                    for file, embds_extreme in zip(
+                        [file_max, file_min], [self.embds_max, self.embds_min]
+                    ):
+                        with open(os.path.join(self.folder_path, file), "w") as f:
+                            json.dump(embds_extreme.tolist(), f)
 
             else:
                 self.log_print(f"Did not find {file_max}. Re-calculating it...")
@@ -394,7 +405,15 @@ class H5Dataset(Dataset):
         if self.X is None:
             _ = self.get_X()
 
-        if self.indices_truncate_embds_topk is not None:
+        # self.X may already be truncation-applied (shape (N, k)) if it was
+        # populated by _get_X_real AFTER indices_truncate_embds_topk was set --
+        # e.g. when normalization stats are recomputed on a stale-cache path.
+        # In that case its columns are already the top-k dims (in indices
+        # order), and slicing again with `indices` would double-permute.
+        if (
+            self.indices_truncate_embds_topk is not None
+            and self.X.shape[1] != len(self.indices_truncate_embds_topk)
+        ):
             return (
                 torch.max(self.X[:, self.indices_truncate_embds_topk], dim=0)[0],
                 torch.min(self.X[:, self.indices_truncate_embds_topk], dim=0)[0],
