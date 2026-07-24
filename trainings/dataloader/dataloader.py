@@ -313,6 +313,11 @@ class H5Dataset(Dataset):
                         f"Stale {file}: has {len(self.indices_truncate_embds_topk)} "
                         f"entries, expected {self.truncate_embds_topk}. Recomputing."
                     )
+                    # must clear before recompute -- get_indices_truncate_embds_topk
+                    # calls get_X() -> _get_item_real, which would otherwise slice
+                    # each vector with the stale index list before we've replaced it
+                    self.indices_truncate_embds_topk = None
+                    self.X = None
                     self.indices_truncate_embds_topk = (
                         self.get_indices_truncate_embds_topk()
                     )
