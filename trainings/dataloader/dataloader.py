@@ -249,6 +249,20 @@ class H5Dataset(Dataset):
         self.log_print(
             f"Fitting PCA basis (q={self.truncate_embds_topk}) on raw X..."
         )
+        # invalidate downstream caches computed against a previous (possibly
+        # broken) basis at the same k -- otherwise truncate_embds() would load
+        # stale top-k indices and produce vectors of the wrong dimensionality
+        suffix = self._cache_suffix()
+        for stale in (
+            f"indices_top_{k}{suffix}.json",
+            f"embds_max_top_{k}{suffix}.json",
+            f"embds_min_top_{k}{suffix}.json",
+        ):
+            stale_path = os.path.join(self.folder_path, stale)
+            if os.path.exists(stale_path):
+                self.log_print(f"Removing stale {stale}")
+                os.remove(stale_path)
+
         # temporarily disable rotation so get_X() fetches the raw D-dim vectors
         self.pca_rotation = False
         X_raw = self.get_X()
