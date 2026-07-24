@@ -10,8 +10,8 @@ _ARTIFACT_GLOBS = (
     "indices_top_*.json",
     "embds_max*.json",
     "embds_min*.json",
-    "pca_mean.pt",
-    "pca_components.pt",
+    "pca_mean_top_*.pt",
+    "pca_components_top_*.pt",
 )
 
 

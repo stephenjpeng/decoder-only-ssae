@@ -235,8 +235,9 @@ class H5Dataset(Dataset):
                 "the number of PCA components is tied to top-k."
             )
 
-        mean_path = os.path.join(self.folder_path, "pca_mean.pt")
-        comp_path = os.path.join(self.folder_path, "pca_components.pt")
+        k = self.truncate_embds_topk
+        mean_path = os.path.join(self.folder_path, f"pca_mean_top_{k}.pt")
+        comp_path = os.path.join(self.folder_path, f"pca_components_top_{k}.pt")
 
         if os.path.exists(mean_path) and os.path.exists(comp_path):
             self.log_print(f"Found {mean_path} and {comp_path}; loading PCA basis.")
