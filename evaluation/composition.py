@@ -37,7 +37,7 @@ def property_block_means_trainable_inputs(
         sl = slice(p * n_repeat_i, (p + 1) * n_repeat_i)
         sel = mask_reduced_train[:, p] > 0.5
         if sel.any():
-            means.append(Ym[sel][:, sl].mean(dim=0))
+            means.append(torch.relu(Ym[sel][:, sl]).mean(dim=0))
         else:
             means.append(torch.zeros(n_repeat_i, device=device, dtype=Y.dtype))
     return torch.stack(means, dim=0)
@@ -63,9 +63,8 @@ def latent_row_from_property_means_trainable(
 
 @torch.no_grad()
 def decode_latent_row_trainable(decoder: torch.nn.Module, z: torch.Tensor) -> torch.Tensor:
-    """``z`` shape (1, n_features) after mask semantics applied externally."""
-    h = decoder.activation(z)
-    return decoder.linear(h)
+    """``z`` shape (1, n_features); block means are already post-ReLU, so skip activation."""
+    return decoder.linear(z)
 
 
 @torch.no_grad()
