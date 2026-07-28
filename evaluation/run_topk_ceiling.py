@@ -30,7 +30,7 @@ from typing import Sequence
 
 import torch
 
-from backbones import get_backbone
+from backbones import Backbone, get_backbone
 from trainings.config.config import initialise_instance
 from trainings.dataloader.dataloader import H5Dataset
 
@@ -121,6 +121,47 @@ def _save_summary(rows: list[dict], out_dir: Path) -> None:
             w.writerow(row)
 
 
+def _resolve_decode_backbone(
+    dataset: H5Dataset, decode_backbone: str | None, device: str
+) -> Backbone:
+    """Pick a backbone whose `decode` actually renders images.
+
+    `sd35_turbo_text_only` (and other extraction-only backbones) inherit the
+    base no-op `decode`, so pointing at the manifest's backbone would silently
+    produce no PNGs. Users can override with `decode_backbone`; the default
+    auto-swaps `sd35_turbo_text_only` -> `sd35_large_turbo` since both emit
+    the same (`seq`, `pooled`) stream layout.
+    """
+    name = decode_backbone or dataset.backbone_name
+    if decode_backbone is None and dataset.backbone_name == "sd35_turbo_text_only":
+        name = "sd35_large_turbo"
+        print(
+            f"Manifest backbone {dataset.backbone_name!r} has no decode(); "
+            f"using {name!r} for image generation."
+        )
+
+    if name == dataset.backbone_name:
+        backbone = get_backbone(name, device=device, **dataset.backbone_kwargs)
+    else:
+        backbone = get_backbone(name, device=device)
+
+    if type(backbone).decode is Backbone.decode:
+        raise RuntimeError(
+            f"backbone {name!r} has no decode() implementation; pass "
+            f"--decode_backbone with a backbone that renders images "
+            f"(e.g. sd35_large_turbo, sdxl)."
+        )
+
+    dataset_streams = [(s.name, s.shape) for s in dataset.stream_specs]
+    backbone_streams = [(s.name, s.shape) for s in type(backbone).stream_specs]
+    if dataset_streams != backbone_streams:
+        raise RuntimeError(
+            f"stream mismatch: dataset streams {dataset_streams} != "
+            f"decoder backbone {name!r} streams {backbone_streams}."
+        )
+    return backbone
+
+
 def run(
     dataset_folder: Path,
     prompt_indices: Sequence[int],
@@ -132,6 +173,7 @@ def run(
     generate_images: bool = True,
     include_gt: bool = True,
     include_mean_baseline: bool = True,
+    decode_backbone: str | None = None,
 ) -> dict:
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -159,7 +201,7 @@ def run(
     if not generate_images:
         return {"variance_summary": rows}
 
-    backbone = get_backbone(dataset.backbone_name, device=device, **dataset.backbone_kwargs)
+    backbone = _resolve_decode_backbone(dataset, decode_backbone, device)
     backbone.load()
 
     per_prompt = []
@@ -230,6 +272,10 @@ def main() -> None:
                    help="Only compute variance summary; skip image generation.")
     p.add_argument("--skip_gt", action="store_true")
     p.add_argument("--skip_mean_baseline", action="store_true")
+    p.add_argument("--decode_backbone", type=str, default=None,
+                   help="Backbone name used for image rendering. Defaults to the "
+                        "manifest's backbone, auto-swapping sd35_turbo_text_only "
+                        "-> sd35_large_turbo since the former has no decode().")
     args = p.parse_args()
 
     device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
@@ -243,6 +289,7 @@ def main() -> None:
         generate_images=not args.skip_images,
         include_gt=not args.skip_gt,
         include_mean_baseline=not args.skip_mean_baseline,
+        decode_backbone=args.decode_backbone,
     )
 
 
