@@ -203,6 +203,11 @@ def run(
 
     backbone = _resolve_decode_backbone(dataset, decode_backbone, device)
     backbone.load()
+    # sd35_large_turbo.decode() casts dtype but not device -- pushing tensors
+    # to the backbone's device up front avoids `getCurrentStream` errors from
+    # the NF4 modules when the pipeline sees CPU inputs.
+    target_device = backbone.device
+    mean = mean.to(target_device)
 
     per_prompt = []
     for idx in prompt_indices:
@@ -219,6 +224,7 @@ def run(
         print(f"[idx={idx}] {prompt_text}")
 
         gt_flat, _ = dataset[idx]
+        gt_flat = gt_flat.to(target_device)
 
         if include_gt:
             backbone.decode(
@@ -233,8 +239,9 @@ def run(
                 seed=seed,
             )
 
+        order_dev = order.to(target_device)
         for k in ks_clean:
-            topk = order[:k]
+            topk = order_dev[:k]
             recon = mean.clone()
             recon[topk] = gt_flat[topk]
             backbone.decode(
