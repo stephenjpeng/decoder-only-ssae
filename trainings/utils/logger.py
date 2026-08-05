@@ -52,7 +52,12 @@ class Logger:
         print(text)
 
     def _register_git_commit(self):
-        repo = git.Repo(".")
+        # optional; runs off git-less worktrees (rsync'd copies, S3 checkouts) also log fine
+        try:
+            repo = git.Repo(".")
+        except git.InvalidGitRepositoryError:
+            self.print("git commit : (not a git repo)")
+            return
         git_commit = repo.git.rev_parse("HEAD")
         self.print(f"git commit : {git_commit}")
 

@@ -36,9 +36,10 @@ class SFDInference:
         self.tp["n_categories"] = self.dataset.properties.n_categories
         self.tp["n_properties_situation"] = self.dataset.same_id.n_pid_never_same
         self.tp["n_features"] = self.dataset.properties.n_properties * self.tp["n_repeat"]
-        self.tp["n_features_situation"] = (
-            self.dataset.properties.n_properties * self.dataset.same_id.n_pid_never_same
-        )
+        # scale with n_repeat, matching trainable_inputs_all_clips.training(); using
+        # n_properties instead overshoots n_features when most categories are never-same
+        # (drives y_same negative and crashes checkpoint reload).
+        self.tp["n_features_situation"] = self.tp["n_repeat"] * self.dataset.same_id.n_pid_never_same
         self.tp["tid_same"] = self.dataset.same_id.tid_same
         self.tp["dim_output"] = self.dataset.dim_x
         self.tp["n_prompts"] = len(self.dataset)
