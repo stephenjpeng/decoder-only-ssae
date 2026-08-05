@@ -53,6 +53,13 @@
 .PARAMETER HiddenDim
     Width of each hidden layer when Layers > 1. Ignored for Layers == 1.
 
+.PARAMETER HeadType
+    Decoder head topology (model_trainable_inputs only). "dense" (default) cross-mixes
+    property blocks; "block_diagonal" runs an independent MLP per property block and
+    sums outputs, ablating cross-property mixing while preserving within-block depth.
+    When set to "block_diagonal", run tags get a "_blockdiag" suffix so runs land in
+    separate folders alongside dense checkpoints.
+
 .PARAMETER PcaRotation
     Rotate embeddings into a top-k PCA basis before truncation. The basis is
     fit once per unique TopK value against the train split and cached as
@@ -86,6 +93,18 @@
     After (or instead of) training each (topk, layers) checkpoint, run
     evaluation.run_image_benchmark against the holdout. Baselines share the
     per-dataset cache at -BaselineCacheRoot.
+
+.PARAMETER RunTrainReconstruction
+    After training each checkpoint, run evaluation.run_reconstruction (SSAE with
+    trained Y rows + ridge + mean-arithmetic on the same training set). Writes
+    train_reconstruction.json into each run folder for the train-vs-holdout gap
+    analysis.
+
+.PARAMETER RescoreLocality
+    After -RunImageBenchmark has produced pre/post/swap renders, re-score them with
+    evaluation.rescore_locality (CLIP full/dropped/swap vs. edit and target attributes).
+    Writes per_sample_locality_extra.csv next to each per_sample.csv. Runs once at the
+    end of the sweep, not per run.
 
 .PARAMETER BenchRoot
     Root directory for image-benchmark output folders. Each run lands under
@@ -147,6 +166,7 @@ param(
     [int[]]$TopK = @(500, 1000, 2000, 5000),
     [int[]]$Layers = @(1),
     [int]$HiddenDim = 1024,
+    [ValidateSet("dense", "block_diagonal")][string]$HeadType = "dense",
     [switch]$PcaRotation,
     [double]$HoldoutFraction = 0.1,
     [int]$MaxTrainPrompts = 0,
@@ -156,6 +176,8 @@ param(
     [switch]$RecreateEmbeddings,
     [switch]$SkipTraining,
     [switch]$RunImageBenchmark,
+    [switch]$RunTrainReconstruction,
+    [switch]$RescoreLocality,
     [string]$BenchRoot = "results/bench_out",
     [string]$BaselineCacheRoot = "results/bench_baseline_cache",
     [int]$BenchmarkMaxSamples = 0,
@@ -293,6 +315,7 @@ foreach ($k in $TopK) {
     foreach ($L in $Layers) {
         $tag = if ($L -eq 1) { "topk_${k}_L1" } else { "topk_${k}_L${L}_h${HiddenDim}" }
         if ($PcaRotation) { $tag = "${tag}_pca" }
+        if ($HeadType -eq "block_diagonal") { $tag = "${tag}_blockdiag" }
         Write-Host "== $tag ==" -ForegroundColor Green
 
         $runDir     = ToPosix (Join-Path $RunsRoot $tag)
@@ -355,6 +378,7 @@ training:
             )
             if ($L -gt 1) { $trainArgs += @("--hidden_dims", "$HiddenDim") }
             if ($PcaRotation) { $trainArgs += @("--pca_rotation", "True") }
+            if ($HeadType -ne "dense") { $trainArgs += @("--head_type", $HeadType) }
 
             $t0 = Get-Date
             Invoke-Py $trainArgs
@@ -409,10 +433,29 @@ training:
             Invoke-Py $benchArgs
         }
 
+        if ($RunTrainReconstruction) {
+            $reconOut = ToPosix (Join-Path $runDir "train_reconstruction.json")
+            Write-Host "  -- train-set reconstruction -> $reconOut" -ForegroundColor Cyan
+            Invoke-Py @(
+                "-m", "evaluation.run_reconstruction",
+                "--checkpoint",  $runDir,
+                "--output_json", $reconOut
+            )
+        }
+
         $hiddenCol = if ($L -eq 1) { "" } else { "$HiddenDim" }
         "$k,$L,$hiddenCol,$mse,$cos,$nHold,$elapsed,$runDir,$benchDir" | Add-Content $SummaryCsv
         Write-Host ("  topk={0} L={1} h={2} mse={3} cosine={4} elapsed={5}s bench={6}" -f $k, $L, $hiddenCol, $mse, $cos, $elapsed, $benchDir) -ForegroundColor Green
     }
+}
+
+if ($RescoreLocality) {
+    Write-Host "== Rescoring locality across bench_out + baseline cache ==" -ForegroundColor Green
+    Invoke-Py @(
+        "-m", "evaluation.rescore_locality",
+        "--bench_dir",    $BenchRoot,
+        "--baseline_dir", $BaselineCacheRoot
+    )
 }
 
 Write-Host "== Sweep complete ==" -ForegroundColor Green

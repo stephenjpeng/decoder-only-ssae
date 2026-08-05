@@ -23,6 +23,7 @@ def training(
     num_layers: int | None = None,
     hidden_dims=None,
     pca_rotation: bool | None = None,
+    head_type: str | None = None,
 ) -> None:
     tp, path_yaml = read_training_params_from_yaml(path_yaml)
 
@@ -32,6 +33,8 @@ def training(
         tp["hidden_dims"] = hidden_dims
     if pca_rotation is not None:
         tp["pca_rotation"] = pca_rotation
+    if head_type is not None:
+        tp["head_type"] = head_type
 
     tp["num_layers"] = tp.get("num_layers", 1) or 1
     tp["hidden_dims"] = parse_hidden_dims(
