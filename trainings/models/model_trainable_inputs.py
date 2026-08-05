@@ -16,6 +16,8 @@ class Decoder(nn.Module):
         trainable_input_init_range=1,
         num_layers=1,
         hidden_dims=None,
+        head_type="dense",
+        n_properties=None,
         logger=None,
     ):
         super(Decoder, self).__init__()
@@ -51,12 +53,23 @@ class Decoder(nn.Module):
 
         self.mask = None
 
+        if head_type not in ("dense", "block_diagonal"):
+            raise ValueError(f"head_type must be 'dense' or 'block_diagonal', got {head_type!r}")
+        n_blocks = None
+        if head_type == "block_diagonal":
+            if n_properties is None:
+                raise ValueError(
+                    "head_type='block_diagonal' requires n_properties (set via training params)"
+                )
+            n_blocks = int(n_properties)
+
         self.linear = build_head(
             in_features=self.n_features,
             out_features=self.dim_output,
             num_layers=num_layers,
             hidden_dims=hidden_dims,
             activation_factory=nn.ReLU,
+            n_blocks=n_blocks,
         )
         self.activation = nn.ReLU()
 

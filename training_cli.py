@@ -73,6 +73,16 @@ if __name__ == "__main__":
         help="If True, rotate embeddings into a top-k PCA basis before "
         "truncation. Overrides YAML when set.",
     )
+    parser.add_argument(
+        "--head_type",
+        type=str,
+        choices=(None, "dense", "block_diagonal"),
+        default=None,
+        help="Decoder head topology. 'dense' (default) cross-mixes property blocks; "
+        "'block_diagonal' runs an independent MLP per property block and sums outputs, "
+        "ablating cross-property mixing. Overrides YAML when set. "
+        "Only implemented for model_trainable_inputs.",
+    )
     args = parser.parse_args()
 
     training(
@@ -82,4 +92,5 @@ if __name__ == "__main__":
         num_layers=args.num_layers,
         hidden_dims=args.hidden_dims,
         pca_rotation=args.pca_rotation,
+        head_type=args.head_type,
     )

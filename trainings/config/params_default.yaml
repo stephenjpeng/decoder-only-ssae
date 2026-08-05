@@ -8,6 +8,12 @@ training:
     using_blocs: False
     num_layers: 1
     hidden_dims: null
+    # head_type: "dense" (default) mixes property blocks in the decoder; "block_diagonal"
+    # runs an independent MLP per property block and sums outputs, forbidding cross-property
+    # mixing. Used to ablate whether the multi-layer head's gain over ridge comes from
+    # within-block nonlinearity (block_diagonal ~ dense) or cross-property mixing
+    # (block_diagonal @lt; dense). Only implemented for model_trainable_inputs.
+    head_type: "dense"
   dataloader:
     folder_path: "results/compositional_split/train/"
     truncate_n_prompts: null
