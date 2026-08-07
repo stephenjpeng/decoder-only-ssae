@@ -38,6 +38,11 @@ Sweep options:
                              Seed 0 keeps the historical run tag; others get _s<seed>.
   --save-model-frequency N   Save a checkpoint every N epochs into <run>/checkpoints/
                              (E11 training-dynamics trajectories). Default: off.
+  --num-workers N            DataLoader workers. Default: 1. Training at top-k=100k is
+                             dataloader-bound (each item reads a 1.36M-dim float16 vector,
+                             casts to float32 and fancy-indexes it), so a single worker
+                             saturates one core while the GPU idles. 6 on an 8-vCPU box
+                             cuts epoch time ~5x.
   --hidden-dim N             Width per hidden layer when layers > 1. Default: 1024
   --head-type TYPE           dense (default) or block_diagonal. block_diagonal ablates
                              cross-property mixing (independent MLP per property block).
@@ -103,6 +108,7 @@ topk_csv="500,1000,2000,5000"
 layers_csv="1"
 seeds_csv="0"
 save_model_frequency=""
+num_workers=1
 hidden_dim=1024
 head_type="dense"
 pca_rotation=0
@@ -141,6 +147,7 @@ while [[ $# -gt 0 ]]; do
         --layers)                   layers_csv="$2"; shift 2 ;;
         --seeds)                    seeds_csv="$2"; shift 2 ;;
         --save-model-frequency)     save_model_frequency="$2"; shift 2 ;;
+        --num-workers)              num_workers="$2"; shift 2 ;;
         --hidden-dim)               hidden_dim="$2"; shift 2 ;;
         --head-type)                head_type="$2"; shift 2 ;;
         --pca-rotation)             pca_rotation=1; shift ;;
@@ -342,7 +349,7 @@ training:
     pca_rotation: $pca_yaml
     add_property_is_the_same: True
     normalize: "MAX_MIN"
-    num_workers: 1
+    num_workers: $num_workers
     simulated:
       simulated: False
       dim_clip_simulated: 100
