@@ -100,14 +100,32 @@ class Logger:
             self._save_metadata()
 
     def save(self):
-        """Saves log data to log folder"""
-        if self.log_dir is not None:
-            results_filename = self.log_folder + "/results.json"
-            with open(results_filename, "w") as file:
-                json.dump(self.logs, file)
+        """Deprecated alias for :meth:`dump_logs`.
 
-        else:
-            warnings.warn("The logger does not have a log_dir so was not saved to disk")
+        The previous body referenced ``self.log_dir``, which is never assigned in
+        ``__init__``, so every call raised ``AttributeError``. Nothing called it, which is
+        why the scalar logs were only ever reachable as PNGs.
+        """
+        warnings.warn(
+            "Logger.save() is deprecated; use Logger.dump_logs()", DeprecationWarning
+        )
+        return self.dump_logs()
+
+    def dump_logs(self, filename: str = "logs.json"):
+        """Persist every logged scalar series as JSON.
+
+        E11 reads training dynamics (loss curve, gradient norms) as data; re-extracting
+        them from ``plots/*.png`` is not an option. Keys are iteration numbers as strings
+        because JSON has no integer keys.
+        """
+        path = Path(self.log_folder, filename)
+        payload = {
+            key: {str(it): val for it, val in series.items()}
+            for key, series in self.logs.items()
+        }
+        with open(path, "w") as f:
+            json.dump(payload, f, indent=2)
+        return path
 
     def log_array_comparison(self, title, array1, array2):
         line1 = "  ".join([f"{x:8.2f}" for x in array1])

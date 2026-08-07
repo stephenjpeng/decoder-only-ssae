@@ -30,19 +30,23 @@ CONFIGS = [
     ("topk_300000_L2_h2048", "59dbe58c95d0cb13", 300_000, "L2 h=2048",  "SSAE 300k / L2",         "#be185d"),
 ]
 
-BASELINE_METHODS = ["ridge_embed", "mean_arithmetic", "prompt_only", "gt_embed"]
-BASELINE_COLOR = {
-    "ridge_embed":     "#7c3aed",
-    "mean_arithmetic": "#0891b2",
-    "prompt_only":     "#b45309",
-    "gt_embed":        "#374151",
-}
-BASELINE_LABEL = {
-    "ridge_embed":     "Ridge",
-    "mean_arithmetic": "Mean-arith",
-    "prompt_only":     "Prompt-only",
-    "gt_embed":        "GT embed",
-}
+# Labels/colours come from evaluation/method_labels.py so report text, CLI help and the
+# proposal cannot drift apart (AUG-01 acceptance criterion). Short labels are used here
+# because this report packs many rows per table.
+from evaluation.method_labels import (  # noqa: E402
+    METHOD_COLOR as BASELINE_COLOR,
+)
+from evaluation.method_labels import (  # noqa: E402
+    METHOD_LABEL_SHORT as BASELINE_LABEL,
+)
+
+BASELINE_METHODS = [
+    "ridge_embed",
+    "mean_arithmetic",
+    "prompt_only",
+    "prompt_modified_packed",
+    "gt_embed",
+]
 
 
 def fnum(x):

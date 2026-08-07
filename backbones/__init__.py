@@ -8,6 +8,7 @@ from backbones import sdxl  # noqa: F401
 from backbones import flux  # noqa: F401
 from backbones import hf_causal_lm  # noqa: F401
 from backbones import fake_test  # noqa: F401
+from backbones import fake_sd3  # noqa: F401
 
 __all__ = [
     "Backbone",

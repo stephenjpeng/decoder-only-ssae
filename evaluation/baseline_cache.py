@@ -1,9 +1,14 @@
 """Content-addressed cache of non-SSAE baselines for ``run_image_benchmark``.
 
-Baselines (gt_embed, mean_arithmetic, ridge_embed, prompt_only) are independent of the
-SSAE checkpoint. Caching them keyed by (holdout, training data, base_seed, ridge_lambda,
-SD3.5 fingerprint) lets subsequent runs with a new SSAE reuse the same images and metrics
-instead of re-rendering every baseline from scratch.
+Baselines (gt_embed, mean_arithmetic, ridge_embed, prompt_only, prompt_modified_packed)
+are independent of the SSAE checkpoint. Caching them keyed by (holdout, training data,
+base_seed, ridge_lambda, SD3.5 fingerprint) lets subsequent runs with a new SSAE reuse the
+same images and metrics instead of re-rendering every baseline from scratch.
+
+Backward compatibility (AUG-01): ``prompt_modified_packed`` was added to the method list
+without touching :func:`compute_dataset_id`, so caches populated before it existed keep
+their ``dataset_id`` and stay readable. Requesting the new method against an old cache
+simply renders it into the existing directory alongside the others.
 
 Cache layout::
 
@@ -40,12 +45,8 @@ import numpy as np
 import torch
 
 
-BASELINE_METHODS: tuple[str, ...] = (
-    "gt_embed",
-    "mean_arithmetic",
-    "ridge_embed",
-    "prompt_only",
-)
+# Re-exported from the shared registry so method identity has exactly one definition.
+from evaluation.method_labels import BASELINE_METHODS  # noqa: E402,F401
 
 VARIANTS: tuple[str, ...] = ("post", "pre_edit", "swapped")
 
@@ -180,7 +181,10 @@ class BaselineCache:
         summary: dict | None = None,
         extra_manifest: dict | None = None,
     ) -> None:
-        methods = list(methods)
+        # Union with methods already present in the cache: a run that requests a subset
+        # must not make the manifest claim the others were never populated.
+        existing = {m for (m, _idx) in self.rows}
+        methods = list(dict.fromkeys([*methods, *sorted(existing)]))
         if self.rows:
             all_keys: set[str] = set()
             for r in self.rows.values():

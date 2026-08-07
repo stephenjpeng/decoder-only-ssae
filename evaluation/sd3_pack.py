@@ -124,3 +124,64 @@ def pack_sd3_from_truncated_normalized(
     embd = full_embd[:-2048].reshape(1, 333, 4096).to(torch.bfloat16)
     pooled = full_embd[-2048:].unsqueeze(0).to(torch.bfloat16)
     return embd, pooled
+
+
+def flatten_sd3_conditioning(
+    prompt_embeds: torch.Tensor, pooled_prompt_embeds: torch.Tensor
+) -> torch.Tensor:
+    """Inverse of the split at the end of :func:`pack_sd3_from_truncated_normalized`.
+
+    Takes a text encoder's ``(1, 333, 4096)`` / ``(1, 2048)`` pair and returns the flat
+    ``[T5 flat | pooled]`` vector in the same layout ``H5Dataset`` stores, as float32 on
+    CPU. Needed to re-truncate a freshly encoded prompt to the SSAE's top-k coordinates.
+    """
+    seq = prompt_embeds.detach().to(torch.float32).cpu().reshape(-1)
+    pooled = pooled_prompt_embeds.detach().to(torch.float32).cpu().reshape(-1)
+    return torch.cat([seq, pooled], dim=0)
+
+
+@torch.no_grad()
+def pack_sd3_from_full_flat_topk(
+    dataset: H5Dataset,
+    full_flat: torch.Tensor,
+    *,
+    template: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Restrict a full-dimensional embedding to the SSAE's top-k subspace, then pack.
+
+    This is the ``prompt_modified_packed`` conditioning path (AUG-01). ``full_flat`` is a
+    real, full-dimensional embedding — e.g. a modified prompt pushed back through the text
+    encoder. Only the ``dataset.indices_truncate_embds_topk`` coordinates survive; the rest
+    are taken from ``template`` (the training mean), exactly as for an SSAE or ridge
+    prediction.
+
+    The point is to put prompt modification under the *same* information restriction as the
+    feature-editing methods, so that a difference between them cannot be explained by
+    prompt modification having access to ~1.36M extra coordinates.
+
+    Note this deliberately does **not** round-trip through
+    ``dataset.normalize``/``denormalize``. Min-max normalisation is fit on the training
+    split, and a re-encoded prompt can legitimately fall outside that range; normalising
+    and immediately denormalising would be the identity on in-range values and lossy
+    clipping risk on out-of-range ones. Copying raw coordinates is the honest operation and
+    matches what ``pack_sd3_from_truncated_normalized`` produces after its own
+    denormalisation step.
+    """
+    full_embd = template.clone()
+    src = full_flat.reshape(-1).to(full_embd.device)
+    if src.numel() != full_embd.numel():
+        raise ValueError(
+            f"full_flat has {src.numel()} elements but the packing template has "
+            f"{full_embd.numel()}; the text encoder output layout does not match the "
+            f"dataset's flat embedding layout."
+        )
+
+    idx = dataset.indices_truncate_embds_topk
+    if idx is None:
+        full_embd = src.to(full_embd.dtype)
+    else:
+        full_embd[idx] = src[idx].to(full_embd.dtype)
+
+    embd = full_embd[:-2048].reshape(1, 333, 4096).to(torch.bfloat16)
+    pooled = full_embd[-2048:].unsqueeze(0).to(torch.bfloat16)
+    return embd, pooled

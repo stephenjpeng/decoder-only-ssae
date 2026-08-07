@@ -34,6 +34,10 @@ Usage: scripts/compare_topk.sh [options]
 Sweep options:
   --topk LIST                Comma-separated TopK values. Default: 500,1000,2000,5000
   --layers LIST              Comma-separated head depths (>=1). Default: 1
+  --seeds LIST               Comma-separated training seeds (E10). Default: 0
+                             Seed 0 keeps the historical run tag; others get _s<seed>.
+  --save-model-frequency N   Save a checkpoint every N epochs into <run>/checkpoints/
+                             (E11 training-dynamics trajectories). Default: off.
   --hidden-dim N             Width per hidden layer when layers > 1. Default: 1024
   --head-type TYPE           dense (default) or block_diagonal. block_diagonal ablates
                              cross-property mixing (independent MLP per property block).
@@ -97,6 +101,8 @@ split_root="results/compositional_split"
 runs_root="results/topk_sweep"
 topk_csv="500,1000,2000,5000"
 layers_csv="1"
+seeds_csv="0"
+save_model_frequency=""
 hidden_dim=1024
 head_type="dense"
 pca_rotation=0
@@ -133,6 +139,8 @@ while [[ $# -gt 0 ]]; do
         --runs-root)                runs_root="$2"; shift 2 ;;
         --topk)                     topk_csv="$2"; shift 2 ;;
         --layers)                   layers_csv="$2"; shift 2 ;;
+        --seeds)                    seeds_csv="$2"; shift 2 ;;
+        --save-model-frequency)     save_model_frequency="$2"; shift 2 ;;
         --hidden-dim)               hidden_dim="$2"; shift 2 ;;
         --head-type)                head_type="$2"; shift 2 ;;
         --pca-rotation)             pca_rotation=1; shift ;;
@@ -172,6 +180,7 @@ esac
 # parse CSV lists
 IFS=',' read -r -a topk_arr   <<< "$topk_csv"
 IFS=',' read -r -a layers_arr <<< "$layers_csv"
+IFS=',' read -r -a seeds_arr  <<< "$seeds_csv"
 
 for L in "${layers_arr[@]}"; do
     if (( L < 1 )); then
@@ -284,12 +293,13 @@ extract_embeddings "$holdout_dir"
 
 # 3. sweep
 summary_csv="$runs_root/sweep_summary.csv"
-echo "topk,layers,hidden_dim,head_type,mse_mean,cosine_mean,n_holdout,elapsed_sec,output_folder,bench_dir" > "$summary_csv"
+echo "topk,layers,hidden_dim,head_type,seed,mse_mean,cosine_mean,n_holdout,elapsed_sec,output_folder,bench_dir" > "$summary_csv"
 
 if (( run_image_benchmark )); then mkdir -p "$bench_root"; fi
 
 for k in "${topk_arr[@]}"; do
     for L in "${layers_arr[@]}"; do
+      for seed in "${seeds_arr[@]}"; do
         if (( L == 1 )); then
             tag="topk_${k}_L1"
         else
@@ -297,6 +307,9 @@ for k in "${topk_arr[@]}"; do
         fi
         if (( pca_rotation )); then tag="${tag}_pca"; fi
         if [[ "$head_type" == "block_diagonal" ]]; then tag="${tag}_blockdiag"; fi
+        # Seed 0 keeps the historical tag so existing run dirs, bench dirs and the
+        # report builders' hardcoded names keep resolving; extra seeds get a suffix.
+        if (( seed != 0 )); then tag="${tag}_s${seed}"; fi
         echo "== $tag =="
 
         run_dir="$runs_root/$tag"
@@ -307,6 +320,8 @@ for k in "${topk_arr[@]}"; do
         # below; keeping them in the YAML too keeps the file self-describing.
         if (( L == 1 )); then hidden_yaml="null"; else hidden_yaml="$hidden_dim"; fi
         if (( pca_rotation )); then pca_yaml="True"; else pca_yaml="False"; fi
+        # E11 needs the checkpoint trajectory, not just the final weights.
+        if [[ -n "$save_model_frequency" ]]; then save_model_yaml="$save_model_frequency"; else save_model_yaml="null"; fi
 
         # block_diagonal head is only implemented on model_trainable_inputs; dense sweeps
         # keep the parameter-efficient model_avg_feature default.
@@ -334,9 +349,9 @@ training:
   training:
     n_epochs: 100
     print_frequency: 1
-    save_model_frequency: null
+    save_model_frequency: $save_model_yaml
     plot_frequency: 1
-    seed: 0
+    seed: $seed
     batch_size: 16
     lr: 0.001
     beta1: 0.9
@@ -449,8 +464,9 @@ PY
         fi
 
         if (( L == 1 )); then hidden_col=""; else hidden_col="$hidden_dim"; fi
-        echo "$k,$L,$hidden_col,$head_type,$mse,$cos,$n_hold,$elapsed,$run_dir,$bench_dir" >> "$summary_csv"
-        echo "  topk=$k L=$L h=$hidden_col head=$head_type mse=$mse cosine=$cos elapsed=${elapsed}s bench=$bench_dir"
+        echo "$k,$L,$hidden_col,$head_type,$seed,$mse,$cos,$n_hold,$elapsed,$run_dir,$bench_dir" >> "$summary_csv"
+        echo "  topk=$k L=$L h=$hidden_col head=$head_type seed=$seed mse=$mse cosine=$cos elapsed=${elapsed}s bench=$bench_dir"
+      done
     done
 done
 

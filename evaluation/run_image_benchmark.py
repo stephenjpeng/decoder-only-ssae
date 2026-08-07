@@ -2,9 +2,22 @@
 Image-level compositional benchmark for held-out concept tuples.
 
 Compares **ground-truth embeddings**, **SSAE compositional** embeddings, **mean-direction**
-and **ridge** embedding baselines, and **prompt-only** generation. Uses matched seeds per
-sample (deterministic in ``base_seed``). Per-method image similarity vs. the ``gt_embed``
-rendering is reported via CLIP, LPIPS, DINO cosine, and pixel-space MSE/SSIM.
+and **ridge** embedding baselines, and two **prompt-modification** conditioning paths. Uses
+matched seeds per sample (deterministic in ``base_seed``). Per-method image similarity vs.
+the ``gt_embed`` rendering is reported via CLIP, LPIPS, DINO cosine, and pixel-space
+MSE/SSIM.
+
+The two prompt-side methods are genuinely different computations (see
+``evaluation/method_labels.py``):
+
+* ``prompt_only`` — **Prompt modification (native/full embedding)**. The modified prompt is
+  encoded and the full text-encoder output conditions the pipeline. This is the deployment-
+  realistic baseline. The key is kept for cache compatibility; the label is what appears in
+  reports and the paper.
+* ``prompt_modified_packed`` — **Prompt modification (packed top-k)**. The same prompt text
+  and the same diffusion seed, but only the SSAE's top-k coordinates survive; the rest are
+  filled with the training mean, matching how every embedding-space method is packed. Use
+  this for apples-to-apples controlled-subspace analysis. Never average the two rows.
 
 Locality tests (both optional; independently enable-able in the same run). A single
 attribute is randomly sampled per holdout row (seeded by ``base_seed + idx`` so the pick
@@ -46,6 +59,12 @@ from baselines.run_baselines import (
 from evaluation.baseline_cache import BASELINE_METHODS, BaselineCache, load_or_create
 from evaluation.bootstrap import bootstrap_mean_ci
 from evaluation.clip_scorer import CLIPScorer
+from evaluation.method_labels import (
+    DEFAULT_METHODS,
+    METHOD_ORDER,
+    conditioning_map,
+)
+from evaluation.method_labels import sort_methods as _sort_methods
 from evaluation.composition import (
     property_block_means_trainable_inputs,
     predict_embedding_compositional,
@@ -55,27 +74,15 @@ from evaluation.lpips_metric import lpips_alex
 from evaluation.pixel_metrics import pixel_mse, ssim
 from evaluation.sd3_pack import (
     compute_or_load_full_mean,
+    flatten_sd3_conditioning,
+    pack_sd3_from_full_flat_topk,
     pack_sd3_from_truncated_normalized,
     packer_fingerprint,
 )
 from inference.image_generation.image_generator import ImageGenerator
+from trainings.utils.run_manifest import checkpoint_fingerprint, write_run_manifest
 
 DEFAULT_BASELINE_CACHE_ROOT = Path("results/bench_baseline_cache")
-
-_METHOD_ORDER = (
-    "gt_embed",
-    "ssae_compose",
-    "mean_arithmetic",
-    "ridge_embed",
-    "prompt_only",
-)
-
-
-def _sort_methods(methods: tuple[str, ...]) -> tuple[str, ...]:
-    seen = set(methods)
-    ordered = tuple(m for m in _METHOD_ORDER if m in seen)
-    extra = tuple(m for m in methods if m not in ordered)
-    return ordered + extra
 
 
 def _stack_cpu(dataset) -> tuple[torch.Tensor, torch.Tensor]:
@@ -129,6 +136,30 @@ def _sample_seed(base_seed: int, idx: int) -> int:
     return base_seed + idx * 1_000_003
 
 
+def _encode_and_pack_prompt(
+    gen: ImageGenerator,
+    dataset,
+    prompt_text: str,
+    seed: int,
+    template: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """``prompt_modified_packed`` conditioning: re-encode, keep top-k, train-mean the rest.
+
+    Distinct from ``prompt_only``, which hands the text encoder's full output straight to
+    the pipeline. Here the prompt is pushed through the same information bottleneck as the
+    SSAE and ridge predictions, so the comparison isolates the *edit operator* rather than
+    the number of conditioning coordinates. See ``evaluation/method_labels.py``.
+
+    The same ``seed`` is used for encoding and later for diffusion, matching the
+    ``prompt_only`` path exactly so the two prompt rows differ only in conditioning.
+    """
+    prompt_embeds, _, pooled_prompt_embeds, _ = gen.get_embds_text_encoder(
+        prompt=prompt_text, use_negative_prompts=False, seed=seed
+    )
+    full_flat = flatten_sd3_conditioning(prompt_embeds, pooled_prompt_embeds)
+    return pack_sd3_from_full_flat_topk(dataset, full_flat, template=template)
+
+
 def _find_ref_training_tid(
     train_mask: torch.Tensor,
     mask_swap: torch.Tensor,
@@ -180,13 +211,7 @@ def run_image_benchmark(
     clip_device: str | None = None,
     clip_failure_threshold: float = 0.2,
     n_bootstrap: int = 2000,
-    methods: tuple[str, ...] = (
-        "gt_embed",
-        "ssae_compose",
-        "mean_arithmetic",
-        "ridge_embed",
-        "prompt_only",
-    ),
+    methods: tuple[str, ...] = DEFAULT_METHODS,
     skip_lpips: bool = False,
     skip_pixel_metrics: bool = False,
     ridge_lambda: float = 1e-2,
@@ -436,6 +461,10 @@ def run_image_benchmark(
                     pe, pp = pack_sd3_from_truncated_normalized(holdout_ds, idx, pred_ridge.cpu(), template=pack_template)
                 elif method == "prompt_only":
                     pe, pp = None, None
+                elif method == "prompt_modified_packed":
+                    pe, pp = _encode_and_pack_prompt(
+                        gen, holdout_ds, prompt_text, seed_i, pack_template
+                    )
                 else:
                     raise ValueError(f"Unknown method {method}")
 
@@ -540,6 +569,10 @@ def run_image_benchmark(
                 if not pre_cached:
                     if method == "prompt_only":
                         pe_pre, pp_pre = None, None
+                    elif method == "prompt_modified_packed":
+                        pe_pre, pp_pre = _encode_and_pack_prompt(
+                            gen, holdout_ds, residual_prompt, seed_i, pack_template
+                        )
                     elif method == "ssae_compose":
                         pe_pre, pp_pre = pack_sd3_from_truncated_normalized(
                             holdout_ds, idx, pred_ssae_pre.detach().cpu(), template=pack_template
@@ -583,6 +616,10 @@ def run_image_benchmark(
                 if not swap_cached:
                     if method == "prompt_only":
                         pe_sw, pp_sw = None, None
+                    elif method == "prompt_modified_packed":
+                        pe_sw, pp_sw = _encode_and_pack_prompt(
+                            gen, holdout_ds, swapped_prompt, seed_i, pack_template
+                        )
                     elif method == "ssae_compose":
                         pe_sw, pp_sw = pack_sd3_from_truncated_normalized(
                             train_ds, ref_tid_swap, pred_ssae_swap.detach().cpu(), template=pack_template
@@ -679,19 +716,58 @@ def run_image_benchmark(
                 "n_samples": n,
             },
         )
-        manifest = {
-            "dataset_id": cache.dataset_id,
-            "baseline_cache_dir": str(cache.dir.resolve()),
-            "baseline_methods": cache_method_list,
-            "local_methods": local_methods,
-            "methods": list(methods),
-            "base_seed": base_seed,
-            "ridge_lambda": ridge_lambda,
-            "locality_drop_one_attr": locality_drop_one_attr,
-            "locality_swap_one_attr": locality_swap_one_attr,
-            "n_samples": n,
-        }
-        (output_dir / "manifest.json").write_text(json.dumps(manifest, indent=2))
+    else:
+        cache_method_list = []
+
+    # Legacy manifest kept for the existing report builders, now with the conditioning
+    # record AUG-01 requires. Paths are stored POSIX-relative-safe (resolve()) so a
+    # manifest written on one machine is at least diagnosable on another.
+    manifest = {
+        "dataset_id": cache.dataset_id if cache is not None else None,
+        "baseline_cache_dir": str(cache.dir.resolve()) if cache is not None else None,
+        "baseline_methods": cache_method_list,
+        "local_methods": local_methods,
+        "methods": list(methods),
+        "base_seed": base_seed,
+        "ridge_lambda": ridge_lambda,
+        "locality_drop_one_attr": locality_drop_one_attr,
+        "locality_swap_one_attr": locality_swap_one_attr,
+        "n_samples": n,
+        # AUG-01 acceptance criterion: native-vs-packed conditioning is explicit, per
+        # method, in every manifest — so no downstream table can silently place a native
+        # and a packed row in the same statistical comparison.
+        "method_conditioning": conditioning_map(methods),
+        "packer_fingerprint": packer_fingerprint(),
+        "truncate_embds_topk": tp.get("truncate_embds_topk"),
+    }
+    (output_dir / "manifest.json").write_text(json.dumps(manifest, indent=2))
+
+    # AUG-02 / E0: full provenance — git SHA, resolved config, seeds, dataset and packer
+    # fingerprints, checkpoint hash, exact command line.
+    write_run_manifest(
+        output_dir,
+        run_kind="image_benchmark",
+        config=tp,
+        seed=base_seed,
+        dataset=holdout_ds,
+        extra_datasets={"train": train_ds},
+        packer_fingerprint=packer_fingerprint(),
+        model_fingerprint=checkpoint_fingerprint(checkpoint_dir),
+        extra={
+            "benchmark": manifest,
+            "sd3_fingerprint": ImageGenerator.fingerprint(),
+            "simulated": simulated,
+            "max_samples": max_samples,
+            "n_samples_scored": n,
+            "clip_failure_threshold": clip_failure_threshold,
+            "n_bootstrap": n_bootstrap,
+            "skip_lpips": skip_lpips,
+            "skip_pixel_metrics": skip_pixel_metrics,
+            "skip_dino": skip_dino,
+            "use_baseline_cache": use_baseline_cache,
+            "baselines_only": baselines_only,
+        },
+    )
 
     return summary
 
@@ -846,7 +922,18 @@ def main() -> None:
     p.add_argument(
         "--methods",
         type=str,
-        default="gt_embed,ssae_compose,mean_arithmetic,ridge_embed,prompt_only",
+        default=",".join(DEFAULT_METHODS),
+        help=(
+            "Comma-separated method keys. Known keys: "
+            + ", ".join(METHOD_ORDER)
+            + ". Note the two prompt-side methods are different computations, not "
+            "synonyms: 'prompt_only' is Prompt modification (native/full embedding) — the "
+            "text encoder's full output goes straight to the pipeline; "
+            "'prompt_modified_packed' re-encodes the same prompt, keeps only the SSAE's "
+            "top-k coordinates and fills the rest with the training mean. Use the native "
+            "row for the practical comparison and the packed row for the controlled-"
+            "subspace analysis. Do not average them."
+        ),
     )
     p.add_argument("--skip_lpips", action="store_true")
     p.add_argument(
@@ -889,7 +976,8 @@ def main() -> None:
         default=DEFAULT_BASELINE_CACHE_ROOT,
         help=(
             "Root directory holding the shared per-dataset baseline cache. Non-SSAE methods "
-            "(gt_embed, mean_arithmetic, ridge_embed, prompt_only) are populated here once "
+            "(gt_embed, mean_arithmetic, ridge_embed, prompt_only, prompt_modified_packed) "
+            "are populated here once "
             "per (holdout, training data, base_seed, ridge_lambda, SD3.5 fingerprint) tuple "
             "and reused by subsequent runs. Default: results/bench_baseline_cache."
         ),

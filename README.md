@@ -309,11 +309,26 @@ Unified CLI: `python -m evaluation.cli <subcommand> ...` (see `evaluation/cli.py
 
 #### Baseline cache (image benchmark)
 
-`run_image_benchmark` caches the non-SSAE baselines (`gt_embed`, `mean_arithmetic`, `ridge_embed`, `prompt_only`) under `results/bench_baseline_cache/<dataset_id>/` and reuses them across runs. A run folder then holds only SSAE outputs plus a `manifest.json` pointing at the cache. The Streamlit viewer merges the two transparently.
+`run_image_benchmark` caches the non-SSAE baselines (`gt_embed`, `mean_arithmetic`, `ridge_embed`, `prompt_only`, `prompt_modified_packed`) under `results/bench_baseline_cache/<dataset_id>/` and reuses them across runs. A run folder then holds only SSAE outputs plus a `manifest.json` pointing at the cache. The Streamlit viewer merges the two transparently.
 
 Dataset identity (`dataset_id`) is a short hash of: the holdout `prompts.json`, the training embeddings + mask, `--base_seed`, `--ridge_lambda`, the SD3.5 pipeline fingerprint (model id, steps, guidance, sequence length), and the packer fingerprint (`fill_policy` + `packer_version`; currently `train_mean_fill` / v2). Changing any of these creates a fresh cache directory; locality flags grow an existing cache in place.
 
 **Fill policy for non-top-k dimensions.** `run_image_benchmark` fills the ~1.36M non-top-k coordinates of the SD3.5 conditioning tensor with the **training-set mean** (cached at `<train_folder>/full_embd_mean.pt`), not with the holdout row's true embedding. This avoids leaking ground truth through the coordinates the SSAE doesn't predict; every method sees the same template and the metrics reflect only the top-k prediction. Legacy oracle-fill behavior (used by `run_magnitude_sensitivity` and inference notebooks that don't pass `template=`) is still available for callers that want it, but any cache populated under one policy is invalidated by the packer fingerprint when the other policy runs.
+
+#### The two prompt-modification methods
+
+| Method key | Label used in reports and the paper | Conditioning |
+|---|---|---|
+| `prompt_only` | Prompt modification (native/full embedding) | full text-encoder output, nothing replaced |
+| `prompt_modified_packed` | Prompt modification (packed top-k) | same prompt + seed, only top-k coordinates kept, rest training-mean filled |
+
+These are genuinely different computations. The native row is the deployment-realistic baseline; the packed row puts prompt modification under the same information restriction as the feature-editing methods, for controlled-subspace analysis. **Do not average them.** The `prompt_only` key is kept only for cache compatibility.
+
+`prompt_modified_packed` is opt-in via `--methods`. Labels, colours and conditioning semantics are defined once in `evaluation/method_labels.py` and imported by the report builders. Every run manifest records per-method conditioning and the packer fingerprint. Smoke-test the semantics with `python scripts/smoke_prompt_baselines.py` (CPU, no GPU or real data needed).
+
+#### Run provenance
+
+Every training run and every image benchmark writes `run_manifest.json` next to its outputs (`trainings/utils/run_manifest.py`), recording: git SHA + branch + dirty flag, the exact `argv`, resolved config and its hash, the training seed, per-split dataset fingerprints (hashes of `prompts.json`, `properties.json`, the top-k index and min/max sidecars), the packer fingerprint, and — for evaluation runs — the `model.pt` hash of the scored checkpoint. Aggregate them with `trainings.utils.run_manifest.iter_manifests`.
 
 Flags:
 

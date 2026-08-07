@@ -20,21 +20,16 @@ from collections import defaultdict
 from html import escape
 from pathlib import Path
 
-METHODS = ["gt_embed", "ssae_compose", "mean_arithmetic", "ridge_embed", "prompt_only"]
-METHOD_LABEL = {
-    "gt_embed": "GT embed (oracle)",
-    "ssae_compose": "SSAE compose",
-    "mean_arithmetic": "Mean-arithmetic",
-    "ridge_embed": "Ridge",
-    "prompt_only": "Prompt-only",
-}
-METHOD_COLOR = {
-    "gt_embed": "#444444",
-    "ssae_compose": "#2563eb",
-    "mean_arithmetic": "#0891b2",
-    "ridge_embed": "#7c3aed",
-    "prompt_only": "#b45309",
-}
+# Labels/colours come from evaluation/method_labels.py so report text, CLI help and the
+# proposal cannot drift apart (AUG-01 acceptance criterion).
+from evaluation.method_labels import (  # noqa: E402
+    METHOD_COLOR,
+    METHOD_LABEL,
+    METHOD_LABEL_SHORT,  # noqa: F401  (available to templates)
+    METHOD_ORDER,
+)
+
+METHODS = list(METHOD_ORDER)
 
 
 def _fnum(x):
@@ -360,7 +355,7 @@ commentary in &sect;3 is held against a prior rather than rationalised after the
       additive baseline; a floor, not a competitor.</li>
   <li><b>Ridge</b> &mdash; a single ridge regression from the binary attribute mask to the embedding
       (&lambda; = {ridge_lambda}). A jointly-fit linear map: the meaningful baseline to beat.</li>
-  <li><b>Prompt-only</b> &mdash; ordinary text-to-image with no embedding manipulation. The "why
+  <li><b>Prompt modification (native/full embedding)</b> &mdash; ordinary text-to-image with no embedding manipulation. The "why
       bother with embeddings at all" control.</li>
 </ul>
 
