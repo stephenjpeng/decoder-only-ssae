@@ -38,6 +38,11 @@ Sweep options:
                              Seed 0 keeps the historical run tag; others get _s<seed>.
   --save-model-frequency N   Save a checkpoint every N epochs into <run>/checkpoints/
                              (E11 training-dynamics trajectories). Default: off.
+  --n-epochs N               Training epochs. Default: 100. The additive model converges
+                             well inside 100, but the two-layer arms do not (L2 h=2048 was
+                             still improving ~14%/10 epochs at epoch 100), so comparing them
+                             at a shared fixed budget confounds depth with optimisation
+                             progress. Raise this for the L2 arms.
   --num-workers N            DataLoader workers. Default: 1. Training at top-k=100k is
                              dataloader-bound (each item reads a 1.36M-dim float16 vector,
                              casts to float32 and fancy-indexes it), so a single worker
@@ -109,6 +114,7 @@ layers_csv="1"
 seeds_csv="0"
 save_model_frequency=""
 num_workers=1
+n_epochs=100
 hidden_dim=1024
 head_type="dense"
 pca_rotation=0
@@ -148,6 +154,7 @@ while [[ $# -gt 0 ]]; do
         --seeds)                    seeds_csv="$2"; shift 2 ;;
         --save-model-frequency)     save_model_frequency="$2"; shift 2 ;;
         --num-workers)              num_workers="$2"; shift 2 ;;
+        --n-epochs)                 n_epochs="$2"; shift 2 ;;
         --hidden-dim)               hidden_dim="$2"; shift 2 ;;
         --head-type)                head_type="$2"; shift 2 ;;
         --pca-rotation)             pca_rotation=1; shift ;;
@@ -354,7 +361,7 @@ training:
       simulated: False
       dim_clip_simulated: 100
   training:
-    n_epochs: 100
+    n_epochs: $n_epochs
     print_frequency: 1
     save_model_frequency: $save_model_yaml
     plot_frequency: 1
