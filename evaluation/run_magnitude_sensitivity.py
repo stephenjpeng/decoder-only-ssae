@@ -10,6 +10,19 @@ Output layout mirrors ``run_image_benchmark.py`` (``per_sample.csv`` with a ``me
 column, images under ``images/<method>/<idx>.png``) so ``evaluation.run_vlm_openai_batch``
 can be pointed at this output directory unmodified for an optional VLM concept-presence
 judge.
+
+Fill policy for non-top-k dimensions
+------------------------------------
+Uses **train-mean fill**, matching ``run_image_benchmark``. This was previously oracle fill:
+the packer was called without ``template=``, so the ~1.36M coordinates the SSAE does not
+predict came from the *true* holdout embedding of the row being edited. That leaks ground
+truth into every render and, worse for this script's purpose, makes the resulting
+efficacy/collateral numbers incomparable with the E3 benchmark, which uses train-mean fill.
+Since the whole point of the magnitude sweep is to place methods on a shared
+efficacy-vs-collateral Pareto plot against E3's rows, the two had to agree.
+
+Pass ``--oracle_fill`` to restore the old behaviour if you need to reproduce a pre-fix
+artifact. Do not mix the two in one comparison.
 """
 
 from __future__ import annotations
@@ -31,8 +44,13 @@ from evaluation.clip_scorer import CLIPScorer
 from evaluation.composition import property_block_means_trainable_inputs
 from evaluation.io import ensure_folder_path, h5_dataset_for_folder, load_decoder_checkpoint
 from evaluation.magnitude import predict_embedding_magnitude, scaled_mask_row
-from evaluation.sd3_pack import pack_sd3_from_truncated_normalized
+from evaluation.sd3_pack import (
+    compute_or_load_full_mean,
+    pack_sd3_from_truncated_normalized,
+    packer_fingerprint,
+)
 from inference.image_generation.image_generator import ImageGenerator
+from trainings.utils.run_manifest import checkpoint_fingerprint, write_run_manifest
 
 
 def _slug(text: str) -> str:
@@ -111,6 +129,7 @@ def run_magnitude_sensitivity(
     clip_device: str | None = None,
     n_bootstrap: int = 2000,
     skip_plot: bool = False,
+    oracle_fill: bool = False,
 ) -> dict:
     clip_device = clip_device or ("cuda" if torch.cuda.is_available() else "cpu")
     data_folder = Path(ensure_folder_path(data_folder))
@@ -136,6 +155,10 @@ def run_magnitude_sensitivity(
 
     with open(data_folder / "prompts.json", "r", encoding="utf-8") as f:
         prompts_meta = json.load(f)
+
+    # Train-mean fill template, shared across every magnitude and sample so the only thing
+    # varying along a curve is the edited concept. `None` restores the legacy oracle fill.
+    pack_template = None if oracle_fill else compute_or_load_full_mean(train_ds).cpu()
 
     gen = ImageGenerator(simulated=simulated, device=sd_device)
     clip_scorer = None if simulated else CLIPScorer(device=clip_device)
@@ -178,7 +201,9 @@ def run_magnitude_sensitivity(
                 seed_i = _sample_seed(base_seed, idx, method)
 
                 if not simulated:
-                    pe, pp = pack_sd3_from_truncated_normalized(data_ds, idx, pred.detach().cpu())
+                    pe, pp = pack_sd3_from_truncated_normalized(
+                        data_ds, idx, pred.detach().cpu(), template=pack_template
+                    )
                     gen.generate_image_from_embd(
                         pe.to(sd_device), pp.to(sd_device), out_path, seed=seed_i
                     )
@@ -226,9 +251,33 @@ def run_magnitude_sensitivity(
     summary["model_name"] = model_name
     summary["sample_source"] = sample_source
     summary["magnitudes"] = magnitudes
+    # Recorded because magnitude curves are only comparable with E3/AUG-05 rows under the
+    # same fill policy; a mismatch here silently invalidates any joint Pareto plot.
+    summary["fill_policy"] = "oracle_fill" if oracle_fill else "train_mean_fill"
+    summary["packer_fingerprint"] = packer_fingerprint()
+    summary["truncate_embds_topk"] = tp.get("truncate_embds_topk")
 
     with open(output_dir / "summary.json", "w", encoding="utf-8") as f:
         json.dump(summary, f, indent=2)
+
+    write_run_manifest(
+        output_dir,
+        run_kind="magnitude_sensitivity",
+        config=tp,
+        seed=base_seed,
+        dataset=data_ds,
+        extra_datasets={"train": train_ds},
+        packer_fingerprint=packer_fingerprint(),
+        model_fingerprint=checkpoint_fingerprint(checkpoint_dir),
+        extra={
+            "concepts": concepts,
+            "magnitudes": magnitudes,
+            "n_samples_per_concept": n_samples_per_concept,
+            "sample_source": sample_source,
+            "fill_policy": "oracle_fill" if oracle_fill else "train_mean_fill",
+            "simulated": simulated,
+        },
+    )
 
     if not skip_plot and not simulated:
         _plot_magnitude_curves(summary, output_dir / "magnitude_sensitivity.png")
@@ -368,6 +417,16 @@ def main() -> None:
     p.add_argument("--clip_device", type=str, default=None)
     p.add_argument("--n_bootstrap", type=int, default=2000)
     p.add_argument("--skip_plot", action="store_true")
+    p.add_argument(
+        "--oracle_fill",
+        action="store_true",
+        help=(
+            "Restore the legacy fill policy: take the ~1.36M non-top-k coordinates from the "
+            "edited row's TRUE embedding instead of the training mean. This leaks ground "
+            "truth and makes results incomparable with run_image_benchmark (which uses "
+            "train-mean fill), so it is off by default. Only for reproducing pre-fix artifacts."
+        ),
+    )
     args = p.parse_args()
 
     concepts = [c.strip() for c in args.concepts.split(",") if c.strip()]
@@ -387,6 +446,7 @@ def main() -> None:
         clip_device=args.clip_device,
         n_bootstrap=args.n_bootstrap,
         skip_plot=args.skip_plot,
+        oracle_fill=args.oracle_fill,
     )
     print(json.dumps(summary, indent=2))
 
