@@ -113,6 +113,18 @@ def _choose_edit_pid(mask_row: torch.Tensor, rng: random.Random) -> int | None:
     return rng.choice(active)
 
 
+def _resolve_property(dataset, name: str) -> int:
+    """Property id for a phrase, or a loud error listing the valid ones."""
+    props = dataset.properties
+    for pid, phrase in props.pid_to_property.items():
+        if phrase == name:
+            return int(pid)
+    raise SystemExit(
+        f"unknown property {name!r}. Valid: "
+        + ", ".join(repr(props.pid_to_property[p]) for p in sorted(props.pid_to_property))
+    )
+
+
 def _choose_swap_target_pid(
     dataset, active_pid: int, rng: random.Random
 ) -> int | None:
@@ -222,6 +234,9 @@ def run_image_benchmark(
     baseline_cache_root: Path | None = None,
     use_baseline_cache: bool = True,
     baselines_only: bool = False,
+    target_property: str | None = None,
+    replacement_property: str | None = None,
+    max_matched: int | None = None,
 ) -> dict:
     ssae_device = ssae_device or sd_device
     baseline_device = baseline_device or ssae_device
@@ -301,6 +316,24 @@ def run_image_benchmark(
     if max_samples is not None:
         n = min(n, max_samples)
 
+    # E3 targeted-concept mode. `target_property` names the concept to delete/replace;
+    # `replacement_property` fixes the on-manifold counterfactual instead of sampling one.
+    target_pid = _resolve_property(holdout_ds, target_property) if target_property else None
+    replacement_pid = (
+        _resolve_property(holdout_ds, replacement_property) if replacement_property else None
+    )
+    if replacement_pid is not None:
+        if target_pid is None:
+            raise SystemExit("--replacement_property requires --target_property")
+        props = holdout_ds.properties
+        if props.pid_to_cid[replacement_pid] != props.pid_to_cid[target_pid]:
+            raise SystemExit(
+                f"replacement {replacement_property!r} is not in the same category as "
+                f"target {target_property!r}; a cross-category swap is not a valid "
+                f"one-hot prompt and would leave the design's row space"
+            )
+    n_matched = 0
+
     gen = ImageGenerator(simulated=simulated, device=sd_device)
     clip_ok = not simulated
     clip_scorer = CLIPScorer(device=clip_device) if clip_ok else None
@@ -328,6 +361,17 @@ def run_image_benchmark(
         x_tgt_base = x_tgt if dev_base == dev_dec else x_tgt.to(dev_base)
         mask_row_ds = mask_row_ds.to(dev_dec)
 
+        # Targeted-concept mode (E3): restrict to tuples containing the target concept and
+        # always edit that concept, instead of sampling an attribute at random. Skipping here
+        # rather than filtering upfront keeps `idx` aligned with the holdout row id, so cache
+        # entries and per-sample rows stay comparable across runs.
+        if target_pid is not None:
+            if mask_t[target_pid].item() <= 0:
+                continue
+            if max_matched is not None and n_matched >= max_matched:
+                break
+            n_matched += 1
+
         sample_rng = random.Random(base_seed + idx)
         do_drop = locality_drop_one_attr and len(attrs) > 1
         do_swap = locality_swap_one_attr and len(attrs) > 1
@@ -341,7 +385,9 @@ def run_image_benchmark(
         swapped_prompt = ""
 
         if do_drop or do_swap:
-            edit_pid = _choose_edit_pid(mask_t, sample_rng)
+            edit_pid = (
+                target_pid if target_pid is not None else _choose_edit_pid(mask_t, sample_rng)
+            )
             if edit_pid is None:
                 do_drop = False
                 do_swap = False
@@ -353,8 +399,10 @@ def run_image_benchmark(
                         a for i, a in enumerate(attrs) if i != edit_position
                     )
                 if do_swap:
-                    swap_target_pid = _choose_swap_target_pid(
-                        holdout_ds, edit_pid, sample_rng
+                    swap_target_pid = (
+                        replacement_pid
+                        if replacement_pid is not None
+                        else _choose_swap_target_pid(holdout_ds, edit_pid, sample_rng)
                     )
                     if swap_target_pid is None:
                         # category has only one property, nothing to swap to
@@ -501,6 +549,13 @@ def run_image_benchmark(
                 "mse_pixel_swap_vs_normal": "",
                 "ssim_swap_vs_normal": "",
                 "clip_swap_image_vs_swapped_prompt": "",
+                # E3 efficacy: CLIP against the *target phrase alone*, on the unedited render
+                # and on each edited render. The drop from one to the other is the efficacy
+                # signal; comparing whole-prompt CLIP cannot isolate the target concept.
+                "clip_normal_vs_target_phrase": "",
+                "clip_deleted_vs_target_phrase": "",
+                "clip_swapped_vs_target_phrase": "",
+                "clip_swapped_vs_replacement_phrase": "",
             }
             if not post_cached:
                 if method == "ssae_compose":
@@ -522,6 +577,10 @@ def run_image_benchmark(
                     if do_drop:
                         row["clip_image_vs_residual_prompt"] = clip_scorer.image_text_cosine(
                             out_path, residual_prompt
+                        )
+                    if edit_attribute:
+                        row["clip_normal_vs_target_phrase"] = clip_scorer.image_text_cosine(
+                            out_path, edit_attribute
                         )
                 else:
                     row["clip_image_vs_full_prompt"] = ""
@@ -604,6 +663,11 @@ def run_image_benchmark(
                     row["mse_pixel_pre_post_edit"] = pixel_mse(pre_path, out_path)
                     row["ssim_pre_post_edit"] = ssim(pre_path, out_path)
 
+                if clip_scorer is not None and not pre_cached and edit_attribute:
+                    row["clip_deleted_vs_target_phrase"] = clip_scorer.image_text_cosine(
+                        pre_path, edit_attribute
+                    )
+
             if do_swap and method != "gt_embed":
                 if is_cached_method:
                     swap_path = cache.image_path(method, idx, "swapped")
@@ -655,6 +719,14 @@ def run_image_benchmark(
                     row["clip_swap_image_vs_swapped_prompt"] = (
                         clip_scorer.image_text_cosine(swap_path, swapped_prompt)
                     )
+                    if edit_attribute:
+                        row["clip_swapped_vs_target_phrase"] = clip_scorer.image_text_cosine(
+                            swap_path, edit_attribute
+                        )
+                    if swap_target_attribute:
+                        row["clip_swapped_vs_replacement_phrase"] = (
+                            clip_scorer.image_text_cosine(swap_path, swap_target_attribute)
+                        )
 
             if is_cached_method:
                 cached_row = cache.get_row(method, idx)
@@ -739,6 +811,9 @@ def run_image_benchmark(
         "method_conditioning": conditioning_map(methods),
         "packer_fingerprint": packer_fingerprint(),
         "truncate_embds_topk": tp.get("truncate_embds_topk"),
+        "target_property": target_property,
+        "replacement_property": replacement_property,
+        "n_matched": n_matched if target_pid is not None else None,
     }
     (output_dir / "manifest.json").write_text(json.dumps(manifest, indent=2))
 
@@ -862,6 +937,15 @@ def _aggregate_summary(
             and r["clip_swap_image_vs_swapped_prompt"] is not None
         ]
 
+        def _col(name):
+            return [float(r[name]) for r in xs
+                    if r.get(name) not in ("", None)]
+
+        tgt_normal = _col("clip_normal_vs_target_phrase")
+        tgt_deleted = _col("clip_deleted_vs_target_phrase")
+        tgt_swapped = _col("clip_swapped_vs_target_phrase")
+        repl_swapped = _col("clip_swapped_vs_replacement_phrase")
+
         seed_m = base_seed + 17 * mi
         out["per_method"][m] = {
             "clip_image_vs_full_prompt": _ci_dict(clip_vals, n_bootstrap, seed_m),
@@ -880,6 +964,20 @@ def _aggregate_summary(
             "ssim_swap_vs_normal": _ci_dict(ssim_swap_vals, n_bootstrap, seed_m + 21),
             "clip_swap_image_vs_swapped_prompt": _ci_dict(
                 clip_swap_vals, n_bootstrap, seed_m + 23
+            ),
+            # E3 efficacy on the target concept. The deletion/replacement drop is the
+            # signal; the absolute values are not comparable across concepts.
+            "clip_normal_vs_target_phrase": _ci_dict(tgt_normal, n_bootstrap, seed_m + 25),
+            "clip_deleted_vs_target_phrase": _ci_dict(tgt_deleted, n_bootstrap, seed_m + 27),
+            "clip_swapped_vs_target_phrase": _ci_dict(tgt_swapped, n_bootstrap, seed_m + 29),
+            "clip_swapped_vs_replacement_phrase": _ci_dict(repl_swapped, n_bootstrap, seed_m + 31),
+            "efficacy_delta_clip_deletion": (
+                float(np.mean(tgt_normal) - np.mean(tgt_deleted))
+                if tgt_normal and tgt_deleted else float("nan")
+            ),
+            "efficacy_delta_clip_replacement": (
+                float(np.mean(tgt_normal) - np.mean(tgt_swapped))
+                if tgt_normal and tgt_swapped else float("nan")
             ),
         }
 
@@ -991,6 +1089,41 @@ def main() -> None:
         ),
     )
     p.add_argument(
+        "--target_property",
+        type=str,
+        default=None,
+        help=(
+            "E3 targeted-concept mode. Restrict evaluation to holdout tuples containing this "
+            "property and always edit *it*, instead of sampling a random active attribute. "
+            "Combine with --locality_drop_one_attr (off-manifold deletion) and/or "
+            "--locality_swap_one_attr (on-manifold replacement). Example: 'holding a gun'. "
+            "IMPORTANT: pre-edit/swapped cache entries are keyed only by (method, sample_idx), "
+            "so different targets MUST use different --baseline_cache_root values or they will "
+            "overwrite each other's edited renders."
+        ),
+    )
+    p.add_argument(
+        "--replacement_property",
+        type=str,
+        default=None,
+        help=(
+            "Fixed on-manifold counterfactual for --locality_swap_one_attr, e.g. "
+            "'holding a coffee' for target 'holding a gun'. Must be in the same category as "
+            "the target; a cross-category swap is not a valid one-hot prompt. Defaults to a "
+            "per-sample random same-category value."
+        ),
+    )
+    p.add_argument(
+        "--max_matched",
+        type=int,
+        default=None,
+        help=(
+            "Cap the number of tuples actually evaluated in targeted-concept mode. Unlike "
+            "--max_samples (which caps how many holdout rows are scanned), this caps how many "
+            "rows containing the target are scored, so the n per concept is predictable."
+        ),
+    )
+    p.add_argument(
         "--baselines_only",
         action="store_true",
         help=(
@@ -1025,6 +1158,9 @@ def main() -> None:
         baseline_cache_root=args.baseline_cache_root,
         use_baseline_cache=not args.no_baseline_cache,
         baselines_only=args.baselines_only,
+        target_property=args.target_property,
+        replacement_property=args.replacement_property,
+        max_matched=args.max_matched,
     )
     print(json.dumps(summary, indent=2))
 
