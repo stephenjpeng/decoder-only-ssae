@@ -75,6 +75,7 @@ from evaluation.pixel_metrics import pixel_mse, ssim
 from evaluation.sd3_pack import (
     compute_or_load_full_mean,
     flatten_sd3_conditioning,
+    get_full_concat_embedding_untruncated,
     pack_sd3_from_full_flat_topk,
     pack_sd3_from_truncated_normalized,
     packer_fingerprint,
@@ -135,6 +136,26 @@ def _choose_swap_target_pid(
     if not alternatives:
         return None
     return rng.choice(alternatives)
+
+
+def _category_marginal_mask(dataset, mask_row: torch.Tensor, target_pid: int) -> torch.Tensor:
+    """Replace ``target_pid`` with the uniform marginal over its category"""
+    props = dataset.properties
+    cid = props.pid_to_cid[target_pid]
+    members = list(props.cid_to_pids[cid])
+    out = mask_row.float().clone()
+    out[target_pid] = 0.0
+    for pid in members:
+        out[pid] = 1.0 / len(members)
+    return out
+
+
+def _packer_metadata(fill_policy: str, drop_operator: str) -> dict:
+    """Cache/run identity for policy choices that change rendered pixels"""
+    meta = dict(packer_fingerprint())
+    meta["fill_policy"] = fill_policy
+    meta["drop_operator"] = drop_operator
+    return meta
 
 
 def _write_placeholder_png(path: Path) -> None:
@@ -237,11 +258,18 @@ def run_image_benchmark(
     target_property: str | None = None,
     replacement_property: str | None = None,
     max_matched: int | None = None,
+    fill_policy: str = "train_mean",
+    drop_operator: str = "zero",
 ) -> dict:
     ssae_device = ssae_device or sd_device
     baseline_device = baseline_device or ssae_device
     clip_device = clip_device or ("cuda" if torch.cuda.is_available() else "cpu")
     holdout_folder = Path(ensure_folder_path(holdout_folder))
+    if fill_policy not in {"train_mean", "source_prompt"}:
+        raise ValueError("fill_policy must be 'train_mean' or 'source_prompt'")
+    if drop_operator not in {"zero", "category_marginal"}:
+        raise ValueError("drop_operator must be 'zero' or 'category_marginal'")
+
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     img_root = output_dir / "images"
@@ -276,11 +304,10 @@ def run_image_benchmark(
 
     X_tr_cpu, M_tr_cpu = _stack_cpu(train_ds)
 
-    # Training-set mean of the full untruncated embedding — used to fill the
-    # non-top-k coordinates when packing SSAE/baseline predictions for SD3. Keeps
-    # image-space rendering free of ground-truth holdout leakage into the
-    # ~99.93% of dims the SSAE doesn't predict.
-    pack_template = compute_or_load_full_mean(train_ds).cpu()
+    # Default fill template. Source-prompt fill is selected per sample below because
+    # the deployment-style template is the unedited prompt's full embedding.
+    train_mean_template = compute_or_load_full_mean(train_ds).cpu()
+    pack_template = train_mean_template
 
     cache: BaselineCache | None = None
     cache_methods: set[str] = set()
@@ -294,7 +321,7 @@ def run_image_benchmark(
             base_seed=base_seed,
             ridge_lambda=ridge_lambda,
             sd3_fingerprint=ImageGenerator.fingerprint(),
-            packer_fingerprint=packer_fingerprint(),
+            packer_fingerprint=_packer_metadata(fill_policy, drop_operator),
         )
         cache_methods = {m for m in methods if m in BASELINE_METHODS}
         loaded_fits = cache.load_fits()
@@ -357,6 +384,10 @@ def run_image_benchmark(
         ]
 
         x_tgt, mask_row_ds = holdout_ds[idx]
+        if fill_policy == "source_prompt":
+            pack_template = get_full_concat_embedding_untruncated(holdout_ds, idx).cpu()
+        else:
+            pack_template = train_mean_template
         x_tgt = x_tgt.unsqueeze(0).to(dev_dec).float()
         x_tgt_base = x_tgt if dev_base == dev_dec else x_tgt.to(dev_base)
         mask_row_ds = mask_row_ds.to(dev_dec)
@@ -442,8 +473,11 @@ def run_image_benchmark(
 
         pred_ssae_pre = pred_ma_pre = pred_ridge_pre = None
         if do_drop:
-            mask_pre_ds = mask_row_ds.clone()
-            mask_pre_ds[edit_pid] = 0
+            if drop_operator == "category_marginal":
+                mask_pre_ds = _category_marginal_mask(holdout_ds, mask_row_ds, edit_pid).to(dev_dec)
+            else:
+                mask_pre_ds = mask_row_ds.clone().float()
+                mask_pre_ds[edit_pid] = 0
             if want_ssae:
                 pred_ssae_pre = predict_embedding_compositional(
                     decoder,
@@ -751,8 +785,12 @@ def run_image_benchmark(
         n_bootstrap=n_bootstrap,
         base_seed=base_seed,
     )
+    packer_meta = _packer_metadata(fill_policy, drop_operator)
     summary["ridge_lambda"] = ridge_lambda
     summary["methods"] = list(local_methods)
+    summary["fill_policy"] = fill_policy
+    summary["drop_operator"] = drop_operator
+    summary["packer_fingerprint"] = packer_meta
 
     mse_ssae = [float(r["mse_embedding_vs_gt"]) for r in rows if r["method"] == "ssae_compose" and r["mse_embedding_vs_gt"] != ""]
     cos_ssae = [float(r["cosine_embedding_vs_gt"]) for r in rows if r["method"] == "ssae_compose" and r["cosine_embedding_vs_gt"] != ""]
@@ -779,6 +817,9 @@ def run_image_benchmark(
         )
         cache_summary["ridge_lambda"] = ridge_lambda
         cache_summary["methods"] = list(cache_method_list)
+        cache_summary["fill_policy"] = fill_policy
+        cache_summary["drop_operator"] = drop_operator
+        cache_summary["packer_fingerprint"] = packer_meta
         cache.write(
             methods=cache_method_list,
             summary=cache_summary,
@@ -786,6 +827,8 @@ def run_image_benchmark(
                 "locality_drop_populated": locality_drop_one_attr,
                 "locality_swap_populated": locality_swap_one_attr,
                 "n_samples": n,
+                "fill_policy": fill_policy,
+                "drop_operator": drop_operator,
             },
         )
     else:
@@ -809,8 +852,10 @@ def run_image_benchmark(
         # method, in every manifest — so no downstream table can silently place a native
         # and a packed row in the same statistical comparison.
         "method_conditioning": conditioning_map(methods),
-        "packer_fingerprint": packer_fingerprint(),
+        "packer_fingerprint": packer_meta,
         "truncate_embds_topk": tp.get("truncate_embds_topk"),
+        "fill_policy": fill_policy,
+        "drop_operator": drop_operator,
         "target_property": target_property,
         "replacement_property": replacement_property,
         "n_matched": n_matched if target_pid is not None else None,
@@ -826,7 +871,7 @@ def run_image_benchmark(
         seed=base_seed,
         dataset=holdout_ds,
         extra_datasets={"train": train_ds},
-        packer_fingerprint=packer_fingerprint(),
+        packer_fingerprint=packer_meta,
         model_fingerprint=checkpoint_fingerprint(checkpoint_dir),
         extra={
             "benchmark": manifest,
@@ -841,6 +886,8 @@ def run_image_benchmark(
             "skip_dino": skip_dino,
             "use_baseline_cache": use_baseline_cache,
             "baselines_only": baselines_only,
+            "fill_policy": fill_policy,
+            "drop_operator": drop_operator,
         },
     )
 
@@ -1124,6 +1171,28 @@ def main() -> None:
         ),
     )
     p.add_argument(
+        "--fill_policy",
+        type=str,
+        default="train_mean",
+        choices=["train_mean", "source_prompt"],
+        help=(
+            "Template for non-top-k coordinates when packing embedding-space predictions. "
+            "train_mean matches the primary benchmark; source_prompt uses each row's original "
+            "full prompt embedding and is the Q8 deployment-style robustness check."
+        ),
+    )
+    p.add_argument(
+        "--drop_operator",
+        type=str,
+        default="zero",
+        choices=["zero", "category_marginal"],
+        help=(
+            "Operator for --locality_drop_one_attr. zero removes the target block; "
+            "category_marginal replaces it with the uniform category marginal, the E4 "
+            "identified-erasure operator. Replacement/swap renders are unchanged."
+        ),
+    )
+    p.add_argument(
         "--baselines_only",
         action="store_true",
         help=(
@@ -1161,6 +1230,8 @@ def main() -> None:
         target_property=args.target_property,
         replacement_property=args.replacement_property,
         max_matched=args.max_matched,
+        fill_policy=args.fill_policy,
+        drop_operator=args.drop_operator,
     )
     print(json.dumps(summary, indent=2))
 

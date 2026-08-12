@@ -55,9 +55,9 @@ def latent_row_from_property_means_trainable(
     z = torch.zeros(n_props * n_repeat, device=device, dtype=block_means.dtype)
     m = mask_reduced_row.to(device).float()
     for p in range(n_props):
-        if m[p] > 0.5:
+        if m[p] != 0:
             sl = slice(p * n_repeat, (p + 1) * n_repeat)
-            z[sl] = block_means[p]
+            z[sl] = block_means[p] * m[p]
     return z.unsqueeze(0)
 
 
@@ -69,14 +69,13 @@ def decode_latent_row_trainable(decoder: torch.nn.Module, z: torch.Tensor) -> to
 
 @torch.no_grad()
 def decode_mask_row_avg_feature(decoder: torch.nn.Module, mask_reduced_row: torch.Tensor) -> torch.Tensor:
-    """Single prompt row; ``mask_reduced_row`` (n_properties,) int 0/1."""
+    """Single prompt row; ``mask_reduced_row`` can contain binary or fractional weights"""
     device = mask_reduced_row.device
     n_props = mask_reduced_row.shape[0]
-    idx = torch.arange(1, n_props + 1, device=device, dtype=torch.long) * mask_reduced_row.long()
-    idx = idx.unsqueeze(0)
-    emb = decoder.Y(idx)
-    emb = decoder.activation(emb)
-    emb = emb.reshape(1, -1)
+    idx = torch.arange(1, n_props + 1, device=device, dtype=torch.long)
+    emb = decoder.activation(decoder.Y(idx))
+    weights = mask_reduced_row.to(device).float().view(n_props, 1)
+    emb = (emb * weights).reshape(1, -1)
     return decoder.linear(emb)
 
 
