@@ -37,6 +37,8 @@ def main() -> None:
     sub.add_parser("unsup_ae", help="Shallow AE baseline on holdout")
     sub.add_parser("unsup_sae", help="Sparse L1 AE baseline on holdout")
     sub.add_parser("sweep", help="Generate ablation YAMLs (see experiments.sweep_generate)")
+    sub.add_parser("interaction_budget", help="Plain and pairwise ridge with lambda selection")
+    sub.add_parser("probe_fit", help="Fit linear probe intervention artifact")
 
     args, rest = p.parse_known_args()
 
@@ -70,6 +72,10 @@ def main() -> None:
         sys.exit(_run("baselines.run_unsup_sae_holdout", rest))
     if args.cmd == "sweep":
         sys.exit(_run("experiments.sweep_generate", rest))
+    if args.cmd == "interaction_budget":
+        sys.exit(_run("baselines.run_interaction_budget", rest))
+    if args.cmd == "probe_fit":
+        sys.exit(_run("evaluation.run_probe_intervention_fit", rest))
 
 
 if __name__ == "__main__":

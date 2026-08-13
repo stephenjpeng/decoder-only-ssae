@@ -132,6 +132,9 @@ def paired_diffs(jsonl_path: Path) -> pd.DataFrame:
         ("ssae_L1", "prompt_only"),
         ("ssae_L2_h2048", "prompt_only"),
         ("ssae_L2_h2048", "ssae_L1"),
+        ("ssae_L2_h2048", "linear_probe_direction"),
+        ("linear_probe_direction", "prompt_only"),
+        ("linear_probe_direction", "ridge_embed"),
     ]
     rows = []
     for target in sorted(df["target"].unique()):

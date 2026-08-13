@@ -50,6 +50,7 @@ METHOD_ORDER: tuple[str, ...] = (
     "ssae_compose",
     "mean_arithmetic",
     "ridge_embed",
+    "linear_probe_direction",
     "prompt_only",
     "prompt_modified_packed",
 )
@@ -77,6 +78,7 @@ CONDITIONING: dict[str, str] = {
     "ssae_compose": "packed",
     "mean_arithmetic": "packed",
     "ridge_embed": "packed",
+    "linear_probe_direction": "packed",
     "prompt_only": "native",
     "prompt_modified_packed": "packed",
 }
@@ -87,6 +89,7 @@ CONDITIONING_DETAIL: dict[str, str] = {
     "ssae_compose": "topk_ssae_prediction_train_mean_fill",
     "mean_arithmetic": "topk_mean_arithmetic_prediction_train_mean_fill",
     "ridge_embed": "topk_ridge_prediction_train_mean_fill",
+    "linear_probe_direction": "topk_true_source_embedding_plus_calibrated_probe_direction_train_mean_fill",
     "prompt_only": "native_full_text_encoder_output",
     "prompt_modified_packed": "topk_reencoded_prompt_train_mean_fill",
 }
@@ -99,6 +102,7 @@ METHOD_LABEL: dict[str, str] = {
     "ssae_compose": "SSAE compose",
     "mean_arithmetic": "Mean-arithmetic",
     "ridge_embed": "Ridge",
+    "linear_probe_direction": "Linear probe direction",
     "prompt_only": "Prompt modification (native/full embedding)",
     "prompt_modified_packed": "Prompt modification (packed top-k)",
 }
@@ -109,6 +113,7 @@ METHOD_LABEL_SHORT: dict[str, str] = {
     "ssae_compose": "SSAE compose",
     "mean_arithmetic": "Mean-arith",
     "ridge_embed": "Ridge",
+    "linear_probe_direction": "Probe dir",
     "prompt_only": "Prompt mod (native)",
     "prompt_modified_packed": "Prompt mod (packed)",
 }
@@ -118,6 +123,7 @@ METHOD_COLOR: dict[str, str] = {
     "ssae_compose": "#2563eb",
     "mean_arithmetic": "#0891b2",
     "ridge_embed": "#7c3aed",
+    "linear_probe_direction": "#dc2626",
     "prompt_only": "#b45309",
     "prompt_modified_packed": "#059669",
 }

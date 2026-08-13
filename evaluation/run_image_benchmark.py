@@ -65,6 +65,7 @@ from evaluation.method_labels import (
     conditioning_map,
 )
 from evaluation.method_labels import sort_methods as _sort_methods
+from evaluation.run_probe_intervention_fit import load_and_validate_probe_artifact
 from evaluation.composition import (
     property_block_means_trainable_inputs,
     predict_embedding_compositional,
@@ -260,6 +261,7 @@ def run_image_benchmark(
     max_matched: int | None = None,
     fill_policy: str = "train_mean",
     drop_operator: str = "zero",
+    probe_artifact_path: Path | None = None,
 ) -> dict:
     ssae_device = ssae_device or sd_device
     baseline_device = baseline_device or ssae_device
@@ -284,6 +286,14 @@ def run_image_benchmark(
     if baselines_only:
         methods = tuple(m for m in methods if m != "ssae_compose")
     methods = _sort_methods(methods)
+
+    # load and validate probe artifact before touching the GPU
+    probe_artifact: dict | None = None
+    if "linear_probe_direction" in methods:
+        if probe_artifact_path is None:
+            raise SystemExit("--probe_artifact is required when 'linear_probe_direction' is in --methods")
+        if "gt_embed" not in methods:
+            raise SystemExit("'gt_embed' must be in --methods when using 'linear_probe_direction' (its post image is reused)")
 
     decoder, tp, train_ds = load_decoder_checkpoint(checkpoint_dir, device=ssae_device)
     holdout_ds = h5_dataset_for_folder(checkpoint_dir, holdout_folder)
@@ -360,6 +370,10 @@ def run_image_benchmark(
                 f"one-hot prompt and would leave the design's row space"
             )
     n_matched = 0
+
+    # now that train_ds is loaded, validate the artifact against its config
+    if "linear_probe_direction" in methods and probe_artifact_path is not None:
+        probe_artifact = load_and_validate_probe_artifact(probe_artifact_path, train_ds)
 
     gen = ImageGenerator(simulated=simulated, device=sd_device)
     clip_ok = not simulated
@@ -547,6 +561,20 @@ def run_image_benchmark(
                     pe, pp = _encode_and_pack_prompt(
                         gen, holdout_ds, prompt_text, seed_i, pack_template
                     )
+                elif method == "linear_probe_direction":
+                    # post is the true source embedding — same image as gt_embed
+                    # hard-link from the gt_embed post image instead of rendering again
+                    gt_post_path = ref_paths.get(idx)
+                    if gt_post_path is not None and gt_post_path.exists():
+                        import os
+                        out_path.parent.mkdir(parents=True, exist_ok=True)
+                        if not out_path.exists():
+                            try:
+                                os.link(gt_post_path, out_path)
+                            except OSError:
+                                import shutil
+                                shutil.copy2(gt_post_path, out_path)
+                    pe, pp = None, None  # skip generation below
                 else:
                     raise ValueError(f"Unknown method {method}")
 
@@ -555,12 +583,17 @@ def run_image_benchmark(
                         gen.generate_image_from_prompt(
                             prompt_text, out_path, use_negative_prompts=False, seed=seed_i
                         )
+                    elif method == "linear_probe_direction":
+                        pass  # hard-linked above; no diffusion call needed
                     else:
                         pe = pe.to(sd_device)
                         pp = pp.to(sd_device)
                         gen.generate_image_from_embd(pe, pp, out_path, seed=seed_i)
                 else:
-                    _write_placeholder_png(out_path)
+                    if method != "linear_probe_direction":
+                        _write_placeholder_png(out_path)
+                    elif not out_path.exists():
+                        _write_placeholder_png(out_path)
 
             row = {
                 "task": "holdout_unseen_tuple",
@@ -599,6 +632,15 @@ def run_image_benchmark(
                     row["mse_embedding_vs_gt"] = mse_ma
                 elif method == "ridge_embed":
                     row["mse_embedding_vs_gt"] = mse_ridge
+                elif method == "linear_probe_direction":
+                    # post is identical to gt_embed — mse is 0 by construction
+                    row["mse_embedding_vs_gt"] = 0.0
+                    row["cosine_embedding_vs_gt"] = 1.0
+                    row["intervention_source"] = "true_holdout_topk_embedding"
+                    if probe_artifact is not None:
+                        row["probe_artifact"] = str(probe_artifact_path)
+                        row["probe_delete_alpha"] = probe_artifact.get("delete_alpha", "")
+                        row["probe_replace_alpha"] = probe_artifact.get("replace_alpha", "")
 
                 if clip_scorer is not None:
                     row["clip_image_vs_full_prompt"] = clip_scorer.image_text_cosine(
@@ -678,6 +720,14 @@ def run_image_benchmark(
                         pe_pre, pp_pre = pack_sd3_from_truncated_normalized(
                             holdout_ds, idx, pred_ridge_pre.cpu(), template=pack_template
                         )
+                    elif method == "linear_probe_direction" and probe_artifact is not None:
+                        # deletion: x_tgt - delete_alpha * delete_direction
+                        d_del = probe_artifact["delete_direction"].to(x_tgt.device)
+                        alpha_del = probe_artifact.get("delete_alpha") or 0.0
+                        x_deleted = x_tgt - alpha_del * d_del
+                        pe_pre, pp_pre = pack_sd3_from_truncated_normalized(
+                            holdout_ds, idx, x_deleted.cpu(), template=pack_template
+                        )
                     else:
                         raise ValueError(f"Unknown method {method}")
 
@@ -729,6 +779,14 @@ def run_image_benchmark(
                     elif method == "ridge_embed":
                         pe_sw, pp_sw = pack_sd3_from_truncated_normalized(
                             train_ds, ref_tid_swap, pred_ridge_swap.cpu(), template=pack_template
+                        )
+                    elif method == "linear_probe_direction" and probe_artifact is not None:
+                        # replacement: x_tgt + replace_alpha * replace_direction
+                        d_rep = probe_artifact["replace_direction"].to(x_tgt.device)
+                        alpha_rep = probe_artifact.get("replace_alpha") or 0.0
+                        x_replaced = x_tgt + alpha_rep * d_rep
+                        pe_sw, pp_sw = pack_sd3_from_truncated_normalized(
+                            holdout_ds, idx, x_replaced.cpu(), template=pack_template
                         )
                     else:
                         raise ValueError(f"Unknown method {method}")
@@ -1200,6 +1258,15 @@ def main() -> None:
             "warming a dataset's baselines before comparing several SSAE checkpoints."
         ),
     )
+    p.add_argument(
+        "--probe_artifact",
+        type=Path,
+        default=None,
+        help=(
+            "Path to a probe_artifact.pt file produced by run_probe_intervention_fit. "
+            "Required when 'linear_probe_direction' is in --methods."
+        ),
+    )
     args = p.parse_args()
 
     methods = tuple(m.strip() for m in args.methods.split(",") if m.strip())
@@ -1232,6 +1299,7 @@ def main() -> None:
         max_matched=args.max_matched,
         fill_policy=args.fill_policy,
         drop_operator=args.drop_operator,
+        probe_artifact_path=args.probe_artifact,
     )
     print(json.dumps(summary, indent=2))
 

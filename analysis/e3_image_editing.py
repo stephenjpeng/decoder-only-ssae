@@ -25,6 +25,7 @@ METHOD_ORDER = [
     "prompt_only",
     "ridge_embed",
     "mean_arithmetic",
+    "linear_probe_direction",
     "ssae_L1",
     "ssae_L2_h2048",
 ]
@@ -126,6 +127,34 @@ def summarise_e3(rows: pd.DataFrame) -> pd.DataFrame:
     return out.sort_values(["concept", "method_rank", "method"]).drop(columns="method_rank")
 
 
+def load_e3_probe_rows(root: Path) -> pd.DataFrame:
+    """Load probe-intervention E3 rows from bench_e3_probe run folders"""
+    rows: list[pd.DataFrame] = []
+    probe_root = root / "bench_e3_probe"
+    if not probe_root.is_dir():
+        return pd.DataFrame()
+    for path in sorted(probe_root.glob("*_probe/per_sample.csv")):
+        run_name = path.parent.name
+        concept = run_name.removesuffix("_probe")
+        df = pd.read_csv(path)
+        df["concept_key"] = concept
+        df["method"] = "linear_probe_direction"
+        rows.append(df)
+    if not rows:
+        return pd.DataFrame()
+    out = pd.concat(rows, ignore_index=True)
+    out["target_concept"] = out["concept_key"].map(CONCEPT_LABELS)
+    if "delete_delta_target" not in out.columns and "clip_normal_vs_target_phrase" in out.columns:
+        out["delete_delta_target"] = (
+            out["clip_normal_vs_target_phrase"] - out["clip_deleted_vs_target_phrase"]
+        )
+    if "swap_gain_replacement_over_target" not in out.columns and "clip_swapped_vs_replacement_phrase" in out.columns:
+        out["swap_gain_replacement_over_target"] = (
+            out["clip_swapped_vs_replacement_phrase"] - out["clip_swapped_vs_target_phrase"]
+        )
+    return out
+
+
 def paired_method_diffs(rows: pd.DataFrame) -> pd.DataFrame:
     """Paired method differences for the main E3 comparisons"""
     comparisons = [
@@ -133,6 +162,9 @@ def paired_method_diffs(rows: pd.DataFrame) -> pd.DataFrame:
         ("ssae_L2_h2048", "ridge_embed"),
         ("ssae_L2_h2048", "prompt_only"),
         ("ssae_L2_h2048", "ssae_L1"),
+        ("ssae_L2_h2048", "linear_probe_direction"),
+        ("linear_probe_direction", "prompt_only"),
+        ("linear_probe_direction", "ridge_embed"),
     ]
     metrics = [
         "delete_delta_target",

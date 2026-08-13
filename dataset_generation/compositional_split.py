@@ -47,6 +47,75 @@ def enumerate_full_combos(categories: Mapping[str, List[str]]) -> List[Dict[str,
     return [dict(zip(keys, t)) for t in tuples]
 
 
+def _property_locations(
+    categories: Mapping[str, list[str]],
+) -> dict[str, tuple[str, int]]:
+    """Map each property phrase to (category_name, within-category index)."""
+    locations = {}
+    for cat_name, props in categories.items():
+        for idx, prop in enumerate(props):
+            locations[prop] = (cat_name, idx)
+    return locations
+
+
+def _validate_holdout_pair(
+    categories: Mapping[str, list[str]],
+    pair: tuple[str, str],
+) -> tuple[tuple[str, str], tuple[str, str]]:
+    """
+    Resolve and validate two unique values from different categories.
+    Returns ((cat_a, phrase_a), (cat_b, phrase_b)).
+    Raises ValueError for: unknown phrase, duplicate phrases, same-category pair.
+    """
+    phrase_a, phrase_b = pair
+
+    # check for duplicates
+    if phrase_a == phrase_b:
+        raise ValueError(f"Duplicate property in holdout pair: {phrase_a!r}")
+
+    locations = _property_locations(categories)
+
+    # check both phrases exist
+    if phrase_a not in locations:
+        raise ValueError(f"Unknown property {phrase_a!r} in holdout pair")
+    if phrase_b not in locations:
+        raise ValueError(f"Unknown property {phrase_b!r} in holdout pair")
+
+    cat_a, _ = locations[phrase_a]
+    cat_b, _ = locations[phrase_b]
+
+    # check different categories
+    if cat_a == cat_b:
+        raise ValueError(
+            f"Holdout pair must be from different categories; both {phrase_a!r} "
+            f"and {phrase_b!r} are from {cat_a!r}"
+        )
+
+    return ((cat_a, phrase_a), (cat_b, phrase_b))
+
+
+def _split_by_value_pair(
+    all_combos: Sequence[dict[str, str]],
+    pair: tuple[str, str],
+) -> tuple[list[int], list[int]]:
+    """
+    Put every tuple containing BOTH values into holdout; rest to train.
+    Returns (train_indices, holdout_indices).
+    """
+    phrase_a, phrase_b = pair
+    train_idx = []
+    holdout_idx = []
+
+    for i, combo in enumerate(all_combos):
+        values = set(combo.values())
+        if phrase_a in values and phrase_b in values:
+            holdout_idx.append(i)
+        else:
+            train_idx.append(i)
+
+    return train_idx, holdout_idx
+
+
 def _shuffle_split_indices(
     n_total: int, n_holdout: int, seed: int
 ) -> Tuple[List[int], List[int]]:
@@ -81,29 +150,53 @@ def build_disjoint_split(
     n_holdout: int | None = None,
     max_train_prompts: int | None = None,
     max_holdout_prompts: int | None = None,
+    holdout_value_pair: tuple[str, str] | None = None,
     seed: int = 0,
 ) -> Tuple[List[Dict[str, str]], List[Dict[str, str]], Dict[str, Any]]:
     """
     Split full Cartesian product into train / holdout by disjoint full tuples.
 
     Exactly one of holdout_fraction or n_holdout must be set (unless both imply
-    n_holdout == 0 via fraction 0).
+    n_holdout == 0 via fraction 0), OR holdout_value_pair is set.
+
+    When holdout_value_pair is set, every tuple containing BOTH values goes to
+    holdout; the rest to train. max_holdout_prompts is rejected in this mode.
     """
     keys = category_order(categories)
     all_combos = enumerate_full_combos(categories)
     n_total = len(all_combos)
 
-    if holdout_fraction is not None and n_holdout is not None:
+    # validate mutual exclusivity
+    if holdout_value_pair is not None:
+        if max_holdout_prompts is not None:
+            raise ValueError(
+                "max_holdout_prompts cannot be used with holdout_value_pair; "
+                "the pair determines the exact holdout set."
+            )
+        if holdout_fraction is not None or n_holdout is not None:
+            raise ValueError(
+                "Pass only holdout_value_pair, not holdout_fraction or n_holdout."
+            )
+    elif holdout_fraction is not None and n_holdout is not None:
         raise ValueError("Pass only one of holdout_fraction or n_holdout.")
 
-    if holdout_fraction is not None:
-        n_h = int(round(holdout_fraction * n_total))
-    elif n_holdout is not None:
-        n_h = n_holdout
+    # determine split strategy
+    if holdout_value_pair is not None:
+        # leave-value-pair-out split
+        validated_pair = _validate_holdout_pair(categories, holdout_value_pair)
+        (cat_a, phrase_a), (cat_b, phrase_b) = validated_pair
+        train_idx, holdout_idx = _split_by_value_pair(all_combos, holdout_value_pair)
+        split_strategy = "leave_value_pair_out"
     else:
-        n_h = 0
-
-    train_idx, holdout_idx = _shuffle_split_indices(n_total, n_h, seed)
+        # random shuffle split
+        if holdout_fraction is not None:
+            n_h = int(round(holdout_fraction * n_total))
+        elif n_holdout is not None:
+            n_h = n_holdout
+        else:
+            n_h = 0
+        train_idx, holdout_idx = _shuffle_split_indices(n_total, n_h, seed)
+        split_strategy = "disjoint_full_tuple_shuffle"
 
     train_choices = [all_combos[i] for i in train_idx]
     holdout_choices = [all_combos[i] for i in holdout_idx]
@@ -127,19 +220,58 @@ def build_disjoint_split(
         )
         holdout_choices = [holdout_choices[i] for i in sorted(kept_h_idx)]
 
+    # build base stats
     stats = {
         "n_categories": len(keys),
         "category_order": keys,
         "n_total_full_factorial": n_total,
-        "n_holdout_requested": n_h,
+        "split_strategy": split_strategy,
         "n_train_written": len(train_choices),
         "n_holdout_written": len(holdout_choices),
         "seed": seed,
-        "holdout_fraction": holdout_fraction,
-        "n_holdout_param": n_holdout,
         "max_train_prompts": max_train_prompts,
         "max_holdout_prompts": max_holdout_prompts,
     }
+
+    # add strategy-specific stats
+    if holdout_value_pair is not None:
+        # pair-specific stats
+        (cat_a, phrase_a), (cat_b, phrase_b) = validated_pair
+        stats["holdout_value_pair"] = [phrase_a, phrase_b]
+        stats["holdout_pair_categories"] = [cat_a, cat_b]
+
+        # count pair occurrences
+        n_holdout_pair_matches = sum(
+            1 for c in holdout_choices
+            if phrase_a in c.values() and phrase_b in c.values()
+        )
+        n_train_pair_matches = sum(
+            1 for c in train_choices
+            if phrase_a in c.values() and phrase_b in c.values()
+        )
+        first_value_train_count = sum(1 for c in train_choices if phrase_a in c.values())
+        second_value_train_count = sum(1 for c in train_choices if phrase_b in c.values())
+
+        # expected holdout count: product of sizes of other categories
+        size_a = len(categories[cat_a])
+        size_b = len(categories[cat_b])
+        n_expected = n_total // (size_a * size_b)
+
+        stats["n_expected_pair_tuples"] = n_expected
+        stats["n_holdout_pair_matches"] = n_holdout_pair_matches
+        stats["n_train_pair_matches"] = n_train_pair_matches
+        stats["first_value_train_count"] = first_value_train_count
+        stats["second_value_train_count"] = second_value_train_count
+        stats["all_holdout_rows_contain_pair"] = n_holdout_pair_matches == len(holdout_choices)
+        stats["no_train_rows_contain_pair"] = n_train_pair_matches == 0
+        stats["individual_values_remain_in_train"] = (
+            first_value_train_count > 0 and second_value_train_count > 0
+        )
+    else:
+        # random split stats
+        stats["n_holdout_requested"] = n_h
+        stats["holdout_fraction"] = holdout_fraction
+        stats["n_holdout_param"] = n_holdout
     return train_choices, holdout_choices, stats
 
 
@@ -198,6 +330,7 @@ def write_compositional_split(
     n_holdout: int | None = None,
     max_train_prompts: int | None = None,
     max_holdout_prompts: int | None = None,
+    holdout_value_pair: tuple[str, str] | None = None,
     seed: int = 0,
     shuffle_train_ids: bool = False,
     properties_same_json: Path | str | None = None,
@@ -207,6 +340,9 @@ def write_compositional_split(
 
     Training uses only ``train/`` (prompts.json + properties.json + embds after
     you run embedding extraction). Holdout tuples never appear in train prompts.
+
+    When holdout_value_pair is set, every tuple containing BOTH values goes to
+    holdout; the rest to train.
     """
     categories_path = Path(categories_json)
     root = Path(output_root)
@@ -218,6 +354,7 @@ def write_compositional_split(
         n_holdout=n_holdout,
         max_train_prompts=max_train_prompts,
         max_holdout_prompts=max_holdout_prompts,
+        holdout_value_pair=holdout_value_pair,
         seed=seed,
     )
 
@@ -234,7 +371,6 @@ def write_compositional_split(
 
     manifest = {
         "categories_source": str(categories_path.resolve()),
-        "split_strategy": "disjoint_full_tuple_shuffle",
         **stats,
         "train_dir": str((root / "train").resolve()),
         "holdout_dir": str((root / "holdout").resolve()),
@@ -299,6 +435,12 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         type=int,
         help="Exact number of holdout tuples (disjoint from train).",
     )
+    g.add_argument(
+        "--holdout_value_pair",
+        nargs=2,
+        metavar=("VALUE_A", "VALUE_B"),
+        help="Two property values from different categories; tuples containing BOTH go to holdout.",
+    )
     p.add_argument(
         "--max_train_prompts",
         type=int,
@@ -358,6 +500,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     args = _parse_args(argv)
     holdout_fraction = args.holdout_fraction
     n_holdout = args.n_holdout
+    holdout_value_pair = tuple(args.holdout_value_pair) if args.holdout_value_pair else None
     manifest = write_compositional_split(
         args.categories_json,
         args.output_root,
@@ -365,6 +508,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         n_holdout=n_holdout,
         max_train_prompts=args.max_train_prompts,
         max_holdout_prompts=args.max_holdout_prompts,
+        holdout_value_pair=holdout_value_pair,
         seed=args.seed,
         shuffle_train_ids=args.shuffle_train_order,
         properties_same_json=args.properties_same_json,
