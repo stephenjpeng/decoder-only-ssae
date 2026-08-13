@@ -57,7 +57,8 @@ def openai_judge_image(
             "(API keys are managed at https://platform.openai.com/)."
         )
 
-    client = OpenAI(api_key=key, timeout=timeout)
+    base_url = os.environ.get("OPENAI_BASE_URL")
+    client = OpenAI(api_key=key, base_url=base_url, timeout=timeout)
     b64 = _encode_image_b64(image_path)
 
     attr_lines = "\n".join(f"- {a!r}" for a in attribute_phrases)

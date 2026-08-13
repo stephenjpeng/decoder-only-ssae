@@ -85,6 +85,11 @@ def _record_for_row(
         )
     except (OSError, ValueError, RuntimeError, ImportError, EnvironmentError) as err:
         out = {"error": str(err), "match_full_prompt": None}
+    except Exception as err:
+        if not err.__class__.__module__.startswith("openai"):
+            raise
+        # external API failures should not erase prior JSONL progress
+        out = {"error": str(err), "match_full_prompt": None}
 
     return {
         "benchmark_dir": str(bench),
