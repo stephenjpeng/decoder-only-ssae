@@ -46,13 +46,20 @@ def predict_mean_arithmetic(mu: torch.Tensor, deltas: torch.Tensor, M: torch.Ten
 
 
 def fit_ridge(M: torch.Tensor, X: torch.Tensor, lam: float) -> torch.Tensor:
-    """Ridge weights W (m, d) with intercept: append column of ones to M."""
-    ones = torch.ones(M.shape[0], 1, device=M.device, dtype=M.dtype)
+    """Ridge weights W (m, d) with intercept: append column of ones to M.
+
+    Uses float64 internally for the linear solve to avoid numerical singularity
+    on large or ill-conditioned design matrices, then casts back to input dtype.
+    """
+    orig_dtype = M.dtype
+    M = M.double()
+    X = X.double()
+    ones = torch.ones(M.shape[0], 1, device=M.device, dtype=torch.float64)
     M_aug = torch.cat([M, ones], dim=1)
     m = M_aug.shape[1]
-    g = M_aug.T @ M_aug + lam * torch.eye(m, device=M.device, dtype=M.dtype)
+    g = M_aug.T @ M_aug + lam * torch.eye(m, device=M.device, dtype=torch.float64)
     rhs = M_aug.T @ X
-    return torch.linalg.solve(g, rhs)
+    return torch.linalg.solve(g, rhs).to(orig_dtype)
 
 
 def predict_linear(M: torch.Tensor, W: torch.Tensor) -> torch.Tensor:
