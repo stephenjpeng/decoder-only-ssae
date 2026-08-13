@@ -77,7 +77,7 @@ class TestRenderingLadderControls(unittest.TestCase):
         short_native = METHOD_LABEL_SHORT["native_prompt"]
         short_prompt_only = METHOD_LABEL_SHORT["prompt_only"]
         short_gt = METHOD_LABEL_SHORT["gt_embed"]
-        
+
         self.assertNotEqual(short_native, short_prompt_only)
         self.assertNotEqual(short_native, short_gt)
         self.assertNotEqual(short_prompt_only, short_gt)
@@ -85,7 +85,7 @@ class TestRenderingLadderControls(unittest.TestCase):
     def test_generate_image_from_prompt_calls_encode_prompt(self):
         """generate_image_from_prompt (prompt_only path) calls encode_prompt."""
         gen = ImageGenerator(simulated=True, device="cpu")
-        
+
         with patch.object(gen, "get_embds_text_encoder") as mock_encode:
             mock_encode.return_value = (
                 torch.randn(1, 333, 4096),
@@ -97,7 +97,7 @@ class TestRenderingLadderControls(unittest.TestCase):
                 gen.generate_image_from_prompt(
                     "test prompt", "out.png", use_negative_prompts=False, seed=42
                 )
-                
+
                 # must call encode_prompt (via get_embds_text_encoder)
                 mock_encode.assert_called_once_with(
                     prompt="test prompt", use_negative_prompts=False, seed=42
@@ -108,13 +108,13 @@ class TestRenderingLadderControls(unittest.TestCase):
     def test_generate_image_from_prompt_native_no_encode_prompt(self):
         """generate_image_from_prompt_native does NOT call encode_prompt."""
         gen = ImageGenerator(simulated=True, device="cpu")
-        
+
         with patch.object(gen, "get_embds_text_encoder") as mock_encode:
             with patch.object(gen, "_generate_image_from_prompt_native_simulated") as mock_native:
                 gen.generate_image_from_prompt_native(
                     "test prompt", "out.png", use_negative_prompts=False, seed=42
                 )
-                
+
                 # must NOT call encode_prompt
                 mock_encode.assert_not_called()
                 # must call native simulated
@@ -128,11 +128,11 @@ class TestRenderingLadderControls(unittest.TestCase):
             gen.pipeline.return_value = Mock(images=[Mock(save=Mock())])
             # must not call encode_prompt when sending text to pipeline
             gen.pipeline.encode_prompt = MagicMock()
-            
+
             gen._generate_image_from_prompt_native(
                 "test prompt", "out.png", use_negative_prompts=False
             )
-            
+
             # pipeline must be called with prompt text, not prompt_embeds
             call_kwargs = gen.pipeline.call_args[1]
             self.assertEqual(call_kwargs["prompt"], "test prompt")
@@ -149,11 +149,11 @@ class TestRenderingLadderControls(unittest.TestCase):
             gen = ImageGenerator(simulated=False, device="cpu")
             gen.pipeline = MagicMock()
             gen.pipeline.return_value = Mock(images=[Mock(save=Mock())])
-            
+
             gen._generate_image_from_prompt_native(
                 "test prompt", "out.png", use_negative_prompts=False
             )
-            
+
             call_kwargs = gen.pipeline.call_args[1]
             self.assertIsNone(call_kwargs["negative_prompt"])
             self.assertIsNone(call_kwargs["negative_prompt_2"])
@@ -165,11 +165,11 @@ class TestRenderingLadderControls(unittest.TestCase):
             gen = ImageGenerator(simulated=False, device="cpu")
             gen.pipeline = MagicMock()
             gen.pipeline.return_value = Mock(images=[Mock(save=Mock())])
-            
+
             gen._generate_image_from_prompt_native(
                 "test prompt", "out.png", use_negative_prompts=True
             )
-            
+
             call_kwargs = gen.pipeline.call_args[1]
             self.assertEqual(call_kwargs["negative_prompt"], "")
             self.assertEqual(call_kwargs["negative_prompt_2"], "")
@@ -181,16 +181,16 @@ class TestRenderingLadderControls(unittest.TestCase):
             gen = ImageGenerator(simulated=False, device="cpu")
             gen.pipeline = MagicMock()
             gen.pipeline.return_value = Mock(images=[Mock(save=Mock())])
-            
+
             prompt_embeds = torch.randn(1, 333, 4096)
             pooled_prompt_embeds = torch.randn(1, 2048)
-            
+
             gen._generate_image_from_embd(
                 prompt_embeds=prompt_embeds,
                 pooled_prompt_embeds=pooled_prompt_embeds,
                 image_name="out.png",
             )
-            
+
             # pipeline must be called with embeddings, prompt=None
             call_kwargs = gen.pipeline.call_args[1]
             self.assertIsNone(call_kwargs["prompt"])
@@ -202,7 +202,7 @@ class TestRenderingLadderControls(unittest.TestCase):
     def test_native_and_round_trip_use_same_seed(self):
         """Native and round-trip paths honor the same seed."""
         gen = ImageGenerator(simulated=True, device="cpu")
-        
+
         with patch("inference.image_generation.image_generator.setup_seed") as mock_seed:
             gen.generate_image_from_prompt_native(
                 "test", "out1.png", use_negative_prompts=False, seed=123
@@ -210,7 +210,7 @@ class TestRenderingLadderControls(unittest.TestCase):
             # setup_seed called once
             self.assertEqual(mock_seed.call_count, 1)
             mock_seed.assert_called_with(123)
-        
+
         with patch("inference.image_generation.image_generator.setup_seed") as mock_seed:
             gen.generate_image_from_prompt(
                 "test", "out2.png", use_negative_prompts=False, seed=123
@@ -222,7 +222,7 @@ class TestRenderingLadderControls(unittest.TestCase):
     def test_native_simulated_rejects_non_string_prompt(self):
         """Simulated native path validates prompt is str."""
         gen = ImageGenerator(simulated=True, device="cpu")
-        
+
         with self.assertRaises(TypeError):
             gen._generate_image_from_prompt_native_simulated(
                 prompt=123,  # wrong type
@@ -258,7 +258,7 @@ class TestRenderingLadderControls(unittest.TestCase):
         self.assertNotEqual(CONDITIONING["native_prompt"], CONDITIONING["prompt_only"])
         self.assertNotEqual(CONDITIONING["native_prompt"], CONDITIONING["gt_embed"])
         self.assertNotEqual(CONDITIONING["prompt_only"], CONDITIONING["gt_embed"])
-        
+
         # three distinct detail strings
         self.assertNotEqual(
             CONDITIONING_DETAIL["native_prompt"], CONDITIONING_DETAIL["prompt_only"]

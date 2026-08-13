@@ -1,22 +1,20 @@
-"""AUG-01 acceptance check: native vs packed prompt modification are distinct methods.
+"""AUG-01 acceptance check for distinct prompt-conditioning methods.
 
 Builds a throwaway SD3-shaped dataset with the ``fake_sd3`` backbone, trains a tiny
 decoder, then runs ``evaluation.run_image_benchmark --simulated`` twice:
 
 1. with the legacy method set, to prove existing caches stay readable and that the
    legacy run still works;
-2. with ``prompt_modified_packed`` added, to prove the two prompt variants produce
-   separate rows and separate image directories.
+2. with ``native_prompt`` and ``prompt_modified_packed`` added, to check their
+   canonical metadata and prove the embedding variants use separate cache paths.
 
 Asserts the plan's acceptance criteria:
 
-* method names describe genuinely different computations (different conditioning
-  recorded in the manifest, and the packed variant's conditioning tensor differs from
-  the native one on the non-top-k coordinates);
+* metadata distinguishes direct text, exact full-embedding round-trip, and packed top-k;
 * existing ``prompt_only`` caches remain readable (same ``dataset_id``, rows survive);
-* native and packed use the same prompt text and diffusion seed per tuple;
-* the manifest records native-vs-packed conditioning and the packer fingerprint;
-* a simulated run produces separate rows/directories for both variants.
+* exact round-trip and packed paths use the same prompt text and seed per tuple;
+* the manifest records canonical labels and the packer fingerprint;
+* a simulated run produces separate rows and directories for the embedding variants.
 
 Run from the repo root:
 
@@ -65,7 +63,7 @@ PROPERTIES = {
 PROPERTIES_SAME = {k: False for k in PROPERTIES}
 
 LEGACY_METHODS = "gt_embed,ssae_compose,mean_arithmetic,ridge_embed,prompt_only"
-PACKED_METHODS = LEGACY_METHODS + ",prompt_modified_packed"
+PACKED_METHODS = LEGACY_METHODS + ",native_prompt,prompt_modified_packed"
 
 
 def _fail(msg: str) -> None:
@@ -210,12 +208,11 @@ def read_rows(csv_path: Path) -> list[dict]:
 
 
 def check_conditioning_differs(ckpt: Path, holdout: Path) -> None:
-    """The packed path must not be a no-op relative to the native path.
+    """The packed path must not match the exact full-embedding round-trip.
 
     Encodes one prompt, packs it, and confirms that (a) the top-k coordinates match the
-    native encoding exactly and (b) the remaining coordinates were replaced by the
-    training mean. If either failed, the two methods really would be the same
-    computation, which is the bug AUG-01 exists to fix.
+    full encoding exactly and (b) the remaining coordinates were replaced by the
+    training mean. If either failed, the two embedding methods would be identical.
     """
     from evaluation.io import h5_dataset_for_folder, load_decoder_checkpoint
     from evaluation.sd3_pack import (
@@ -231,9 +228,9 @@ def check_conditioning_differs(ckpt: Path, holdout: Path) -> None:
 
     gen = ImageGenerator(simulated=True, device="cpu")
     seq, _, pooled, _ = gen.get_embds_text_encoder("A blond girl, with blue eyes", seed=7)
-    native_flat = flatten_sd3_conditioning(seq, pooled)
+    full_flat = flatten_sd3_conditioning(seq, pooled)
 
-    pe, pp = pack_sd3_from_full_flat_topk(holdout_ds, native_flat, template=template)
+    pe, pp = pack_sd3_from_full_flat_topk(holdout_ds, full_flat, template=template)
     packed_flat = torch.cat(
         [pe.to(torch.float32).reshape(-1), pp.to(torch.float32).reshape(-1)]
     )
@@ -247,24 +244,24 @@ def check_conditioning_differs(ckpt: Path, holdout: Path) -> None:
     mask[idx_t] = False
 
     # (a) top-k coordinates preserved (bfloat16 round-trip tolerance)
-    max_topk_dev = (packed_flat[idx_t] - native_flat[idx_t]).abs().max().item()
+    max_topk_dev = (packed_flat[idx_t] - full_flat[idx_t]).abs().max().item()
     if max_topk_dev > 0.05:
         _fail(f"packed variant altered top-k coordinates (max dev {max_topk_dev:.4g})")
-    _ok(f"packed keeps native top-k coordinates (max dev {max_topk_dev:.2e})")
+    _ok(f"packed keeps full-embedding top-k coordinates (max dev {max_topk_dev:.2e})")
 
     # (b) everything else came from the training mean, not the prompt
     dev_from_mean = (packed_flat[mask] - template[mask]).abs().max().item()
-    dev_from_native = (packed_flat[mask] - native_flat[mask]).abs().mean().item()
+    dev_from_full = (packed_flat[mask] - full_flat[mask]).abs().mean().item()
     if dev_from_mean > 0.05:
         _fail(f"non-top-k coordinates are not the training mean (max dev {dev_from_mean:.4g})")
-    if dev_from_native < 1e-3:
+    if dev_from_full < 1e-3:
         _fail(
-            "non-top-k coordinates are indistinguishable from the native encoding — "
-            "packed and native would be the same computation"
+            "non-top-k coordinates are indistinguishable from the full encoding; "
+            "packed and exact round-trip would be the same computation"
         )
     _ok(
         f"packed replaces non-top-k with training mean "
-        f"(dev from mean {dev_from_mean:.2e}, mean dev from native {dev_from_native:.3f})"
+        f"(dev from mean {dev_from_mean:.2e}, mean dev from full {dev_from_full:.3f})"
     )
 
 
@@ -283,23 +280,26 @@ def check_acceptance(cache_root: Path, out_legacy: Path, out_packed: Path, legac
         )
     _ok(f"cache dataset_id unchanged by the new method ({legacy_id})")
 
-    # --- manifest records conditioning + packer fingerprint
+    # --- manifest records canonical conditioning, labels, and packer fingerprint
     cond = manifest.get("method_conditioning") or {}
-    if cond.get("prompt_only", {}).get("conditioning") != "native":
-        _fail("manifest does not record prompt_only as native conditioning")
-    if cond.get("prompt_modified_packed", {}).get("conditioning") != "packed":
-        _fail("manifest does not record prompt_modified_packed as packed conditioning")
+    expected = {
+        "native_prompt": ("direct_text", "Native text generation"),
+        "prompt_only": ("full_embedding", "Exact full-embedding round-trip"),
+        "prompt_modified_packed": ("packed", "Prompt modification (packed top-k)"),
+    }
+    for method, (conditioning, label) in expected.items():
+        actual = cond.get(method, {})
+        if (actual.get("conditioning"), actual.get("label")) != (conditioning, label):
+            _fail(
+                f"unexpected {method} conditioning/label: {actual!r}; "
+                f"expected {(conditioning, label)!r}"
+            )
     if not manifest.get("packer_fingerprint"):
         _fail("manifest is missing packer_fingerprint")
     _ok(
-        "manifest records native-vs-packed conditioning + packer fingerprint "
-        f"({manifest['packer_fingerprint']})"
+        "manifest distinguishes direct text, exact full-embedding round-trip, and "
+        f"packed top-k ({manifest['packer_fingerprint']})"
     )
-
-    # --- labels agree with the code
-    if cond["prompt_only"]["label"] != "Prompt modification (native/full embedding)":
-        _fail(f"unexpected prompt_only label: {cond['prompt_only']['label']}")
-    _ok(f"prompt_only labelled '{cond['prompt_only']['label']}'")
 
     # --- AUG-02 provenance rides along
     for key in ("git", "config", "datasets", "packer_fingerprint", "model_fingerprint"):
@@ -318,38 +318,46 @@ def check_acceptance(cache_root: Path, out_legacy: Path, out_packed: Path, legac
     # --- separate directories
     cache_dir = cache_root / legacy_id
     for variant in ("images", "images_pre_edit", "images_swapped"):
-        native_dir = cache_dir / variant / "prompt_only"
+        round_trip_dir = cache_dir / variant / "prompt_only"
         packed_dir = cache_dir / variant / "prompt_modified_packed"
-        if not native_dir.is_dir():
-            _fail(f"missing {native_dir}")
+        if not round_trip_dir.is_dir():
+            _fail(f"missing {round_trip_dir}")
         if not packed_dir.is_dir():
             _fail(f"missing {packed_dir}")
-        n_native = len(list(native_dir.glob("*.png")))
+        n_round_trip = len(list(round_trip_dir.glob("*.png")))
         n_packed = len(list(packed_dir.glob("*.png")))
-        if n_native == 0 or n_packed == 0:
-            _fail(f"{variant}: native={n_native} packed={n_packed} images")
-        _ok(f"{variant}/: prompt_only={n_native} png, prompt_modified_packed={n_packed} png")
+        if n_round_trip == 0 or n_packed == 0:
+            _fail(f"{variant}: round_trip={n_round_trip} packed={n_packed} images")
+        _ok(
+            f"{variant}/: prompt_only={n_round_trip} png, "
+            f"prompt_modified_packed={n_packed} png"
+        )
 
     # --- separate rows, same prompt text per tuple
     rows = read_rows(cache_dir / "per_sample.csv")
-    native = {int(r["sample_idx"]): r for r in rows if r["method"] == "prompt_only"}
+    round_trip = {
+        int(r["sample_idx"]): r for r in rows if r["method"] == "prompt_only"
+    }
     packed = {
         int(r["sample_idx"]): r for r in rows if r["method"] == "prompt_modified_packed"
     }
     if not packed:
         _fail("no prompt_modified_packed rows in the cache CSV")
-    if set(native) != set(packed):
-        _fail(f"row index mismatch: native {sorted(native)} vs packed {sorted(packed)}")
-    _ok(f"separate rows for both variants over {len(packed)} tuples")
+    if set(round_trip) != set(packed):
+        _fail(
+            f"row index mismatch: round-trip {sorted(round_trip)} vs "
+            f"packed {sorted(packed)}"
+        )
+    _ok(f"separate rows for both embedding variants over {len(packed)} tuples")
 
     for i in sorted(packed):
         for field in ("prompt", "swapped_prompt", "edit_attribute", "swap_target_attribute"):
-            if native[i][field] != packed[i][field]:
+            if round_trip[i][field] != packed[i][field]:
                 _fail(
-                    f"tuple {i}: '{field}' differs between native "
-                    f"({native[i][field]!r}) and packed ({packed[i][field]!r})"
+                    f"tuple {i}: '{field}' differs between round-trip "
+                    f"({round_trip[i][field]!r}) and packed ({packed[i][field]!r})"
                 )
-    _ok("native and packed use identical prompt text per tuple (post / pre-edit / swap)")
+    _ok("round-trip and packed use identical prompt text per tuple")
 
     # Diffusion seed is a pure function of (base_seed, idx) in run_image_benchmark, and
     # both methods are rendered inside the same idx loop, so seed parity is structural.
@@ -408,7 +416,7 @@ def main() -> None:
         run_bench(ckpt, holdout_folder, out_legacy, cache_root, LEGACY_METHODS)
         legacy_id = json.loads((out_legacy / "manifest.json").read_text())["dataset_id"]
 
-        print("\n=== pass 2: + prompt_modified_packed (must reuse the same cache) ===")
+        print("\n=== pass 2: + native_prompt and packed (must reuse the same cache) ===")
         run_bench(ckpt, holdout_folder, out_packed, cache_root, PACKED_METHODS)
 
         print("\n=== acceptance criteria ===")

@@ -105,11 +105,11 @@ class ImageGenerator:
         seed: int | None = None,
     ):
         """Exact full-embedding round-trip: encode prompt, then decode.
-        
+
         This method is NOT true native pipeline generation. It calls encode_prompt
         and then generate_image_from_embd, making it an exact round-trip through
         the full 333x4096 (+2048 pooled) embedding space.
-        
+
         For true native text-to-image generation that bypasses encode_prompt,
         use generate_image_from_prompt_native instead.
         """
@@ -140,11 +140,11 @@ class ImageGenerator:
         seed: int | None = None,
     ) -> None:
         """True native pipeline text generation: pass text directly without encode_prompt.
-        
+
         This is the only method that sends prompt text directly to the diffusion pipeline
         without precomputing embeddings. The pipeline's internal text encoders process
         the text as part of the diffusion forward pass.
-        
+
         For exact full-embedding round-trip (encode then decode), use
         generate_image_from_prompt instead.
         """
@@ -173,7 +173,7 @@ class ImageGenerator:
         # pass prompt text directly to the pipeline; no encode_prompt call
         # SD3 pipeline accepts prompt/prompt_2/prompt_3 for the three text encoders
         negative_prompt = "" if use_negative_prompts else None
-        
+
         image = self.pipeline(
             prompt=prompt,
             prompt_2=prompt,
