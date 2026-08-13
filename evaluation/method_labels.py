@@ -1,33 +1,29 @@
 """Single source of truth for benchmark method keys, labels and conditioning semantics.
 
-AUG-01 background
------------------
-The proposal previously listed **Prompt modification** and **Prompt-only** as two separate
-methods. They were the same code path: ``prompt_only`` calls
-``ImageGenerator.generate_image_from_prompt()``, which encodes the text and immediately
-calls ``generate_image_from_embd()``. One computation, two names.
+Rendering ladder: native, exact round-trip, and packed top-k
+-------------------------------------------------------------
+The SD3.5 image benchmark distinguishes three conditioning paths:
 
-The fix keeps the cache/method key ``prompt_only`` — existing caches under
-``results/bench_baseline_cache/`` stay readable — but renames it everywhere a human reads
-it to **Prompt modification (native/full embedding)**, and adds a genuinely distinct
-method, ``prompt_modified_packed``, for the controlled-subspace comparison.
+``native_prompt`` — **true native text generation**
+    Prompt text is passed directly to ``StableDiffusion3Pipeline.__call__`` without calling
+    ``encode_prompt()`` first. The pipeline's internal text encoders process the text as
+    part of the diffusion forward pass. This is the deployment-realistic baseline.
 
-The two prompt methods differ in *conditioning*, which is the axis that matters:
+``prompt_only`` — **exact full-embedding round-trip**
+    The prompt is encoded via ``encode_prompt()`` and the full 333x4096 (+2048 pooled)
+    embedding is immediately passed to ``generate_image_from_embd()``. Despite the key name,
+    this is NOT true native generation — it round-trips through the full embedding space.
+    The key is kept for existing cache compatibility; the label clarifies the computation.
+    All ~1.36M coordinates carry text signal.
 
-``prompt_only`` — **native**
-    The modified prompt is encoded and the resulting full 333x4096 (+2048 pooled) tensor is
-    handed to the diffusion pipeline untouched. All ~1.36M coordinates carry text signal.
-    This is what a deployed prompt-rewriting defense actually does, so it is the right row
-    for the *practical* comparison against feature editing.
+``prompt_modified_packed`` — **packed top-k**
+    The prompt is encoded, but only the ``truncate_embds_topk`` coordinates the SSAE
+    predicts are kept; every other coordinate is overwritten with the training mean,
+    exactly as an SSAE or ridge prediction is packed. This puts prompt modification in
+    the same information-restricted subspace as the feature-editing methods.
 
-``prompt_modified_packed`` — **packed**
-    The modified prompt is encoded, but only the ``truncate_embds_topk`` coordinates the
-    SSAE predicts are kept; every other coordinate is overwritten with the training mean,
-    exactly as an SSAE or ridge prediction is packed. This puts prompt modification in the
-    same information-restricted subspace as the feature-editing methods, which is the right
-    row for an *apples-to-apples* analysis.
-
-Do not average the two. They answer different questions.
+Source code, manifest labels, and tests must not conflate these three paths.
+Do not average them. They answer different questions.
 """
 
 from __future__ import annotations
@@ -40,6 +36,7 @@ BASELINE_METHODS: tuple[str, ...] = (
     "gt_embed",
     "mean_arithmetic",
     "ridge_embed",
+    "native_prompt",
     "prompt_only",
     "prompt_modified_packed",
 )
@@ -51,6 +48,7 @@ METHOD_ORDER: tuple[str, ...] = (
     "mean_arithmetic",
     "ridge_embed",
     "linear_probe_direction",
+    "native_prompt",
     "prompt_only",
     "prompt_modified_packed",
 )
@@ -63,6 +61,7 @@ DEFAULT_METHODS: tuple[str, ...] = (
     "ssae_compose",
     "mean_arithmetic",
     "ridge_embed",
+    "native_prompt",
     "prompt_only",
 )
 
@@ -71,15 +70,17 @@ DEFAULT_METHODS: tuple[str, ...] = (
 #: How each method's conditioning tensor reaches the diffusion pipeline. Recorded in every
 #: run manifest so a result row can never be silently compared across conditioning paths.
 #:
-#: ``native``  - full text-encoder output, no coordinates replaced
-#: ``packed``  - top-k coordinates only, remainder filled from the training mean
+#: ``direct_text``      - prompt text sent directly to pipeline, no precomputed embeddings
+#: ``full_embedding``   - full text-encoder output (all coordinates), no packing
+#: ``packed``           - top-k coordinates only, remainder filled from training mean
 CONDITIONING: dict[str, str] = {
     "gt_embed": "packed",
     "ssae_compose": "packed",
     "mean_arithmetic": "packed",
     "ridge_embed": "packed",
     "linear_probe_direction": "packed",
-    "prompt_only": "native",
+    "native_prompt": "direct_text",
+    "prompt_only": "full_embedding",
     "prompt_modified_packed": "packed",
 }
 
@@ -90,7 +91,8 @@ CONDITIONING_DETAIL: dict[str, str] = {
     "mean_arithmetic": "topk_mean_arithmetic_prediction_train_mean_fill",
     "ridge_embed": "topk_ridge_prediction_train_mean_fill",
     "linear_probe_direction": "topk_true_source_embedding_plus_calibrated_probe_direction_train_mean_fill",
-    "prompt_only": "native_full_text_encoder_output",
+    "native_prompt": "direct_text_pipeline_conditioning",
+    "prompt_only": "exact_full_embedding_round_trip",
     "prompt_modified_packed": "topk_reencoded_prompt_train_mean_fill",
 }
 
@@ -98,12 +100,13 @@ CONDITIONING_DETAIL: dict[str, str] = {
 
 #: Full labels — use in report headings, captions and the paper.
 METHOD_LABEL: dict[str, str] = {
-    "gt_embed": "GT embed (oracle)",
+    "gt_embed": "GT embed (packed top-k oracle)",
     "ssae_compose": "SSAE compose",
     "mean_arithmetic": "Mean-arithmetic",
     "ridge_embed": "Ridge",
     "linear_probe_direction": "Linear probe direction",
-    "prompt_only": "Prompt modification (native/full embedding)",
+    "native_prompt": "Native text generation",
+    "prompt_only": "Exact full-embedding round-trip",
     "prompt_modified_packed": "Prompt modification (packed top-k)",
 }
 
@@ -114,7 +117,8 @@ METHOD_LABEL_SHORT: dict[str, str] = {
     "mean_arithmetic": "Mean-arith",
     "ridge_embed": "Ridge",
     "linear_probe_direction": "Probe dir",
-    "prompt_only": "Prompt mod (native)",
+    "native_prompt": "Native text",
+    "prompt_only": "Full embed round-trip",
     "prompt_modified_packed": "Prompt mod (packed)",
 }
 
@@ -124,6 +128,7 @@ METHOD_COLOR: dict[str, str] = {
     "mean_arithmetic": "#0891b2",
     "ridge_embed": "#7c3aed",
     "linear_probe_direction": "#dc2626",
+    "native_prompt": "#16a34a",
     "prompt_only": "#b45309",
     "prompt_modified_packed": "#059669",
 }

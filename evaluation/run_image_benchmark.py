@@ -2,22 +2,24 @@
 Image-level compositional benchmark for held-out concept tuples.
 
 Compares **ground-truth embeddings**, **SSAE compositional** embeddings, **mean-direction**
-and **ridge** embedding baselines, and two **prompt-modification** conditioning paths. Uses
+and **ridge** embedding baselines, and three **prompt-side** conditioning paths. Uses
 matched seeds per sample (deterministic in ``base_seed``). Per-method image similarity vs.
 the ``gt_embed`` rendering is reported via CLIP, LPIPS, DINO cosine, and pixel-space
 MSE/SSIM.
 
-The two prompt-side methods are genuinely different computations (see
-``evaluation/method_labels.py``):
+Rendering ladder (see ``evaluation/method_labels.py``):
 
-* ``prompt_only`` — **Prompt modification (native/full embedding)**. The modified prompt is
-  encoded and the full text-encoder output conditions the pipeline. This is the deployment-
-  realistic baseline. The key is kept for cache compatibility; the label is what appears in
-  reports and the paper.
-* ``prompt_modified_packed`` — **Prompt modification (packed top-k)**. The same prompt text
-  and the same diffusion seed, but only the SSAE's top-k coordinates survive; the rest are
-  filled with the training mean, matching how every embedding-space method is packed. Use
-  this for apples-to-apples controlled-subspace analysis. Never average the two rows.
+* ``native_prompt`` — **Native text generation**. Prompt text is passed directly to the
+  diffusion pipeline without calling encode_prompt. This is the deployment-realistic
+  baseline.
+* ``prompt_only`` — **Exact full-embedding round-trip**. The prompt is encoded and the
+  full text-encoder output (333x4096 + 2048 pooled) is immediately decoded. Despite the
+  key name, this is NOT true native generation. The key is kept for cache compatibility;
+  the label clarifies the computation.
+* ``prompt_modified_packed`` — **Prompt modification (packed top-k)**. The prompt is
+  encoded but only the SSAE's top-k coordinates survive; the rest are filled with the
+  training mean, matching how every embedding-space method is packed. Use for controlled-
+  subspace analysis. Never average or conflate these three paths.
 
 Locality tests (both optional; independently enable-able in the same run). A single
 attribute is randomly sampled per holdout row (seeded by ``base_seed + idx`` so the pick
@@ -25,13 +27,14 @@ is reproducible), shared between the two tests when both are on:
 
 * ``--locality_drop_one_attr``: renders a same-seed **pre-edit** image per method with
   the chosen attribute's mask bit zeroed (or its phrase dropped from the prompt for
-  ``prompt_only``). Reports pixel MSE/SSIM between the pre- and post-edit renders as an
-  "edit surgical-ness" proxy under attribute removal.
+  ``native_prompt`` and ``prompt_only``). Reports pixel MSE/SSIM between the pre- and
+  post-edit renders as an "edit surgical-ness" proxy under attribute removal.
 * ``--locality_swap_one_attr``: renders a same-seed **swap** image per method with the
   chosen attribute's mask bit flipped to a different property in the same category (e.g.
   blond -> brunette), or the corresponding phrase substituted in the prompt for
-  ``prompt_only``. Reports pixel MSE/SSIM between the swap and normal renders (surgical-
-  ness under a value swap) and CLIP alignment of the swap image against the swapped prompt.
+  ``native_prompt`` and ``prompt_only``. Reports pixel MSE/SSIM between the swap and
+  normal renders (surgical-ness under a value swap) and CLIP alignment of the swap image
+  against the swapped prompt.
 
 Writes ``per_sample.csv``, ``summary.json``, and PNGs under ``<output>/images/<method>/``
 (post-edit), ``<output>/images_pre_edit/<method>/`` (only with ``--locality_drop_one_attr``),
@@ -555,6 +558,8 @@ def run_image_benchmark(
                     pe, pp = pack_sd3_from_truncated_normalized(holdout_ds, idx, pred_ma.cpu(), template=pack_template)
                 elif method == "ridge_embed":
                     pe, pp = pack_sd3_from_truncated_normalized(holdout_ds, idx, pred_ridge.cpu(), template=pack_template)
+                elif method == "native_prompt":
+                    pe, pp = None, None
                 elif method == "prompt_only":
                     pe, pp = None, None
                 elif method == "prompt_modified_packed":
@@ -579,7 +584,11 @@ def run_image_benchmark(
                     raise ValueError(f"Unknown method {method}")
 
                 if not simulated:
-                    if method == "prompt_only":
+                    if method == "native_prompt":
+                        gen.generate_image_from_prompt_native(
+                            prompt_text, out_path, use_negative_prompts=False, seed=seed_i
+                        )
+                    elif method == "prompt_only":
                         gen.generate_image_from_prompt(
                             prompt_text, out_path, use_negative_prompts=False, seed=seed_i
                         )
@@ -702,7 +711,9 @@ def run_image_benchmark(
                 pre_cached = is_cached_method and pre_path.exists()
 
                 if not pre_cached:
-                    if method == "prompt_only":
+                    if method == "native_prompt":
+                        pe_pre, pp_pre = None, None
+                    elif method == "prompt_only":
                         pe_pre, pp_pre = None, None
                     elif method == "prompt_modified_packed":
                         pe_pre, pp_pre = _encode_and_pack_prompt(
@@ -732,7 +743,11 @@ def run_image_benchmark(
                         raise ValueError(f"Unknown method {method}")
 
                     if not simulated:
-                        if method == "prompt_only":
+                        if method == "native_prompt":
+                            gen.generate_image_from_prompt_native(
+                                residual_prompt, pre_path, use_negative_prompts=False, seed=seed_i
+                            )
+                        elif method == "prompt_only":
                             gen.generate_image_from_prompt(
                                 residual_prompt, pre_path, use_negative_prompts=False, seed=seed_i
                             )
@@ -762,7 +777,9 @@ def run_image_benchmark(
                 swap_cached = is_cached_method and swap_path.exists()
 
                 if not swap_cached:
-                    if method == "prompt_only":
+                    if method == "native_prompt":
+                        pe_sw, pp_sw = None, None
+                    elif method == "prompt_only":
                         pe_sw, pp_sw = None, None
                     elif method == "prompt_modified_packed":
                         pe_sw, pp_sw = _encode_and_pack_prompt(
@@ -792,7 +809,11 @@ def run_image_benchmark(
                         raise ValueError(f"Unknown method {method}")
 
                     if not simulated:
-                        if method == "prompt_only":
+                        if method == "native_prompt":
+                            gen.generate_image_from_prompt_native(
+                                swapped_prompt, swap_path, use_negative_prompts=False, seed=seed_i
+                            )
+                        elif method == "prompt_only":
                             gen.generate_image_from_prompt(
                                 swapped_prompt, swap_path, use_negative_prompts=False, seed=seed_i
                             )
@@ -1129,13 +1150,11 @@ def main() -> None:
         help=(
             "Comma-separated method keys. Known keys: "
             + ", ".join(METHOD_ORDER)
-            + ". Note the two prompt-side methods are different computations, not "
-            "synonyms: 'prompt_only' is Prompt modification (native/full embedding) — the "
-            "text encoder's full output goes straight to the pipeline; "
-            "'prompt_modified_packed' re-encodes the same prompt, keeps only the SSAE's "
-            "top-k coordinates and fills the rest with the training mean. Use the native "
-            "row for the practical comparison and the packed row for the controlled-"
-            "subspace analysis. Do not average them."
+            + ". Rendering ladder: 'native_prompt' passes text directly to the pipeline "
+            "without encode_prompt (true native). 'prompt_only' encodes and immediately "
+            "decodes through the full embedding (exact round-trip, kept for cache "
+            "compatibility). 'prompt_modified_packed' re-encodes and packs to top-k "
+            "(controlled subspace). Do not conflate or average them."
         ),
     )
     p.add_argument("--skip_lpips", action="store_true")
@@ -1179,10 +1198,10 @@ def main() -> None:
         default=DEFAULT_BASELINE_CACHE_ROOT,
         help=(
             "Root directory holding the shared per-dataset baseline cache. Non-SSAE methods "
-            "(gt_embed, mean_arithmetic, ridge_embed, prompt_only, prompt_modified_packed) "
-            "are populated here once "
-            "per (holdout, training data, base_seed, ridge_lambda, SD3.5 fingerprint) tuple "
-            "and reused by subsequent runs. Default: results/bench_baseline_cache."
+            "(gt_embed, mean_arithmetic, ridge_embed, native_prompt, prompt_only, "
+            "prompt_modified_packed) are populated here once per (holdout, training data, "
+            "base_seed, ridge_lambda, SD3.5 fingerprint) tuple and reused by subsequent runs. "
+            "Default: results/bench_baseline_cache."
         ),
     )
     p.add_argument(

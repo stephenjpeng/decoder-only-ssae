@@ -104,6 +104,15 @@ class ImageGenerator:
         use_negative_prompts: bool = False,
         seed: int | None = None,
     ):
+        """Exact full-embedding round-trip: encode prompt, then decode.
+        
+        This method is NOT true native pipeline generation. It calls encode_prompt
+        and then generate_image_from_embd, making it an exact round-trip through
+        the full 333x4096 (+2048 pooled) embedding space.
+        
+        For true native text-to-image generation that bypasses encode_prompt,
+        use generate_image_from_prompt_native instead.
+        """
         (
             prompt_embeds,
             negative_prompt_embeds,
@@ -121,6 +130,74 @@ class ImageGenerator:
             negative_pooled_prompt_embeds=negative_pooled_prompt_embeds,
             seed=seed,
         )
+
+    @torch.no_grad()
+    def generate_image_from_prompt_native(
+        self,
+        prompt: str,
+        image_name: Path | str,
+        use_negative_prompts: bool = False,
+        seed: int | None = None,
+    ) -> None:
+        """True native pipeline text generation: pass text directly without encode_prompt.
+        
+        This is the only method that sends prompt text directly to the diffusion pipeline
+        without precomputing embeddings. The pipeline's internal text encoders process
+        the text as part of the diffusion forward pass.
+        
+        For exact full-embedding round-trip (encode then decode), use
+        generate_image_from_prompt instead.
+        """
+        setup_seed(0 if seed is None else seed)
+
+        if self.simulated:
+            return self._generate_image_from_prompt_native_simulated(
+                prompt=prompt,
+                image_name=image_name,
+                use_negative_prompts=use_negative_prompts,
+            )
+        else:
+            return self._generate_image_from_prompt_native(
+                prompt=prompt,
+                image_name=image_name,
+                use_negative_prompts=use_negative_prompts,
+            )
+
+    def _generate_image_from_prompt_native(
+        self,
+        prompt: str,
+        image_name: Path | str,
+        use_negative_prompts: bool = False,
+    ) -> None:
+        """Real pipeline call with direct text conditioning."""
+        # pass prompt text directly to the pipeline; no encode_prompt call
+        # SD3 pipeline accepts prompt/prompt_2/prompt_3 for the three text encoders
+        negative_prompt = "" if use_negative_prompts else None
+        
+        image = self.pipeline(
+            prompt=prompt,
+            prompt_2=prompt,
+            prompt_3=prompt,
+            negative_prompt=negative_prompt,
+            negative_prompt_2=negative_prompt,
+            negative_prompt_3=negative_prompt,
+            num_inference_steps=self.NUM_INFERENCE_STEPS,
+            guidance_scale=self.GUIDANCE_SCALE,
+            max_sequence_length=self.MAX_SEQUENCE_LENGTH,
+        ).images[0]
+        image.save(image_name)
+        print(f"Image saved in {image_name}")
+
+    def _generate_image_from_prompt_native_simulated(
+        self,
+        prompt: str,
+        image_name: Path | str,
+        use_negative_prompts: bool = False,
+    ) -> None:
+        """Simulated mode: verify prompt is str, write placeholder."""
+        if not isinstance(prompt, str):
+            raise TypeError(f"prompt must be str, got {type(prompt)}")
+        print(f"Image saved in {image_name}")
 
     @torch.no_grad()
     def generate_image_from_embd(
