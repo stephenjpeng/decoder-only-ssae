@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import copy
 import csv
-import hashlib
 import json
 import stat
 import sys
@@ -16,6 +15,7 @@ from unittest.mock import MagicMock, patch
 
 from backbones.base import StreamSpec
 from backbones.flux import FluxDevBackbone
+from backbones.sd35_large_turbo import Sd35LargeTurboBackbone
 from evaluation.image_qualification import (
     Context,
     PromptSpec,
@@ -25,12 +25,14 @@ from evaluation.image_qualification import (
     build_bakeoff_plan,
     validate_coverage,
 )
+from evaluation.image_validity import analyze_image_validity
 from evaluation.run_native_model_qualification import (
     build_model_configuration,
     fingerprint_model_configuration,
-    load_or_create_blinding_mapping,
+    build_scoring_package,
     manifest_success_matches,
-    write_scoring_sheet,
+    qualification_identity,
+    write_manifest,
 )
 
 SPEC_PATH = "evaluation/config/image_validity_prompts.yaml"
@@ -43,6 +45,7 @@ class FakeQualificationBackbone:
     revision = "test-revision"
     device = "cuda"
     dtype = "bfloat16"
+    max_length = 512
     stream_specs = [
         StreamSpec("seq", (333, 4096), "float16", "embds.h5"),
         StreamSpec("pooled", (2048,), "float16", "embds_pooled.h5"),
@@ -51,20 +54,19 @@ class FakeQualificationBackbone:
     def __init__(self) -> None:
         self.load = MagicMock()
         self.unload = MagicMock()
-        self.encode = MagicMock(return_value={"seq": "seq", "pooled": "pooled"})
-        self.decode_calls: list[tuple[dict[str, str], Path, int | None]] = []
+        self.generate_calls: list[tuple[str, Path, int | None]] = []
 
-    def decode(
+    def generate(
         self,
-        streams: dict[str, str],
+        prompt: str,
         output_path: Path,
         seed: int | None = None,
         num_inference_steps: int = 4,
         guidance_scale: float = 0.0,
-        max_sequence_length: int = 512,
+        max_sequence_length: int = 256,
     ) -> Path:
-        """Record a successful render with the production default signature."""
-        self.decode_calls.append((streams, output_path, seed))
+        """Record a successful native direct-text render."""
+        self.generate_calls.append((prompt, output_path, seed))
         output_path.write_bytes(b"fake image")
         return output_path
 
@@ -164,6 +166,23 @@ class TestPlanBuilding(unittest.TestCase):
         self.assertEqual(len(bakeoff_rows), 576)
         row_ids = [row.row_id for row in audit_rows + bakeoff_rows]
         self.assertEqual(len(row_ids), len(set(row_ids)))
+        self.assertTrue(
+            all(
+                row.design == "audit"
+                and row.conditioning == "direct_text"
+                and row.effective_context == 256
+                for row in audit_rows
+            )
+        )
+        self.assertTrue(
+            all(
+                row.design == "bakeoff"
+                and row.conditioning == "direct_text"
+                and row.effective_context
+                == (512 if row.model_backbone == "flux_dev" else 256)
+                for row in bakeoff_rows
+            )
+        )
 
     def test_validate_coverage_rejects_short_plan(self) -> None:
         spec = PromptSpec.load(SPEC_PATH)
@@ -199,55 +218,48 @@ class TestPlanBuilding(unittest.TestCase):
 
 
 class TestBlinding(unittest.TestCase):
-    def test_mapping_uses_random_ids_paths_and_randomized_order(self) -> None:
-        rows = build_audit_plan(PromptSpec.load(SPEC_PATH))[:12]
+    def _successful_manifest(
+        self, output_dir: Path, rows: list[RenderRow], identity: str = "identity"
+    ) -> dict[str, dict[str, object]]:
+        manifest = {}
+        private = output_dir / "private_images"
+        private.mkdir()
+        for row in rows:
+            path = private / f"{row.row_id}.png"
+            path.write_bytes(b"pixels")
+            manifest[row.row_id] = {
+                **row.to_dict(),
+                "status": "success",
+                "image_path": str(path),
+                "qualification_identity": f"{identity}-{row.row_id}",
+            }
+        return manifest
+
+    def test_package_is_opaque_complete_and_private(self) -> None:
+        rows = build_bakeoff_plan(PromptSpec.load(SPEC_PATH))[:4]
         with tempfile.TemporaryDirectory() as directory:
             output_dir = Path(directory)
-            mapping = load_or_create_blinding_mapping(output_dir, rows)
-            original_order = [row.row_id for row in rows]
+            manifest = self._successful_manifest(output_dir, rows)
+            mapping = build_scoring_package(output_dir, rows, manifest)
+            write_manifest(output_dir / "manifest.jsonl", manifest)
 
-            mapping_mode = stat.S_IMODE(
-                (output_dir / "blinded_row_mapping.json").stat().st_mode
+            self.assertEqual(
+                stat.S_IMODE((output_dir / "blinded_row_mapping.json").stat().st_mode),
+                0o600,
             )
-            self.assertEqual(mapping_mode, 0o600)
-            self.assertNotEqual(mapping["scoring_order"], original_order)
-            for row in rows:
-                entry = mapping["rows"][row.row_id]
-                enumerable_hash = hashlib.sha256(row.row_id.encode()).hexdigest()[:12]
-                self.assertNotEqual(entry["blinded_row_id"], enumerable_hash)
-                self.assertNotIn(row.property_id, entry["blinded_row_id"])
-                self.assertNotIn(row.model_backbone, entry["image_path"])
-                self.assertEqual(
-                    Path(entry["image_path"]).parent.name, "blinded_images"
-                )
-
-    def test_resume_repairs_mapping_permissions(self) -> None:
-        rows = build_audit_plan(PromptSpec.load(SPEC_PATH))[:2]
-        with tempfile.TemporaryDirectory() as directory:
-            output_dir = Path(directory)
-            original = load_or_create_blinding_mapping(output_dir, rows)
-            mapping_path = output_dir / "blinded_row_mapping.json"
-            mapping_path.chmod(0o644)
-
-            resumed = load_or_create_blinding_mapping(output_dir, rows)
-
-            self.assertEqual(resumed, original)
-            self.assertEqual(stat.S_IMODE(mapping_path.stat().st_mode), 0o600)
-
-    def test_sheet_contains_only_blinded_locators_and_scores(self) -> None:
-        rows = build_audit_plan(PromptSpec.load(SPEC_PATH))[:4]
-        with tempfile.TemporaryDirectory() as directory:
-            output_dir = Path(directory)
-            mapping = load_or_create_blinding_mapping(output_dir, rows)
-            write_scoring_sheet(output_dir, mapping)
-
+            self.assertEqual(
+                stat.S_IMODE((output_dir / "manifest.jsonl").stat().st_mode), 0o600
+            )
             with (output_dir / "scoring_sheet.csv").open(newline="") as file:
                 sheet_rows = list(csv.DictReader(file))
+            self.assertEqual(len(sheet_rows), len(rows))
             self.assertEqual(
                 list(sheet_rows[0]),
                 [
                     "blinded_row_id",
                     "image_path",
+                    "target_phrase",
+                    "prompt",
                     "target_present",
                     "target_visible",
                     "prompt_ambiguous",
@@ -259,24 +271,164 @@ class TestBlinding(unittest.TestCase):
                 self.assertNotIn(row.property_id, serialized)
                 self.assertNotIn(row.model_backbone, serialized)
                 self.assertNotIn(row.row_id, serialized)
+                self.assertIn(row.prompt, serialized)
+                self.assertIn(row.target_phrase, serialized)
+                entry = mapping["rows"][row.row_id]
+                blinded_path = output_dir / entry["image_path"]
+                self.assertTrue(blinded_path.is_file())
+                self.assertEqual(blinded_path.stat().st_mtime_ns, 0)
 
-    def test_resume_preserves_mapping_and_scored_sheet(self) -> None:
-        rows = build_audit_plan(PromptSpec.load(SPEC_PATH))[:3]
+    def test_public_files_are_created_outside_plan_and_model_order(self) -> None:
+        rows = build_bakeoff_plan(PromptSpec.load(SPEC_PATH))[:6]
         with tempfile.TemporaryDirectory() as directory:
             output_dir = Path(directory)
-            first_mapping = load_or_create_blinding_mapping(output_dir, rows)
-            write_scoring_sheet(output_dir, first_mapping)
-            mapping_bytes = (output_dir / "blinded_row_mapping.json").read_bytes()
-            scoring_path = output_dir / "scoring_sheet.csv"
-            scoring_path.write_text("completed scores\n")
+            manifest = self._successful_manifest(output_dir, rows)
+            source_order: list[str] = []
 
-            second_mapping = load_or_create_blinding_mapping(output_dir, rows)
-            write_scoring_sheet(output_dir, second_mapping)
+            def record_copy(source: Path, destination: Path) -> None:
+                source_order.append(str(source))
+                Path(destination).write_bytes(Path(source).read_bytes())
+
+            no_shuffle = SimpleNamespace(shuffle=lambda values: None)
+            with (
+                patch(
+                    "evaluation.run_native_model_qualification.secrets.SystemRandom",
+                    return_value=no_shuffle,
+                ),
+                patch(
+                    "evaluation.run_native_model_qualification.shutil.copyfile",
+                    side_effect=record_copy,
+                ),
+                patch(
+                    "evaluation.run_native_model_qualification.secrets.randbelow",
+                    return_value=2,
+                ) as randbelow,
+            ):
+                build_scoring_package(output_dir, rows, manifest)
+
+            planned_sources = [manifest[row.row_id]["image_path"] for row in rows]
+            self.assertEqual(source_order, planned_sources[4:] + planned_sources[:4])
+            randbelow.assert_called_once_with(4)
+            copied_models = [
+                next(
+                    row.model_backbone
+                    for row in rows
+                    if manifest[row.row_id]["image_path"] == source
+                )
+                for source in source_order
+            ]
+            planned_models = [row.model_backbone for row in rows]
+            self.assertEqual(copied_models, planned_models[4:] + planned_models[:4])
+            self.assertNotEqual(copied_models, planned_models)
+
+    def test_resume_does_not_touch_retained_public_files_or_scores(self) -> None:
+        rows = build_bakeoff_plan(PromptSpec.load(SPEC_PATH))[:3]
+        with tempfile.TemporaryDirectory() as directory:
+            output_dir = Path(directory)
+            manifest = self._successful_manifest(output_dir, rows)
+            first_mapping = build_scoring_package(output_dir, rows, manifest)
+            scoring_path = output_dir / "scoring_sheet.csv"
+            with scoring_path.open(newline="") as file:
+                scored = list(csv.DictReader(file))
+            for score in scored:
+                score["target_present"] = "true"
+                score["target_visible"] = "true"
+                score["prompt_ambiguous"] = "false"
+            with scoring_path.open("w", newline="") as file:
+                writer = csv.DictWriter(file, fieldnames=list(scored[0]))
+                writer.writeheader()
+                writer.writerows(scored)
+            scored_bytes = scoring_path.read_bytes()
+            public_paths = [
+                output_dir / entry["image_path"]
+                for entry in first_mapping["rows"].values()
+            ]
+            metadata = {
+                path: (path.stat().st_ctime_ns, path.stat().st_mtime_ns)
+                for path in public_paths
+            }
+
+            with (
+                patch(
+                    "evaluation.run_native_model_qualification.shutil.copyfile"
+                ) as copyfile,
+                patch("evaluation.run_native_model_qualification.os.utime") as utime,
+            ):
+                second_mapping = build_scoring_package(output_dir, rows, manifest)
+
+            copyfile.assert_not_called()
+            utime.assert_not_called()
             self.assertEqual(second_mapping, first_mapping)
+            self.assertEqual(scoring_path.read_bytes(), scored_bytes)
             self.assertEqual(
-                (output_dir / "blinded_row_mapping.json").read_bytes(), mapping_bytes
+                {
+                    path: (path.stat().st_ctime_ns, path.stat().st_mtime_ns)
+                    for path in public_paths
+                },
+                metadata,
             )
-            self.assertEqual(scoring_path.read_text(), "completed scores\n")
+
+    def test_failed_render_is_not_sent_to_scorer(self) -> None:
+        rows = build_bakeoff_plan(PromptSpec.load(SPEC_PATH))[:2]
+        with tempfile.TemporaryDirectory() as directory:
+            output_dir = Path(directory)
+            manifest = self._successful_manifest(output_dir, rows)
+            manifest[rows[1].row_id] = {
+                **rows[1].to_dict(),
+                "status": "error",
+                "image_path": None,
+                "qualification_identity": "failed",
+            }
+            mapping = build_scoring_package(output_dir, rows, manifest)
+            self.assertEqual(set(mapping["rows"]), {rows[0].row_id})
+            with (output_dir / "scoring_sheet.csv").open(newline="") as file:
+                self.assertEqual(len(list(csv.DictReader(file))), 1)
+
+    def test_changed_identity_replaces_opaque_id_and_drops_score(self) -> None:
+        rows = build_bakeoff_plan(PromptSpec.load(SPEC_PATH))[:1]
+        with tempfile.TemporaryDirectory() as directory:
+            output_dir = Path(directory)
+            manifest = self._successful_manifest(output_dir, rows, "first")
+            first = build_scoring_package(output_dir, rows, manifest)
+            opaque_id = first["rows"][rows[0].row_id]["blinded_row_id"]
+            scoring_path = output_dir / "scoring_sheet.csv"
+            scored = list(csv.DictReader(scoring_path.open(newline="")))
+            scored[0]["target_present"] = "true"
+            with scoring_path.open("w", newline="") as file:
+                writer = csv.DictWriter(file, fieldnames=list(scored[0]))
+                writer.writeheader()
+                writer.writerows(scored)
+
+            manifest[rows[0].row_id]["qualification_identity"] = "second"
+            second = build_scoring_package(output_dir, rows, manifest)
+            self.assertNotEqual(
+                second["rows"][rows[0].row_id]["blinded_row_id"], opaque_id
+            )
+            refreshed = list(csv.DictReader(scoring_path.open(newline="")))
+            self.assertEqual(refreshed[0]["target_present"], "")
+
+
+class TestDirectNativeBackbones(unittest.TestCase):
+    def test_turbo_and_flux_send_text_without_encode_dispatch(self) -> None:
+        for backbone, expected_context in (
+            (Sd35LargeTurboBackbone(device="cpu"), 256),
+            (FluxDevBackbone(device="cpu"), 512),
+        ):
+            image = MagicMock()
+            pipeline = MagicMock(return_value=SimpleNamespace(images=[image]))
+            pipeline.device = "cpu"
+            pipeline.encode_prompt = MagicMock()
+            backbone.pipeline = pipeline
+            backbone._loaded = True
+            with tempfile.TemporaryDirectory() as directory:
+                backbone.generate(
+                    "native prompt", Path(directory) / "image.png", seed=5
+                )
+            pipeline.encode_prompt.assert_not_called()
+            kwargs = pipeline.call_args.kwargs
+            self.assertEqual(kwargs["prompt"], "native prompt")
+            self.assertNotIn("prompt_embeds", kwargs)
+            self.assertEqual(kwargs["max_sequence_length"], expected_context)
 
 
 class TestModelFingerprint(unittest.TestCase):
@@ -346,7 +498,8 @@ class TestModelFingerprint(unittest.TestCase):
         cuda_configuration = build_model_configuration(
             "flux_dev", FluxDevBackbone(device="cuda")
         )
-        self.assertEqual(cpu_configuration["revision"], "default")
+        self.assertIsNone(cpu_configuration["revision"])
+        self.assertFalse(cpu_configuration["revision_is_concrete"])
         self.assertEqual(
             cpu_configuration["render_parameters"]["num_inference_steps"], 50
         )
@@ -381,11 +534,17 @@ class TestModelFingerprint(unittest.TestCase):
             "sd35_large_turbo", FakeQualificationBackbone()
         )
         model_fingerprint = fingerprint_model_configuration(configuration)
+        contract_identity = qualification_identity(
+            row, "current-spec", model_fingerprint
+        )
         manifest_row = {
             **row.to_dict(),
             "spec_fingerprint": "current-spec",
             "model_configuration": configuration,
             "model_fingerprint": model_fingerprint,
+            "render_contract_fingerprint": contract_identity,
+            "render_attempt_id": "attempt",
+            "qualification_identity": f"{contract_identity}-attempt",
             "status": "success",
         }
         self.assertTrue(
@@ -454,12 +613,19 @@ class TestCLI(unittest.TestCase):
         )
         backbone = FakeQualificationBackbone()
         model_configuration = build_model_configuration("sd35_large_turbo", backbone)
+        model_fingerprint = fingerprint_model_configuration(model_configuration)
+        contract_identity = qualification_identity(
+            row, "spec-fingerprint", model_fingerprint
+        )
         manifest_row = {
             **row.to_dict(),
             "status": "success",
             "spec_fingerprint": "spec-fingerprint",
             "model_configuration": model_configuration,
-            "model_fingerprint": fingerprint_model_configuration(model_configuration),
+            "model_fingerprint": model_fingerprint,
+            "render_contract_fingerprint": contract_identity,
+            "render_attempt_id": "attempt",
+            "qualification_identity": f"{contract_identity}-attempt",
             "error": None,
         }
         fake_spec = MagicMock()
@@ -515,8 +681,7 @@ class TestCLI(unittest.TestCase):
             self.assertTrue(blinded_path.is_file())
             self.assertEqual(blinded_path.read_bytes(), b"existing image")
 
-        backbone.encode.assert_not_called()
-        self.assertEqual(backbone.decode_calls, [])
+        self.assertEqual(backbone.generate_calls, [])
         backbone.load.assert_called_once_with()
         backbone.unload.assert_called_once_with()
 
@@ -624,7 +789,7 @@ class TestCLI(unittest.TestCase):
                 )
             )
 
-        self.assertEqual(len(backbone.decode_calls), 2)
+        self.assertEqual(len(backbone.generate_calls), 2)
 
     def test_resume_skips_success_and_replaces_failed_record(self) -> None:
         successful = RenderRow(
@@ -648,13 +813,20 @@ class TestCLI(unittest.TestCase):
         model_configuration = build_model_configuration(
             "sd35_large_turbo", FakeQualificationBackbone()
         )
+        model_fingerprint = fingerprint_model_configuration(model_configuration)
+        contract_identity = qualification_identity(
+            successful, "spec-fingerprint", model_fingerprint
+        )
         existing_success = {
             **successful.to_dict(),
             "status": "success",
             "image_path": None,
             "spec_fingerprint": "spec-fingerprint",
             "model_configuration": model_configuration,
-            "model_fingerprint": fingerprint_model_configuration(model_configuration),
+            "model_fingerprint": model_fingerprint,
+            "render_contract_fingerprint": contract_identity,
+            "render_attempt_id": "attempt",
+            "qualification_identity": f"{contract_identity}-attempt",
             "sentinel": "preserve",
         }
         existing_failure = {
@@ -711,12 +883,16 @@ class TestCLI(unittest.TestCase):
                 final_rows = [json.loads(line) for line in file if line.strip()]
             with (output_dir / "blinded_row_mapping.json").open("r") as file:
                 mapping = json.load(file)
-            scorer_paths = [
-                output_dir / mapping["rows"][row.row_id]["image_path"]
-                for row in (successful, failed)
-            ]
-            self.assertTrue(all(path.is_file() for path in scorer_paths))
-            self.assertEqual(scorer_paths[0].read_bytes(), b"existing image")
+            self.assertEqual(mapping["rows"], {})
+            self.assertEqual(legacy_image_path.read_bytes(), b"existing image")
+            generated_path = Path(
+                next(
+                    row["image_path"]
+                    for row in final_rows
+                    if row["row_id"] == failed.row_id
+                )
+            )
+            self.assertEqual(generated_path.read_bytes(), b"fake image")
 
         self.assertEqual(len(final_rows), 2)
         self.assertEqual(len({row["row_id"] for row in final_rows}), 2)
@@ -725,11 +901,144 @@ class TestCLI(unittest.TestCase):
         self.assertEqual(final_by_id[successful.row_id]["sentinel"], "preserve")
         self.assertEqual(final_by_id[failed.row_id]["status"], "success")
         self.assertIsNone(final_by_id[failed.row_id]["error"])
-        backbone.encode.assert_called_once_with(failed.prompt)
-        self.assertEqual(len(backbone.decode_calls), 1)
-        self.assertEqual(backbone.decode_calls[0][2], failed.seed)
+        self.assertEqual(len(backbone.generate_calls), 1)
+        self.assertEqual(backbone.generate_calls[0][0], failed.prompt)
+        self.assertEqual(backbone.generate_calls[0][2], failed.seed)
         backbone.load.assert_called_once_with()
         backbone.unload.assert_called_once_with()
+
+    def test_mocked_render_blind_score_unblind_and_bakeoff_analysis(self) -> None:
+        rows = [
+            RenderRow(
+                "audit-turbo",
+                "native",
+                "sd35_large_turbo",
+                "audit-property",
+                "context",
+                11,
+                "audit prompt",
+                design="audit",
+                target_phrase="audit phrase",
+            )
+        ] + [
+            RenderRow(
+                f"bakeoff-{model}",
+                "native",
+                model,
+                "target-property",
+                "context",
+                17,
+                "full target prompt",
+                design="bakeoff",
+                effective_context=512 if model == "flux_dev" else 256,
+                target_phrase="target phrase",
+            )
+            for model in ("sd35_large_turbo", "sd35_large", "flux_dev")
+        ]
+        audit_rows = rows[:1]
+        bakeoff_rows = rows[1:]
+        backbone = FakeQualificationBackbone()
+        fake_spec = MagicMock()
+        fake_spec.fingerprint.return_value = "spec-fingerprint"
+
+        with tempfile.TemporaryDirectory() as directory:
+            output_dir = Path(directory)
+            argv = ["run_native_model_qualification.py", "--output_dir", directory]
+            with (
+                patch.object(sys, "argv", argv),
+                patch(
+                    "evaluation.run_native_model_qualification.PromptSpec.load",
+                    return_value=fake_spec,
+                ),
+                patch(
+                    "evaluation.run_native_model_qualification.build_audit_plan",
+                    return_value=audit_rows,
+                ),
+                patch(
+                    "evaluation.run_native_model_qualification.build_bakeoff_plan",
+                    return_value=bakeoff_rows,
+                ),
+                patch("evaluation.run_native_model_qualification.validate_coverage"),
+                patch(
+                    "evaluation.run_native_model_qualification.list_backbones",
+                    return_value=[
+                        "sd35_large_turbo",
+                        "sd35_large",
+                        "flux_dev",
+                    ],
+                ),
+                patch(
+                    "evaluation.run_native_model_qualification.get_backbone",
+                    return_value=backbone,
+                ),
+            ):
+                from evaluation.run_native_model_qualification import main
+
+                main()
+
+            scoring_path = output_dir / "scoring_sheet.csv"
+            with scoring_path.open(newline="") as file:
+                scored = list(csv.DictReader(file))
+            self.assertEqual(len(scored), 3)
+            with (output_dir / "blinded_row_mapping.json").open() as file:
+                scoring_mapping = json.load(file)
+            self.assertNotIn("audit-turbo", scoring_mapping["rows"])
+            for entry in scoring_mapping["rows"].values():
+                self.assertEqual(
+                    (output_dir / entry["image_path"]).stat().st_mtime_ns, 0
+                )
+            for row in scored:
+                row["target_present"] = "true"
+                row["target_visible"] = "true"
+                row["prompt_ambiguous"] = "false"
+            with scoring_path.open("w", newline="") as file:
+                writer = csv.DictWriter(file, fieldnames=list(scored[0]))
+                writer.writeheader()
+                writer.writerows(scored)
+
+            canonical_scores = output_dir / "scores.internal.csv"
+            results = analyze_image_validity(
+                output_dir / "manifest.jsonl",
+                scoring_path,
+                blinding_mapping_path=output_dir / "blinded_row_mapping.json",
+                unblinded_scores_output=canonical_scores,
+            )
+
+            self.assertEqual(results["overall"]["n_total"], 3)
+            self.assertEqual(
+                set(results["per_model"]),
+                {
+                    "sd35_large_turbo",
+                    "sd35_large",
+                    "flux_dev",
+                },
+            )
+            self.assertEqual(results["per_model"]["sd35_large_turbo"]["n_total"], 1)
+            self.assertEqual(
+                results["per_model_property"]["flux_dev"]["target-property"]["n_valid"],
+                1,
+            )
+            self.assertEqual(stat.S_IMODE(canonical_scores.stat().st_mode), 0o600)
+
+            manifest_path = output_dir / "manifest.jsonl"
+            manifest_rows = [
+                json.loads(line) for line in manifest_path.read_text().splitlines()
+            ]
+            for manifest_row in manifest_rows:
+                if manifest_row["row_id"] == "bakeoff-flux_dev":
+                    manifest_row["qualification_identity"] = "replaced-pixels"
+            manifest_path.write_text(
+                "".join(json.dumps(row) + "\n" for row in manifest_rows)
+            )
+            manifest_path.chmod(0o600)
+            with self.assertRaisesRegex(ValueError, "identity does not match"):
+                analyze_image_validity(
+                    manifest_path,
+                    scoring_path,
+                    blinding_mapping_path=output_dir / "blinded_row_mapping.json",
+                )
+
+        self.assertEqual(len(backbone.generate_calls), 4)
 
 
 if __name__ == "__main__":

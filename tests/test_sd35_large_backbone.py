@@ -31,9 +31,7 @@ class TestSd35LargeBackbone(unittest.TestCase):
         """The preset uses Stability AI's non-Turbo model-card defaults."""
         backbone = Sd35LargeBackbone(device="cpu")
 
-        self.assertEqual(
-            backbone.model_id, "stabilityai/stable-diffusion-3.5-large"
-        )
+        self.assertEqual(backbone.model_id, "stabilityai/stable-diffusion-3.5-large")
         self.assertEqual(backbone.DEFAULT_NUM_INFERENCE_STEPS, 28)
         self.assertEqual(backbone.DEFAULT_GUIDANCE_SCALE, 3.5)
         self.assertEqual(backbone.DEFAULT_MAX_SEQUENCE_LENGTH, 256)
@@ -97,6 +95,28 @@ class TestSd35LargeBackbone(unittest.TestCase):
         )
         self.assertEqual(streams["seq"].shape, (333, 4096))
         self.assertEqual(streams["pooled"].shape, (2048,))
+
+    def test_generate_dispatches_prompt_text_without_encoding(self) -> None:
+        """Qualification generation sends native text directly to Diffusers."""
+        image = MagicMock()
+        pipeline = MagicMock(return_value=types.SimpleNamespace(images=[image]))
+        pipeline.encode_prompt = MagicMock()
+        backbone = Sd35LargeBackbone(device="cpu")
+        backbone.pipeline = pipeline
+        backbone._loaded = True
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output_path = Path(tmpdir) / "native.png"
+            backbone.generate("a red cube", output_path, seed=7)
+
+        pipeline.encode_prompt.assert_not_called()
+        kwargs = pipeline.call_args.kwargs
+        self.assertEqual(kwargs["prompt"], "a red cube")
+        self.assertEqual(kwargs["prompt_2"], "a red cube")
+        self.assertEqual(kwargs["prompt_3"], "a red cube")
+        self.assertNotIn("prompt_embeds", kwargs)
+        self.assertEqual(kwargs["max_sequence_length"], 256)
+        self.assertEqual(kwargs["generator"].initial_seed(), 7)
 
     def test_decode_forwards_defaults_and_seeded_cpu_generator(self) -> None:
         """Decode forwards non-Turbo settings and constructs a repeatable seed."""
@@ -188,9 +208,7 @@ class TestSd35LargeBackbone(unittest.TestCase):
             device=torch.device("cuda:1"), dtype=torch.bfloat16
         )
         self.assertIs(pipeline.call_args.kwargs["prompt_embeds"], placed_seq)
-        self.assertIs(
-            pipeline.call_args.kwargs["pooled_prompt_embeds"], placed_pooled
-        )
+        self.assertIs(pipeline.call_args.kwargs["pooled_prompt_embeds"], placed_pooled)
 
     def test_decode_rejects_context_length_outside_stream_contract(self) -> None:
         """A different T5 context cannot match a stored 333-token stream."""

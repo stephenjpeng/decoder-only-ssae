@@ -307,6 +307,38 @@ The repo includes scripts for **held-out tuple splits**, **embedding and image m
 
 Unified CLI: `python -m evaluation.cli <subcommand> ...` (see `evaluation/cli.py`).
 
+#### Native image qualification and blinded scoring
+
+Inspect the frozen 104-row prompt audit and 576-row model bakeoff without loading weights:
+
+```bash
+python -m evaluation.run_native_model_qualification \
+    --output_dir results/image_qualification --dry_run
+```
+
+Render with direct text conditioning. SD3.5 Turbo and Large use 256 tokens. FLUX dev uses 512 tokens.
+
+```bash
+python -m evaluation.run_native_model_qualification \
+    --output_dir results/image_qualification --device cuda
+```
+
+Give only `scoring_sheet.csv` and `blinded_images/` to the scorer. This package contains successful bakeoff rows only. Audit rows stay outside the model-blinded handoff because audit membership identifies Turbo. The sheet contains opaque IDs, image paths, target phrases, and full prompts. Keep `manifest.jsonl` and `blinded_row_mapping.json` private. Both files use mode 0600. Failed renders remain in the private manifest, count as invalid in the gate, and do not appear in the scoring sheet.
+
+After the scorer fills all three boolean columns, authorize unblinding and run the bakeoff-only analysis:
+
+```bash
+python -m evaluation.run_image_validity_analysis \
+    --manifest results/image_qualification/manifest.jsonl \
+    --scores results/image_qualification/scoring_sheet.csv \
+    --blinding-mapping results/image_qualification/blinded_row_mapping.json \
+    --unblinded-scores-output results/image_qualification/scores.internal.csv \
+    --output-json results/image_qualification/bakeoff-results.json \
+    --output-csv results/image_qualification/bakeoff-summary.csv
+```
+
+The 90% gate uses only `design=bakeoff`, `conditioning=direct_text`, and `target_present=true`. Prompt-audit rows do not enter candidate counts. Visibility and ambiguity are secondary diagnostics. Results include each model, each property, and each model-property cell.
+
 #### Baseline cache (image benchmark)
 
 `run_image_benchmark` caches the non-SSAE baselines (`gt_embed`, `mean_arithmetic`, `ridge_embed`, `native_prompt`, `prompt_only`, `prompt_modified_packed`) under `results/bench_baseline_cache/<dataset_id>/` and reuses them across real-render runs. Simulated runs keep placeholders in the run folder and never read or write this shared cache. A real run folder holds SSAE outputs plus a `manifest.json` that points at the cache. The Streamlit viewer merges the two transparently.

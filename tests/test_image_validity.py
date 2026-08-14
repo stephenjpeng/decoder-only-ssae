@@ -11,10 +11,8 @@ from pathlib import Path
 from unittest.mock import patch
 
 from evaluation.image_validity import (
-    EligibilityStats,
     ManifestRow,
     ScoringRow,
-    ValidityStats,
     analyze_image_validity,
     calculate_eligibility,
     calculate_per_model_validity,
@@ -614,7 +612,7 @@ class TestCalculateEligibility(unittest.TestCase):
         self.assertEqual(eligibility.n_eligible, 2)  # e1 and e3 both reference src1
         self.assertAlmostEqual(eligibility.rate, 2 / 3)
 
-    def test_missing_source_row(self):
+    def test_unscored_source_is_conservatively_ineligible(self):
         manifest = [
             ManifestRow("e1", "m1", "p1", "c1", 1, "edit", "/img1.png", "src1"),
             ManifestRow("e2", "m1", "p1", "c1", 2, "edit", "/img2.png", "src_missing"),
@@ -623,8 +621,9 @@ class TestCalculateEligibility(unittest.TestCase):
             "src1": ScoringRow("src1", True, True, False, ""),
         }
 
-        with self.assertRaisesRegex(ValueError, "source without a score"):
-            calculate_eligibility(manifest, scores)
+        eligibility = calculate_eligibility(manifest, scores)
+        self.assertEqual(eligibility.n_attempted, 2)
+        self.assertEqual(eligibility.n_eligible, 1)
 
     def test_no_source_row_id(self):
         manifest = [
@@ -762,7 +761,7 @@ class TestEndToEnd(unittest.TestCase):
                             "model_backbone": "m1",
                             "property_id": "p1",
                             "context_id": "c1",
-                            "seed": 3,
+                            "seed": 1,
                             "stage": "edit",
                             "image_path": "/e1.png",
                             "source_row_id": "n1",
@@ -777,7 +776,7 @@ class TestEndToEnd(unittest.TestCase):
                             "model_backbone": "m1",
                             "property_id": "p1",
                             "context_id": "c1",
-                            "seed": 4,
+                            "seed": 2,
                             "stage": "edit",
                             "image_path": "/e2.png",
                             "source_row_id": "n2",
@@ -965,7 +964,7 @@ class TestEndToEnd(unittest.TestCase):
                                 "model_backbone": "m1",
                                 "property_id": "p1",
                                 "context_id": "c1",
-                                "seed": i + 100,
+                                "seed": 0,
                                 "stage": "edit",
                                 "image_path": f"/e{i}.png",
                                 "source_row_id": "n0",
@@ -1054,7 +1053,7 @@ class TestEndToEnd(unittest.TestCase):
                     "model_backbone": "m1",
                     "property_id": "p1",
                     "context_id": "c1",
-                    "seed": 2,
+                    "seed": 1,
                     "stage": "edit",
                     "image_path": "/e1.png",
                     "source_row_id": "n1",
@@ -1084,6 +1083,97 @@ class TestEndToEnd(unittest.TestCase):
 
             with self.assertRaisesRegex(ValueError, "must reference a native row"):
                 analyze_image_validity(manifest_path, scores_path)
+
+    def test_edit_join_rejects_model_context_seed_and_property_mismatches(self):
+        base_source = {
+            "row_id": "source",
+            "model_backbone": "m1",
+            "property_id": "source-property",
+            "context_id": "c1",
+            "seed": 9,
+            "stage": "native",
+            "image_path": "/source.png",
+        }
+        base_edit = {
+            "row_id": "edit",
+            "model_backbone": "m1",
+            "property_id": "target-property",
+            "source_property_id": "source-property",
+            "target_property_id": "target-property",
+            "context_id": "c1",
+            "seed": 9,
+            "stage": "edit",
+            "image_path": "/edit.png",
+            "source_row_id": "source",
+        }
+        mutations = (
+            ("model_backbone", "m2", "model_backbone"),
+            ("context_id", "c2", "context_id"),
+            ("seed", 10, "seed"),
+            ("source_property_id", "wrong", "source_property_id"),
+            ("target_property_id", "wrong", "target_property_id"),
+        )
+        for field, value, message in mutations:
+            with self.subTest(field=field), tempfile.TemporaryDirectory() as tmpdir:
+                root = Path(tmpdir)
+                edit = {**base_edit, field: value}
+                (root / "manifest.jsonl").write_text(
+                    json.dumps(base_source) + "\n" + json.dumps(edit) + "\n",
+                    encoding="utf-8",
+                )
+                (root / "scores.csv").write_text(
+                    "row_id,target_present,target_visible,prompt_ambiguous,notes\n"
+                    "source,true,true,false,\nedit,true,true,false,\n",
+                    encoding="utf-8",
+                )
+                with self.assertRaisesRegex(ValueError, message):
+                    analyze_image_validity(root / "manifest.jsonl", root / "scores.csv")
+
+    def test_failed_bakeoff_render_needs_no_score_and_counts_invalid(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            manifest_path = root / "manifest.jsonl"
+            rows = [
+                {
+                    "row_id": "ok",
+                    "model_backbone": "m1",
+                    "property_id": "p1",
+                    "context_id": "c1",
+                    "seed": 1,
+                    "stage": "native",
+                    "design": "bakeoff",
+                    "conditioning": "direct_text",
+                    "status": "success",
+                    "image_path": "/ok.png",
+                },
+                {
+                    "row_id": "failed",
+                    "model_backbone": "m1",
+                    "property_id": "p1",
+                    "context_id": "c1",
+                    "seed": 2,
+                    "stage": "native",
+                    "design": "bakeoff",
+                    "conditioning": "direct_text",
+                    "status": "error",
+                    "image_path": None,
+                },
+            ]
+            manifest_path.write_text(
+                "".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8"
+            )
+            scores_path = root / "scores.csv"
+            scores_path.write_text(
+                "row_id,target_present,target_visible,prompt_ambiguous,notes\n"
+                "ok,true,true,false,\n",
+                encoding="utf-8",
+            )
+
+            results = analyze_image_validity(manifest_path, scores_path)
+
+            self.assertEqual(results["overall"]["n_total"], 2)
+            self.assertEqual(results["overall"]["n_valid"], 1)
+            self.assertEqual(results["render_failures"]["n_bakeoff"], 1)
 
 
 class TestCLI(unittest.TestCase):

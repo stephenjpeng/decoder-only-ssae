@@ -104,6 +104,43 @@ class Sd35LargeBackbone(Backbone):
         }
 
     @torch.no_grad()
+    def generate(
+        self,
+        prompt: str,
+        output_path: str | Path,
+        seed: int | None = None,
+        num_inference_steps: int = DEFAULT_NUM_INFERENCE_STEPS,
+        guidance_scale: float = DEFAULT_GUIDANCE_SCALE,
+        max_sequence_length: int = DEFAULT_MAX_SEQUENCE_LENGTH,
+        height: int = DEFAULT_HEIGHT,
+        width: int = DEFAULT_WIDTH,
+        **_: Any,
+    ) -> Path:
+        """Generate directly from text with the native SD3.5 context."""
+        if not self._loaded:
+            self.load()
+        if max_sequence_length != self.DEFAULT_MAX_SEQUENCE_LENGTH:
+            raise ValueError("max_sequence_length must be 256 for SD3.5 qualification")
+
+        generator = None
+        if seed is not None:
+            generator = torch.Generator(device="cpu").manual_seed(seed)
+        image = self.pipeline(
+            prompt=prompt,
+            prompt_2=prompt,
+            prompt_3=prompt,
+            num_inference_steps=num_inference_steps,
+            guidance_scale=guidance_scale,
+            max_sequence_length=max_sequence_length,
+            height=height,
+            width=width,
+            generator=generator,
+        ).images[0]
+        output_path = Path(output_path)
+        image.save(output_path)
+        return output_path
+
+    @torch.no_grad()
     def decode(
         self,
         streams: StreamTensors,

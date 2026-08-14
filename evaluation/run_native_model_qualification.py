@@ -1,4 +1,4 @@
-"""Generate native-model qualification plans, images, and scoring artifacts."""
+"""Generate direct-text qualification plans, images, and blinded scoring artifacts."""
 
 from __future__ import annotations
 
@@ -10,7 +10,6 @@ import json
 import os
 import secrets
 import shutil
-import sys
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
@@ -27,7 +26,6 @@ from evaluation.image_qualification import (
 _MODEL_BASE_CONFIGS: dict[str, dict[str, Any]] = {
     "sd35_large_turbo": {
         "model_id": "stabilityai/stable-diffusion-3.5-large-turbo",
-        "revision": None,
         "configuration": {
             "text_encoder_3_model_id": "diffusers/t5-nf4",
             "transformer_quantization": "nf4",
@@ -36,26 +34,19 @@ _MODEL_BASE_CONFIGS: dict[str, dict[str, Any]] = {
     },
     "sd35_large": {
         "model_id": "stabilityai/stable-diffusion-3.5-large",
-        "revision": None,
         "configuration": {"torch_dtype": "bfloat16"},
     },
     "flux_dev": {
         "model_id": "black-forest-labs/FLUX.1-dev",
-        "revision": None,
         "configuration": {"torch_dtype": "bfloat16"},
     },
 }
-_OBSERVABLE_CONFIG_ATTRIBUTES = (
-    "dtype",
-    "max_length",
-    "variant",
-    "torch_dtype",
-)
+_OBSERVABLE_CONFIG_ATTRIBUTES = ("dtype", "max_length", "variant", "torch_dtype")
 _EXPLICIT_RENDER_PARAMETERS: dict[str, dict[str, Any]] = {
     "sd35_large_turbo": {
         "num_inference_steps": 4,
         "guidance_scale": 0.0,
-        "max_sequence_length": 512,
+        "max_sequence_length": 256,
     },
     "sd35_large": {
         "num_inference_steps": 28,
@@ -76,6 +67,7 @@ _CONFIG_MARKER_FIELDS = (
     "_diffusers_version",
     "revision",
 )
+_SCORE_FIELDS = ("target_present", "target_visible", "prompt_ambiguous", "notes")
 
 
 def parse_args() -> argparse.Namespace:
@@ -85,37 +77,28 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--prompt_spec",
-        type=str,
         default="evaluation/config/image_validity_prompts.yaml",
         help="path to prompt spec YAML",
     )
     parser.add_argument(
-        "--output_dir",
-        type=str,
-        required=True,
-        help="output directory for the manifest, images, and scoring sheet",
+        "--output_dir", required=True, help="qualification output directory"
     )
     parser.add_argument(
         "--dry_run",
         action="store_true",
-        help="write the plan without loading model weights or generating images",
+        help="write the plan without loading model weights or rendering images",
     )
-    parser.add_argument(
-        "--device",
-        type=str,
-        default="cuda",
-        help="device for model inference (ignored in dry-run mode)",
-    )
+    parser.add_argument("--device", default="cuda", help="inference device")
     return parser.parse_args()
 
 
 def load_existing_manifest(manifest_path: Path) -> dict[str, dict[str, Any]]:
-    """Load existing manifest rows keyed by row ID."""
+    """Load existing private manifest rows keyed by canonical row ID."""
     if not manifest_path.exists():
         return {}
-
+    manifest_path.chmod(0o600)
     rows: dict[str, dict[str, Any]] = {}
-    with manifest_path.open("r") as file:
+    with manifest_path.open("r", encoding="utf-8") as file:
         for line in file:
             if line.strip():
                 row = json.loads(line)
@@ -124,112 +107,27 @@ def load_existing_manifest(manifest_path: Path) -> dict[str, dict[str, Any]]:
 
 
 def write_manifest(manifest_path: Path, rows: dict[str, dict[str, Any]]) -> None:
-    """Atomically write one stable manifest record per row ID."""
+    """Atomically write the private render manifest with mode 0600."""
     temporary_path = manifest_path.with_suffix(f"{manifest_path.suffix}.tmp")
-    with temporary_path.open("w") as file:
+    descriptor = os.open(temporary_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    os.fchmod(descriptor, 0o600)
+    with os.fdopen(descriptor, "w", encoding="utf-8") as file:
         for row_id in sorted(rows):
             file.write(json.dumps(rows[row_id], sort_keys=True) + "\n")
     temporary_path.replace(manifest_path)
+    manifest_path.chmod(0o600)
 
 
-def _write_json_exclusive(path: Path, payload: dict[str, Any]) -> None:
-    """Create a mode-0600 mapping once so resume cannot replace its identities."""
-    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
-    descriptor = os.open(path, flags, 0o600)
-    with os.fdopen(descriptor, "w") as file:
+def _write_private_json(path: Path, payload: dict[str, Any]) -> None:
+    """Atomically write private JSON with mode 0600."""
+    temporary_path = path.with_suffix(f"{path.suffix}.tmp")
+    descriptor = os.open(temporary_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    os.fchmod(descriptor, 0o600)
+    with os.fdopen(descriptor, "w", encoding="utf-8") as file:
         json.dump(payload, file, indent=2, sort_keys=True)
         file.write("\n")
+    temporary_path.replace(path)
     path.chmod(0o600)
-
-
-def _validate_blinding_mapping(mapping: dict[str, Any], rows: list[RenderRow]) -> None:
-    """Validate that a persisted mapping covers the current plan exactly once."""
-    if mapping.get("version") != 1 or not isinstance(mapping.get("rows"), dict):
-        raise ValueError("blinded row mapping has an unsupported format")
-
-    expected_ids = {row.row_id for row in rows}
-    mapped_ids = set(mapping["rows"])
-    if mapped_ids != expected_ids:
-        raise ValueError("blinded row mapping does not match the current plan")
-
-    scoring_order = mapping.get("scoring_order")
-    if not isinstance(scoring_order, list) or set(scoring_order) != expected_ids:
-        raise ValueError("blinded scoring order does not match the current plan")
-    if len(scoring_order) != len(expected_ids):
-        raise ValueError("blinded scoring order contains duplicate row IDs")
-
-    blinded_ids = [entry["blinded_row_id"] for entry in mapping["rows"].values()]
-    image_paths = [entry["image_path"] for entry in mapping["rows"].values()]
-    if len(blinded_ids) != len(set(blinded_ids)):
-        raise ValueError("blinded row mapping contains duplicate opaque IDs")
-    if len(image_paths) != len(set(image_paths)):
-        raise ValueError("blinded row mapping contains duplicate image paths")
-
-
-def load_or_create_blinding_mapping(
-    output_dir: Path, rows: list[RenderRow]
-) -> dict[str, Any]:
-    """Load stable opaque identities or create them with cryptographic randomness."""
-    mapping_path = output_dir / "blinded_row_mapping.json"
-    if mapping_path.exists():
-        # the mapping unblinds every score, so repair permissive legacy modes first
-        mapping_path.chmod(0o600)
-        with mapping_path.open("r") as file:
-            mapping = json.load(file)
-        _validate_blinding_mapping(mapping, rows)
-        return mapping
-
-    entries: dict[str, dict[str, str]] = {}
-    used_tokens: set[str] = set()
-    for row in rows:
-        token = secrets.token_hex(16)
-        while token in used_tokens:
-            token = secrets.token_hex(16)
-        used_tokens.add(token)
-        entries[row.row_id] = {
-            "blinded_row_id": token,
-            "image_path": f"blinded_images/{token}.png",
-        }
-
-    # hide the deterministic property and model grouping from the scorer
-    scoring_order = [row.row_id for row in rows]
-    original_order = list(scoring_order)
-    secrets.SystemRandom().shuffle(scoring_order)
-    if len(scoring_order) > 1 and scoring_order == original_order:
-        scoring_order = scoring_order[1:] + scoring_order[:1]
-
-    mapping = {"version": 1, "rows": entries, "scoring_order": scoring_order}
-    _validate_blinding_mapping(mapping, rows)
-    _write_json_exclusive(mapping_path, mapping)
-    return mapping
-
-
-def write_scoring_sheet(output_dir: Path, mapping: dict[str, Any]) -> None:
-    """Create a blinded scoring sheet without replacing existing annotations."""
-    scoring_path = output_dir / "scoring_sheet.csv"
-    if scoring_path.exists():
-        print(f"preserving existing scoring sheet at {scoring_path}")
-        return
-
-    with scoring_path.open("x", newline="") as file:
-        writer = csv.writer(file)
-        writer.writerow(
-            [
-                "blinded_row_id",
-                "image_path",
-                "target_present",
-                "target_visible",
-                "prompt_ambiguous",
-                "notes",
-            ]
-        )
-        for row_id in mapping["scoring_order"]:
-            entry = mapping["rows"][row_id]
-            writer.writerow(
-                [entry["blinded_row_id"], entry["image_path"], "", "", "", ""]
-            )
-    print(f"wrote blinded scoring sheet to {scoring_path}")
-    print(f"keep {output_dir / 'blinded_row_mapping.json'} private")
 
 
 def _json_value(value: Any) -> Any:
@@ -255,7 +153,6 @@ def _loaded_model_markers(backbone: Any) -> dict[str, dict[str, Any]]:
     pipeline = getattr(backbone, "pipeline", None)
     if pipeline is None:
         return {}
-
     markers: dict[str, dict[str, Any]] = {}
     components = {
         "pipeline": pipeline,
@@ -279,20 +176,20 @@ def _loaded_model_markers(backbone: Any) -> dict[str, dict[str, Any]]:
     return markers
 
 
-def _resolved_revision(backbone: Any, markers: dict[str, dict[str, Any]]) -> str:
-    """Resolve an explicit revision label from the instance or loaded configs."""
+def _resolved_revision(backbone: Any, markers: dict[str, dict[str, Any]]) -> str | None:
+    """Resolve a concrete revision when the instance or loaded config exposes one."""
     revision = getattr(backbone, "revision", None)
-    if revision is not None:
+    if revision:
         return str(revision)
     for component in markers.values():
         commit_hash = component.get("_commit_hash")
         if commit_hash:
             return str(commit_hash)
-    return "default"
+    return None
 
 
 def resolved_render_parameters(backbone_name: str, backbone: Any) -> dict[str, Any]:
-    """Resolve the explicit parameters passed for qualification renders."""
+    """Resolve parameters passed to direct-text qualification generation."""
     parameters = dict(_EXPLICIT_RENDER_PARAMETERS[backbone_name])
     if backbone_name == "flux_dev":
         parameters["max_sequence_length"] = int(backbone.max_length)
@@ -306,7 +203,6 @@ def _effective_inference_dtype(backbone_name: str, backbone: Any) -> Any:
         configured_dtype = _MODEL_BASE_CONFIGS[backbone_name]["configuration"].get(
             "torch_dtype"
         )
-
     device = getattr(backbone, "device", "unknown")
     device_type = getattr(device, "type", str(device).split(":", maxsplit=1)[0])
     if (
@@ -319,24 +215,24 @@ def _effective_inference_dtype(backbone_name: str, backbone: Any) -> Any:
 
 
 def build_model_configuration(backbone_name: str, backbone: Any) -> dict[str, Any]:
-    """Record the resolved model, runtime, render parameters, and stream contract."""
+    """Record model provenance, runtime, direct render parameters, and streams."""
     if backbone_name not in _MODEL_BASE_CONFIGS:
         raise ValueError(f"no qualification model configuration for {backbone_name!r}")
-
     base = _MODEL_BASE_CONFIGS[backbone_name]
     observable_configuration = dict(base["configuration"])
     for attribute in _OBSERVABLE_CONFIG_ATTRIBUTES:
         value = getattr(backbone, attribute, None)
         if value is not None:
             observable_configuration[attribute] = _json_value(value)
-
-    loaded_model_markers = _loaded_model_markers(backbone)
+    markers = _loaded_model_markers(backbone)
+    revision = _resolved_revision(backbone, markers)
     return {
         "backbone_name": backbone_name,
         "backbone_class": type(backbone).__name__,
         "model_id": _json_value(getattr(backbone, "model_id", base["model_id"])),
-        "revision": _resolved_revision(backbone, loaded_model_markers),
-        "loaded_model_markers": loaded_model_markers,
+        "revision": revision,
+        "revision_is_concrete": revision is not None,
+        "loaded_model_markers": markers,
         "configuration": observable_configuration,
         "runtime": {
             "device": str(getattr(backbone, "device", "unknown")),
@@ -350,9 +246,22 @@ def build_model_configuration(backbone_name: str, backbone: Any) -> dict[str, An
 
 
 def fingerprint_model_configuration(configuration: dict[str, Any]) -> str:
-    """Hash a canonical model configuration for stable manifest identity."""
+    """Hash a canonical model configuration for stable render identity."""
     canonical = json.dumps(configuration, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(canonical.encode()).hexdigest()[:16]
+
+
+def qualification_identity(
+    row: RenderRow, spec_fingerprint: str, model_fingerprint: str
+) -> str:
+    """Bind one rendered pixel artifact to its spec, model, and render contract."""
+    payload = {
+        "row": row.to_dict(),
+        "spec_fingerprint": spec_fingerprint,
+        "model_fingerprint": model_fingerprint,
+    }
+    canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(canonical.encode()).hexdigest()[:24]
 
 
 def manifest_success_matches(
@@ -362,21 +271,180 @@ def manifest_success_matches(
     model_configuration: dict[str, Any],
     model_fingerprint: str,
 ) -> bool:
-    """Return whether a saved success matches the full current render contract."""
+    """Return whether a saved success matches the complete direct render contract."""
     expected = {
-        "row_id": row.row_id,
-        "stage": row.stage,
-        "model_backbone": row.model_backbone,
-        "property_id": row.property_id,
-        "context_id": row.context_id,
-        "seed": row.seed,
-        "prompt": row.prompt,
+        **row.to_dict(),
         "spec_fingerprint": spec_fingerprint,
         "model_configuration": model_configuration,
         "model_fingerprint": model_fingerprint,
+        "render_contract_fingerprint": qualification_identity(
+            row, spec_fingerprint, model_fingerprint
+        ),
         "status": "success",
     }
-    return all(manifest_row.get(key) == value for key, value in expected.items())
+    if not all(manifest_row.get(key) == value for key, value in expected.items()):
+        return False
+    artifact_identity = manifest_row.get("qualification_identity")
+    render_attempt_id = manifest_row.get("render_attempt_id")
+    return (
+        isinstance(render_attempt_id, str)
+        and bool(render_attempt_id)
+        and artifact_identity
+        == f"{expected['render_contract_fingerprint']}-{render_attempt_id}"
+    )
+
+
+def _load_existing_scores(path: Path) -> dict[str, dict[str, str]]:
+    """Load annotations by opaque ID so unchanged pixels retain their scores."""
+    if not path.exists():
+        return {}
+    with path.open("r", encoding="utf-8", newline="") as file:
+        return {
+            row["blinded_row_id"]: row
+            for row in csv.DictReader(file)
+            if row.get("blinded_row_id")
+        }
+
+
+def _load_mapping(path: Path) -> dict[str, Any]:
+    """Load the private v2 mapping or return an empty mapping."""
+    if not path.exists():
+        return {"version": 2, "rows": {}, "scoring_order": []}
+    path.chmod(0o600)
+    with path.open("r", encoding="utf-8") as file:
+        mapping = json.load(file)
+    if mapping.get("version") != 2 or not isinstance(mapping.get("rows"), dict):
+        return {"version": 2, "rows": {}, "scoring_order": []}
+    return mapping
+
+
+def _shuffle_public_copy_rows(
+    pending: list[tuple[RenderRow, Path, str]],
+) -> list[tuple[RenderRow, Path, str]]:
+    """Randomize public file creation order without retaining an arm-order collision."""
+    shuffled = list(pending)
+    if len(shuffled) < 2:
+        return shuffled
+
+    original_ids = [row.row_id for row, _, _ in pending]
+    original_models = [row.model_backbone for row, _, _ in pending]
+    secrets.SystemRandom().shuffle(shuffled)
+    shuffled_ids = [row.row_id for row, _, _ in shuffled]
+    shuffled_models = [row.model_backbone for row, _, _ in shuffled]
+    if shuffled_ids == original_ids or (
+        len(set(original_models)) > 1 and shuffled_models == original_models
+    ):
+        # sample only rotations that cannot reproduce the deterministic arm schedule
+        offsets = [
+            offset
+            for offset in range(1, len(shuffled))
+            if len(set(original_models)) == 1
+            or original_models[offset:] + original_models[:offset] != original_models
+        ]
+        offset = offsets[secrets.randbelow(len(offsets))]
+        shuffled = shuffled[offset:] + shuffled[:offset]
+    return shuffled
+
+
+def build_scoring_package(
+    output_dir: Path,
+    rows: list[RenderRow],
+    manifest: dict[str, dict[str, Any]],
+) -> dict[str, Any]:
+    """Publish opaque copies and a score sheet for successful current renders only."""
+    mapping_path = output_dir / "blinded_row_mapping.json"
+    scoring_path = output_dir / "scoring_sheet.csv"
+    prior_mapping = _load_mapping(mapping_path)
+    prior_scores = _load_existing_scores(scoring_path)
+    prior_entries = prior_mapping["rows"]
+    blinded_dir = output_dir / "blinded_images"
+    blinded_dir.mkdir(exist_ok=True)
+
+    entries: dict[str, dict[str, str]] = {}
+    scorer_rows = [
+        row
+        for row in rows
+        if row.design == "bakeoff" and row.conditioning == "direct_text"
+    ]
+    pending_copies: list[tuple[RenderRow, Path, str]] = []
+    for row in scorer_rows:
+        rendered = manifest.get(row.row_id, {})
+        if rendered.get("status") != "success":
+            continue
+        source_path = Path(rendered["image_path"])
+        if not source_path.is_file():
+            continue
+        identity = rendered["qualification_identity"]
+        previous = prior_entries.get(row.row_id, {})
+        previous_path = output_dir / previous.get("image_path", "missing")
+        if (
+            previous.get("qualification_identity") == identity
+            and previous_path.is_file()
+        ):
+            # retained files stay untouched so resume cannot restamp ctime in arm order
+            entries[row.row_id] = previous
+            continue
+
+        pending_copies.append((row, source_path, identity))
+
+    # file creation metadata follows an independent random order, not model order
+    for row, source_path, identity in _shuffle_public_copy_rows(pending_copies):
+        token = secrets.token_hex(16)
+        while (blinded_dir / f"{token}.png").exists():
+            token = secrets.token_hex(16)
+        destination = blinded_dir / f"{token}.png"
+        shutil.copyfile(source_path, destination)
+        destination.chmod(0o644)
+        os.utime(destination, (0, 0))
+        entries[row.row_id] = {
+            "blinded_row_id": token,
+            "image_path": str(destination.relative_to(output_dir)),
+            "qualification_identity": identity,
+        }
+
+    # remove obsolete opaque images after the replacement is safely copied
+    retained_paths = {entry["image_path"] for entry in entries.values()}
+    for previous in prior_entries.values():
+        old_path = previous.get("image_path")
+        if old_path and old_path not in retained_paths:
+            (output_dir / old_path).unlink(missing_ok=True)
+
+    row_by_id = {row.row_id: row for row in scorer_rows}
+    scoring_order = [
+        row_id for row_id in prior_mapping.get("scoring_order", []) if row_id in entries
+    ]
+    new_ids = [row_id for row_id in entries if row_id not in scoring_order]
+    secrets.SystemRandom().shuffle(new_ids)
+    scoring_order.extend(new_ids)
+    mapping = {"version": 2, "rows": entries, "scoring_order": scoring_order}
+    _write_private_json(mapping_path, mapping)
+
+    temporary_path = scoring_path.with_suffix(".csv.tmp")
+    with temporary_path.open("w", encoding="utf-8", newline="") as file:
+        fieldnames = [
+            "blinded_row_id",
+            "image_path",
+            "target_phrase",
+            "prompt",
+            *_SCORE_FIELDS,
+        ]
+        writer = csv.DictWriter(file, fieldnames=fieldnames)
+        writer.writeheader()
+        for row_id in scoring_order:
+            entry = entries[row_id]
+            old_score = prior_scores.get(entry["blinded_row_id"], {})
+            row = row_by_id[row_id]
+            writer.writerow(
+                {
+                    "blinded_row_id": entry["blinded_row_id"],
+                    "image_path": entry["image_path"],
+                    "target_phrase": row.target_phrase,
+                    "prompt": row.prompt,
+                    **{field: old_score.get(field, "") for field in _SCORE_FIELDS},
+                }
+            )
+    temporary_path.replace(scoring_path)
+    return mapping
 
 
 def _write_dry_run_plan(
@@ -385,10 +453,10 @@ def _write_dry_run_plan(
     audit_rows: list[RenderRow],
     bakeoff_rows: list[RenderRow],
 ) -> None:
-    """Write the deterministic dry-run plan."""
+    """Write the deterministic dry-run plan without creating scoring artifacts."""
     all_rows = audit_rows + bakeoff_rows
     plan_path = output_dir / "plan.json"
-    with plan_path.open("w") as file:
+    with plan_path.open("w", encoding="utf-8") as file:
         json.dump(
             {
                 "spec_fingerprint": spec_fingerprint,
@@ -405,12 +473,10 @@ def _write_dry_run_plan(
 
 
 def main() -> None:
-    """Run the qualification plan or materialize it without model loading."""
+    """Render the qualification plan through native direct-text dispatch."""
     args = parse_args()
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-
-    print(f"loading prompt spec from {args.prompt_spec}")
     spec = PromptSpec.load(args.prompt_spec)
     spec_fingerprint = spec.fingerprint()
     audit_rows = build_audit_plan(spec)
@@ -421,66 +487,27 @@ def main() -> None:
         f"validated {len(audit_rows)} audit rows and "
         f"{len(bakeoff_rows)} bakeoff rows ({spec_fingerprint})"
     )
-
-    # scorer identities remain private and stable across retries
-    blinding_mapping = load_or_create_blinding_mapping(output_dir, all_rows)
-    write_scoring_sheet(output_dir, blinding_mapping)
-
     if args.dry_run:
         _write_dry_run_plan(output_dir, spec_fingerprint, audit_rows, bakeoff_rows)
         return
 
     manifest_path = output_dir / "manifest.jsonl"
     manifest = load_existing_manifest(manifest_path)
-    planned_ids = {row.row_id for row in all_rows}
-
-    # migrate legacy image locations, but verify the full contract after model load
-    for row in all_rows:
-        manifest_row = manifest.get(row.row_id)
-        if manifest_row is None or manifest_row.get("status") != "success":
-            continue
-        target_path = output_dir / blinding_mapping["rows"][row.row_id]["image_path"]
-        legacy_value = manifest_row.get("image_path")
-        legacy_path = Path(legacy_value) if legacy_value else None
-        if legacy_path is not None and not legacy_path.is_absolute():
-            output_relative_path = output_dir / legacy_path
-            if not legacy_path.is_file() and output_relative_path.is_file():
-                legacy_path = output_relative_path
-        if (
-            not target_path.is_file()
-            and legacy_path is not None
-            and legacy_path.is_file()
-        ):
-            target_path.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(legacy_path, target_path)
-        if target_path.is_file():
-            manifest_row["image_path"] = str(target_path)
-
-    # rewriting here canonicalizes duplicate legacy IDs even if every row is valid
+    # canonicalize duplicate legacy rows even when every render can be resumed
     write_manifest(manifest_path, manifest)
-
-    failed_ids = {
-        row_id
-        for row_id, row in manifest.items()
-        if row_id in planned_ids and row.get("status") != "success"
-    }
-    print(f"checking {len(all_rows)} rows against the current model contracts")
-    print(f"retrying {len(failed_ids)} previously failed rows")
-
     rows_by_backbone: dict[str, list[RenderRow]] = {}
     for row in all_rows:
         rows_by_backbone.setdefault(row.model_backbone, []).append(row)
-
     registered = list_backbones()
-    for backbone_name in rows_by_backbone:
-        if backbone_name not in registered:
-            print(
-                f"error: backbone {backbone_name!r} not registered; "
-                f"available: {registered}",
-                file=sys.stderr,
-            )
-            raise SystemExit(1)
+    unknown = sorted(set(rows_by_backbone) - set(registered))
+    if unknown:
+        raise SystemExit(
+            f"unregistered qualification backbones: {unknown}; available: {registered}"
+        )
 
+    private_images = output_dir / "private_images"
+    private_images.mkdir(exist_ok=True)
+    private_images.chmod(0o700)
     for backbone_name, rows in rows_by_backbone.items():
         print(f"loading backbone {backbone_name!r}")
         backbone = get_backbone(backbone_name, device=args.device)
@@ -489,74 +516,88 @@ def main() -> None:
             model_configuration = build_model_configuration(backbone_name, backbone)
             model_fingerprint = fingerprint_model_configuration(model_configuration)
             render_parameters = resolved_render_parameters(backbone_name, backbone)
-            decode_signature = inspect.signature(type(backbone).decode)
-            accepted_render_parameters = {
+            generate_signature = inspect.signature(type(backbone).generate)
+            accepted_parameters = {
                 name: value
                 for name, value in render_parameters.items()
-                if name in decode_signature.parameters
+                if name in generate_signature.parameters
             }
-
             skipped_count = 0
             for index, row in enumerate(rows, start=1):
-                relative_image_path = blinding_mapping["rows"][row.row_id]["image_path"]
-                image_path = output_dir / relative_image_path
-                existing_row = manifest.get(row.row_id, {})
-                if image_path.is_file() and manifest_success_matches(
-                    existing_row,
-                    row,
-                    spec_fingerprint,
-                    model_configuration,
-                    model_fingerprint,
+                contract_identity = qualification_identity(
+                    row, spec_fingerprint, model_fingerprint
+                )
+                image_path = private_images / f"{row.row_id}.{contract_identity}.png"
+                existing = manifest.get(row.row_id, {})
+                existing_path_value = existing.get("image_path")
+                existing_path = (
+                    Path(existing_path_value) if existing_path_value else None
+                )
+                if (
+                    existing_path is not None
+                    and existing_path.is_file()
+                    and manifest_success_matches(
+                        existing,
+                        row,
+                        spec_fingerprint,
+                        model_configuration,
+                        model_fingerprint,
+                    )
                 ):
                     skipped_count += 1
                     continue
 
                 print(f"[{index}/{len(rows)}] {row.row_id}")
-                image_path.parent.mkdir(parents=True, exist_ok=True)
+                old_path_value = existing.get("image_path")
+                render_attempt_id = secrets.token_hex(8)
                 manifest_row: dict[str, Any] = {
-                    "row_id": row.row_id,
-                    "stage": row.stage,
-                    "model_backbone": row.model_backbone,
+                    **row.to_dict(),
                     "model_fingerprint": model_fingerprint,
                     "model_configuration": model_configuration,
-                    "property_id": row.property_id,
-                    "context_id": row.context_id,
-                    "seed": row.seed,
-                    "prompt": row.prompt,
                     "spec_fingerprint": spec_fingerprint,
+                    "render_contract_fingerprint": contract_identity,
+                    "render_attempt_id": render_attempt_id,
+                    "qualification_identity": f"{contract_identity}-{render_attempt_id}",
                     "image_path": str(image_path),
                     "status": "success",
                     "error": None,
                 }
                 try:
-                    # a stale partial file must not make a no-op decode look successful
                     image_path.unlink(missing_ok=True)
-                    streams = backbone.encode(row.prompt)
-                    backbone.decode(
-                        streams,
+                    backbone.generate(
+                        row.prompt,
                         image_path,
                         seed=row.seed,
-                        **accepted_render_parameters,
+                        **accepted_parameters,
                     )
                     if not image_path.is_file():
                         raise RuntimeError(
-                            f"backbone decode did not create image at {image_path}"
+                            f"backbone generate did not create image at {image_path}"
                         )
+                    if old_path_value and Path(old_path_value) != image_path:
+                        Path(old_path_value).unlink(missing_ok=True)
                 except Exception as err:
                     print(f"render error for {row.row_id}: {err}")
                     manifest_row["status"] = "error"
                     manifest_row["error"] = str(err)
                     manifest_row["image_path"] = None
-
-                # checkpoint each result so an interruption loses at most one render
                 manifest[row.row_id] = manifest_row
                 write_manifest(manifest_path, manifest)
-            print(f"skipped {skipped_count} valid {backbone_name!r} rows")
+            print(f"skipped {skipped_count} current {backbone_name!r} rows")
         finally:
             backbone.unload()
             print(f"unloaded backbone {backbone_name!r}")
 
-    print(f"rendering complete. manifest: {manifest_path}")
+    mapping = build_scoring_package(output_dir, all_rows, manifest)
+    successful = len(mapping["rows"])
+    failed = sum(
+        manifest.get(row.row_id, {}).get("status") == "error" for row in all_rows
+    )
+    print(
+        f"rendering complete: {successful} bakeoff scorer rows, {failed} render failures"
+    )
+    print(f"private manifest: {manifest_path}")
+    print(f"blinded scoring sheet: {output_dir / 'scoring_sheet.csv'}")
 
 
 if __name__ == "__main__":

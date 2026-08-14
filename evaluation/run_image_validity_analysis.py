@@ -52,6 +52,16 @@ def main() -> int:
         help="path to write human-readable summary CSV",
     )
     parser.add_argument(
+        "--blinding-mapping",
+        type=Path,
+        help="private mode-0600 mapping for an opaque scoring sheet",
+    )
+    parser.add_argument(
+        "--unblinded-scores-output",
+        type=Path,
+        help="optional private canonical score CSV written during unblinding",
+    )
+    parser.add_argument(
         "--gate-threshold",
         type=float,
         default=0.90,
@@ -65,6 +75,8 @@ def main() -> int:
             manifest_path=args.manifest,
             scores_path=args.scores,
             gate_threshold=args.gate_threshold,
+            blinding_mapping_path=args.blinding_mapping,
+            unblinded_scores_output=args.unblinded_scores_output,
         )
 
         write_results_json(results, args.output_json)

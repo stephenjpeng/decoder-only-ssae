@@ -295,6 +295,10 @@ class RenderRow:
     context_id: str
     seed: int
     prompt: str
+    design: str = "audit"
+    conditioning: str = "direct_text"
+    effective_context: int = 256
+    target_phrase: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         """Serialize to dict for JSONL output."""
@@ -306,6 +310,10 @@ class RenderRow:
             "context_id": self.context_id,
             "seed": self.seed,
             "prompt": self.prompt,
+            "design": self.design,
+            "conditioning": self.conditioning,
+            "effective_context": self.effective_context,
+            "target_phrase": self.target_phrase,
         }
 
 
@@ -330,6 +338,10 @@ def build_audit_plan(spec: PromptSpec) -> list[RenderRow]:
                         context_id=ctx_id,
                         seed=seed,
                         prompt=prompt,
+                        design="audit",
+                        conditioning="direct_text",
+                        effective_context=256,
+                        target_phrase=prop.rendering_phrase,
                     )
                 )
     return rows
@@ -358,6 +370,10 @@ def build_bakeoff_plan(spec: PromptSpec) -> list[RenderRow]:
                             context_id=ctx_id,
                             seed=seed,
                             prompt=prompt,
+                            design="bakeoff",
+                            conditioning="direct_text",
+                            effective_context=512 if model == "flux_dev" else 256,
+                            target_phrase=prop.rendering_phrase,
                         )
                     )
     return rows
@@ -386,6 +402,4 @@ def validate_coverage(
     # check row ID uniqueness across both plans
     all_row_ids = [r.row_id for r in audit_rows] + [r.row_id for r in bakeoff_rows]
     if len(all_row_ids) != len(set(all_row_ids)):
-        raise ValueError(
-            f"duplicate row IDs detected in combined audit + bakeoff plans"
-        )
+        raise ValueError("duplicate row IDs detected in combined audit + bakeoff plans")

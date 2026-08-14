@@ -90,6 +90,38 @@ python -m baselines.run_baselines \
     --output_json results/compositional_split/baseline_metrics.json
 ```
 
+### Qualify native image models before the benchmark
+
+Materialize the qualification design without loading weights:
+
+```bash
+python -m evaluation.run_native_model_qualification \
+    --output_dir results/image_qualification --dry_run
+```
+
+Render the prompt audit and three-model bakeoff with fixed seeds and direct text:
+
+```bash
+python -m evaluation.run_native_model_qualification \
+    --output_dir results/image_qualification --device cuda
+```
+
+Send `scoring_sheet.csv` and `blinded_images/` for scoring. This handoff contains successful bakeoff rows only. Audit rows stay separate because their membership identifies Turbo. Do not send `manifest.jsonl` or `blinded_row_mapping.json`. The private files use mode 0600. Failed renders stay explicit in the manifest and count as invalid during analysis.
+
+Fill `target_present`, `target_visible`, and `prompt_ambiguous` with `true` or `false`. Then unblind and analyze:
+
+```bash
+python -m evaluation.run_image_validity_analysis \
+    --manifest results/image_qualification/manifest.jsonl \
+    --scores results/image_qualification/scoring_sheet.csv \
+    --blinding-mapping results/image_qualification/blinded_row_mapping.json \
+    --unblinded-scores-output results/image_qualification/scores.internal.csv \
+    --output-json results/image_qualification/bakeoff-results.json \
+    --output-csv results/image_qualification/bakeoff-summary.csv
+```
+
+The model gate selects `design=bakeoff` and `conditioning=direct_text`. It reports each model, property, and model-property cell. Prompt-audit rows never increase Turbo bakeoff counts. `target_present` alone controls the 90% gate. Visibility and ambiguity remain secondary diagnostics.
+
 **Image benchmark** (renders SD3 images, scores CLIP/LPIPS/DINO/pixel metrics):
 
 ```bash

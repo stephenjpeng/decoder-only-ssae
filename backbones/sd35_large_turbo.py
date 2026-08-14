@@ -20,7 +20,9 @@ class Sd35LargeTurboBackbone(Backbone):
 
     stream_specs = [
         StreamSpec(name="seq", shape=(333, 4096), dtype="float16", h5_file="embds.h5"),
-        StreamSpec(name="pooled", shape=(2048,), dtype="float16", h5_file="embds_pooled.h5"),
+        StreamSpec(
+            name="pooled", shape=(2048,), dtype="float16", h5_file="embds_pooled.h5"
+        ),
     ]
 
     def __init__(self, device: str | torch.device = "cuda") -> None:
@@ -87,12 +89,45 @@ class Sd35LargeTurboBackbone(Backbone):
         if not self._loaded:
             self.load()
         prompt_embeds, _, pooled_prompt_embeds, _ = self.pipeline.encode_prompt(
-            prompt, prompt, prompt
+            prompt, prompt, prompt, max_sequence_length=256
         )
         return {
             "seq": prompt_embeds.squeeze(0),
             "pooled": pooled_prompt_embeds.squeeze(0),
         }
+
+    @torch.no_grad()
+    def generate(
+        self,
+        prompt: str,
+        output_path: str | Path,
+        seed: int | None = None,
+        num_inference_steps: int = 4,
+        guidance_scale: float = 0.0,
+        max_sequence_length: int = 256,
+        **_: Any,
+    ) -> Path:
+        """Generate from direct text with the native 256-token SD3.5 context."""
+        if not self._loaded:
+            self.load()
+        if max_sequence_length != 256:
+            raise ValueError("max_sequence_length must be 256 for SD3.5 qualification")
+
+        generator = None
+        if seed is not None:
+            generator = torch.Generator(device=self.pipeline.device).manual_seed(seed)
+        image = self.pipeline(
+            prompt=prompt,
+            prompt_2=prompt,
+            prompt_3=prompt,
+            num_inference_steps=num_inference_steps,
+            guidance_scale=guidance_scale,
+            max_sequence_length=max_sequence_length,
+            generator=generator,
+        ).images[0]
+        output_path = Path(output_path)
+        image.save(output_path)
+        return output_path
 
     @torch.no_grad()
     def decode(
@@ -102,11 +137,13 @@ class Sd35LargeTurboBackbone(Backbone):
         seed: int | None = None,
         num_inference_steps: int = 4,
         guidance_scale: float = 0.0,
-        max_sequence_length: int = 512,
+        max_sequence_length: int = 256,
         **_: Any,
     ) -> Path:
         if not self._loaded:
             self.load()
+        if max_sequence_length != 256:
+            raise ValueError("max_sequence_length must be 256 for SD3.5 streams")
 
         seq = streams["seq"]
         pooled = streams["pooled"]

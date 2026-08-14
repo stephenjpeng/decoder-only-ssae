@@ -61,8 +61,7 @@ class Backbone(ABC):
         return sum(s.flat_dim for s in self.stream_specs)
 
     @abstractmethod
-    def load(self) -> None:
-        ...
+    def load(self) -> None: ...
 
     def unload(self) -> None:
         self._loaded = False
@@ -74,6 +73,12 @@ class Backbone(ABC):
         Each tensor's per-sample shape must match its StreamSpec.shape; the
         leading batch dim is optional (extraction squeezes it before writing).
         """
+
+    def generate(
+        self, prompt: str, output_path: str | Path, **kwargs: Any
+    ) -> Any | None:
+        """Optional: generate directly from text without an encode/decode round trip."""
+        return None
 
     def decode(
         self, streams: StreamTensors, output_path: str | Path, **kwargs: Any

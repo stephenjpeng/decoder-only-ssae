@@ -12,6 +12,8 @@ from __future__ import annotations
 import csv
 import json
 import math
+import os
+import stat
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -38,8 +40,14 @@ class ManifestRow:
     context_id: str
     seed: int
     stage: str
-    image_path: str
+    image_path: str | None
     source_row_id: str | None
+    design: str = "bakeoff"
+    conditioning: str = "direct_text"
+    status: str = "success"
+    source_property_id: str | None = None
+    target_property_id: str | None = None
+    qualification_identity: str | None = None
 
 
 @dataclass
@@ -91,6 +99,121 @@ def parse_bool_strict(value: str | None, field_name: str, row_id: str) -> bool:
         f"invalid boolean for {field_name} in row {row_id}: "
         f"got '{value}', expected 'true' or 'false'"
     )
+
+
+def import_blinded_scores(
+    scoring_path: Path,
+    mapping_path: Path,
+    manifest_path: Path,
+    output_path: Path | None = None,
+) -> dict[str, ScoringRow]:
+    """Authorize unblinding and translate opaque score IDs to canonical row IDs."""
+    if not mapping_path.exists():
+        raise FileNotFoundError(f"blinding mapping not found: {mapping_path}")
+    if stat.S_IMODE(mapping_path.stat().st_mode) != 0o600:
+        raise ValueError("blinding mapping must have mode 0600 before unblinding")
+    with mapping_path.open("r", encoding="utf-8") as file:
+        mapping = json.load(file)
+    if mapping.get("version") != 2 or not isinstance(mapping.get("rows"), dict):
+        raise ValueError("blinding mapping has an unsupported format")
+
+    manifest = load_manifest_jsonl(manifest_path)
+    expected_rows = {
+        row.row_id: row
+        for row in manifest
+        if row.stage == "native"
+        and row.design == "bakeoff"
+        and row.conditioning == "direct_text"
+        and row.status == "success"
+    }
+    if set(mapping["rows"]) != set(expected_rows):
+        raise ValueError(
+            "blinding mapping does not match current successful bakeoff rows"
+        )
+
+    opaque_to_row: dict[str, str] = {}
+    for row_id, entry in mapping["rows"].items():
+        opaque_id = entry.get("blinded_row_id")
+        if not isinstance(opaque_id, str) or not opaque_id:
+            raise ValueError(f"mapping row {row_id} has no opaque ID")
+        if opaque_id in opaque_to_row:
+            raise ValueError(f"duplicate opaque ID in mapping: {opaque_id}")
+        mapped_identity = entry.get("qualification_identity")
+        current_identity = expected_rows[row_id].qualification_identity
+        if not current_identity or mapped_identity != current_identity:
+            raise ValueError(
+                f"blinding mapping identity does not match current manifest row {row_id}"
+            )
+        opaque_to_row[opaque_id] = row_id
+
+    if not scoring_path.exists():
+        raise FileNotFoundError(f"scoring CSV not found: {scoring_path}")
+    scores: dict[str, ScoringRow] = {}
+    with scoring_path.open("r", encoding="utf-8", newline="") as file:
+        reader = csv.DictReader(file)
+        required = {
+            "blinded_row_id",
+            "target_present",
+            "target_visible",
+            "prompt_ambiguous",
+        }
+        if not required.issubset(reader.fieldnames or []):
+            raise ValueError("blinded scoring CSV is missing required score columns")
+        for line_num, row in enumerate(reader, 2):
+            opaque_id = (row.get("blinded_row_id") or "").strip()
+            if opaque_id not in opaque_to_row:
+                raise ValueError(
+                    f"blinded scoring row {line_num} has an unknown opaque ID: {opaque_id}"
+                )
+            row_id = opaque_to_row[opaque_id]
+            if row_id in scores:
+                raise ValueError(f"duplicate blinded score for canonical row {row_id}")
+            scores[row_id] = ScoringRow(
+                row_id=row_id,
+                target_present=parse_bool_strict(
+                    row.get("target_present"), "target_present", opaque_id
+                ),
+                target_visible=parse_bool_strict(
+                    row.get("target_visible"), "target_visible", opaque_id
+                ),
+                prompt_ambiguous=parse_bool_strict(
+                    row.get("prompt_ambiguous"), "prompt_ambiguous", opaque_id
+                ),
+                notes=(row.get("notes") or "").strip(),
+            )
+    missing = set(mapping["rows"]) - set(scores)
+    if missing:
+        raise ValueError(
+            f"blinded scoring CSV is missing {len(missing)} successful row(s)"
+        )
+
+    if output_path is not None:
+        descriptor = os.open(output_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        os.fchmod(descriptor, 0o600)
+        with os.fdopen(descriptor, "w", encoding="utf-8", newline="") as file:
+            writer = csv.writer(file)
+            writer.writerow(
+                [
+                    "row_id",
+                    "target_present",
+                    "target_visible",
+                    "prompt_ambiguous",
+                    "notes",
+                ]
+            )
+            for row_id in sorted(scores):
+                score = scores[row_id]
+                writer.writerow(
+                    [
+                        row_id,
+                        str(score.target_present).lower(),
+                        str(score.target_visible).lower(),
+                        str(score.prompt_ambiguous).lower(),
+                        score.notes,
+                    ]
+                )
+        output_path.chmod(0o600)
+    return scores
 
 
 def load_scoring_csv(path: Path) -> dict[str, ScoringRow]:
@@ -184,7 +307,6 @@ def load_manifest_jsonl(path: Path) -> list[ManifestRow]:
         "property_id",
         "context_id",
         "stage",
-        "image_path",
     }
     required = string_fields | {"seed"}
 
@@ -220,6 +342,32 @@ def load_manifest_jsonl(path: Path) -> list[ManifestRow]:
                 raise ValueError(
                     f"manifest line {line_num} has unsupported stage: {obj['stage']}"
                 )
+            status = obj.get("status", "success")
+            if status not in {"success", "error"}:
+                raise ValueError(
+                    f"manifest line {line_num} has unsupported status: {status}"
+                )
+            image_path = obj.get("image_path")
+            if status == "success" and (
+                not isinstance(image_path, str) or not image_path.strip()
+            ):
+                raise ValueError(
+                    f"manifest line {line_num} successful row needs a nonblank image_path"
+                )
+            if status == "error" and image_path not in {None, ""}:
+                raise ValueError(
+                    f"manifest line {line_num} failed row image_path must be blank"
+                )
+            design = obj.get("design", "bakeoff")
+            conditioning = obj.get("conditioning", "direct_text")
+            if design not in {"audit", "bakeoff"}:
+                raise ValueError(
+                    f"manifest line {line_num} has unsupported design: {design}"
+                )
+            if not isinstance(conditioning, str) or not conditioning.strip():
+                raise ValueError(
+                    f"manifest line {line_num} conditioning must be a nonblank string"
+                )
 
             source_row_id = obj.get("source_row_id")
             if source_row_id is not None and (
@@ -243,10 +391,18 @@ def load_manifest_jsonl(path: Path) -> list[ManifestRow]:
                     context_id=obj["context_id"].strip(),
                     seed=obj["seed"],
                     stage=obj["stage"],
-                    image_path=obj["image_path"].strip(),
+                    image_path=image_path.strip()
+                    if isinstance(image_path, str)
+                    else None,
                     source_row_id=(
                         source_row_id.strip() if source_row_id is not None else None
                     ),
+                    design=design,
+                    conditioning=conditioning.strip(),
+                    status=status,
+                    source_property_id=obj.get("source_property_id"),
+                    target_property_id=obj.get("target_property_id"),
+                    qualification_identity=obj.get("qualification_identity"),
                 )
             )
 
@@ -319,11 +475,12 @@ def calculate_validity(
     n_valid = 0
 
     for row in manifest:
+        # render failures remain in the denominator and count as invalid
+        if row.status == "error":
+            continue
         if row.row_id not in scores:
             raise ValueError(f"manifest row {row.row_id} has no corresponding score")
-
-        score = scores[row.row_id]
-        if score.target_present:
+        if scores[row.row_id].target_present:
             n_valid += 1
 
     rate = n_valid / n_total if n_total > 0 else 0.0
@@ -423,12 +580,9 @@ def calculate_eligibility(
             raise ValueError(f"edit row {row.row_id} has no source_row_id")
         if row.source_row_id == row.row_id:
             raise ValueError(f"edit row {row.row_id} cannot reference itself")
+        # a failed source render has no human score and is conservatively ineligible
         if row.source_row_id not in scores:
-            raise ValueError(
-                f"edit row {row.row_id} references source without a score: "
-                f"{row.source_row_id}"
-            )
-
+            continue
         source_score = scores[row.source_row_id]
         if source_score.target_present:
             n_eligible += 1
@@ -446,122 +600,152 @@ def analyze_image_validity(
     manifest_path: Path,
     scores_path: Path,
     gate_threshold: float = 0.90,
+    blinding_mapping_path: Path | None = None,
+    unblinded_scores_output: Path | None = None,
 ) -> dict[str, Any]:
+    """Analyze bakeoff validity after optional authorized unblinding.
+
+    The 90% gate uses target presence only. Visibility and ambiguity are
+    secondary diagnostics and do not change the gate decision.
     """
-    Run full validity analysis and return structured results.
-
-    Args:
-        manifest_path: path to manifest JSONL
-        scores_path: path to scoring CSV
-        gate_threshold: minimum observed rate to pass native gate
-
-    Returns:
-        dictionary with overall, per_model, per_property stats,
-        plus separate ambiguity and visibility reports
-
-    Raises:
-        ValueError: if score CSV contains rows not in the manifest
-    """
-    scores = load_scoring_csv(scores_path)
     manifest = load_manifest_jsonl(manifest_path)
+    manifest_by_id = {row.row_id: row for row in manifest}
+    native_rows = [row for row in manifest if row.stage == "native"]
+    edit_rows = [row for row in manifest if row.stage == "edit"]
+    bakeoff_rows = [
+        row
+        for row in native_rows
+        if row.design == "bakeoff" and row.conditioning == "direct_text"
+    ]
+    if blinding_mapping_path is None:
+        scores = load_scoring_csv(scores_path)
+        expected_score_ids = {row.row_id for row in manifest if row.status == "success"}
+    else:
+        scores = import_blinded_scores(
+            scores_path,
+            blinding_mapping_path,
+            manifest_path,
+            unblinded_scores_output,
+        )
+        expected_score_ids = {
+            row.row_id for row in bakeoff_rows if row.status == "success"
+        }
+    score_ids = set(scores)
 
-    # validate score coverage: all manifest rows must have scores, no extra scores
-    manifest_ids = {r.row_id for r in manifest}
-    score_ids = set(scores.keys())
-
-    missing_scores = manifest_ids - score_ids
+    missing_scores = expected_score_ids - score_ids
     if missing_scores:
         sample = sorted(missing_scores)[:5]
         raise ValueError(
-            f"manifest contains {len(missing_scores)} row(s) without scores: "
+            f"manifest contains {len(missing_scores)} successful row(s) without scores: "
             f"{sample}{' ...' if len(missing_scores) > 5 else ''}"
         )
-
-    unknown_scores = score_ids - manifest_ids
+    unknown_scores = score_ids - expected_score_ids
     if unknown_scores:
         sample = sorted(unknown_scores)[:5]
         raise ValueError(
-            f"scoring CSV contains {len(unknown_scores)} row(s) not in manifest: "
-            f"{sample}{' ...' if len(unknown_scores) > 5 else ''}"
+            f"scoring CSV contains {len(unknown_scores)} row(s) not in manifest "
+            f"successes: {sample}{' ...' if len(unknown_scores) > 5 else ''}"
         )
 
-    # only native rows contribute to the validity gate
-    native_rows = [r for r in manifest if r.stage == "native"]
-    edit_rows = [r for r in manifest if r.stage == "edit"]
-
-    # corrupt source joins must not appear as ordinary ineligible attempts
-    native_ids = {row.row_id for row in native_rows}
     for row in edit_rows:
         if not row.source_row_id:
             raise ValueError(f"edit row {row.row_id} has no source_row_id")
-        if row.source_row_id not in native_ids:
+        source = manifest_by_id.get(row.source_row_id)
+        if source is None or source.stage != "native":
             raise ValueError(
                 f"edit row {row.row_id} source_row_id must reference a native row: "
                 f"{row.source_row_id}"
             )
+        for field_name in ("model_backbone", "context_id", "seed"):
+            if getattr(row, field_name) != getattr(source, field_name):
+                raise ValueError(
+                    f"edit row {row.row_id} must match source {field_name}"
+                )
+        if (
+            row.source_property_id is not None
+            and row.source_property_id != source.property_id
+        ):
+            raise ValueError(
+                f"edit row {row.row_id} source_property_id does not match source"
+            )
+        if (
+            row.target_property_id is not None
+            and row.target_property_id != row.property_id
+        ):
+            raise ValueError(
+                f"edit row {row.row_id} target_property_id does not match target"
+            )
 
-    # native validity (for gate decision)
-    overall = calculate_validity(native_rows, scores, gate_threshold)
+    # audit rows diagnose prompt wording but never inflate candidate bakeoff counts
+    overall = calculate_validity(bakeoff_rows, scores, gate_threshold)
+    per_model = calculate_per_model_validity(bakeoff_rows, scores, gate_threshold)
+    per_property = calculate_per_property_validity(bakeoff_rows, scores, gate_threshold)
+    per_model_property: dict[str, dict[str, ValidityStats]] = {}
+    for model in sorted({row.model_backbone for row in bakeoff_rows}):
+        model_rows = [row for row in bakeoff_rows if row.model_backbone == model]
+        per_model_property[model] = calculate_per_property_validity(
+            model_rows, scores, gate_threshold
+        )
 
-    # per-model validity (native only)
-    per_model = calculate_per_model_validity(native_rows, scores, gate_threshold)
-
-    # per-property validity (native only)
-    per_property = calculate_per_property_validity(native_rows, scores, gate_threshold)
-
-    eligibility = None
-    if edit_rows:
-        eligibility = calculate_eligibility(edit_rows, scores)
-
-    # ambiguity and visibility counts (across all manifest rows)
-    n_ambiguous = sum(1 for r in manifest if scores[r.row_id].prompt_ambiguous)
-    n_present_all = sum(1 for r in manifest if scores[r.row_id].target_present)
+    eligibility = calculate_eligibility(edit_rows, scores) if edit_rows else None
+    scored_rows = [manifest_by_id[row_id] for row_id in scores]
+    n_ambiguous = sum(scores[row.row_id].prompt_ambiguous for row in scored_rows)
+    n_present = sum(scores[row.row_id].target_present for row in scored_rows)
     n_invisible = sum(
-        1
-        for r in manifest
-        if scores[r.row_id].target_present and not scores[r.row_id].target_visible
+        scores[row.row_id].target_present and not scores[row.row_id].target_visible
+        for row in scored_rows
     )
 
+    def stats_dict(stats: ValidityStats) -> dict[str, Any]:
+        return {
+            "n_total": stats.n_total,
+            "n_valid": stats.n_valid,
+            "rate": stats.rate,
+            "ci_lower": stats.ci_lower,
+            "ci_upper": stats.ci_upper,
+            "passes_gate": stats.passes_gate,
+        }
+
+    failures = [row for row in manifest if row.status == "error"]
+    bakeoff_failures = [row for row in bakeoff_rows if row.status == "error"]
     return {
-        "overall": {
-            "n_total": overall.n_total,
-            "n_valid": overall.n_valid,
-            "rate": overall.rate,
-            "ci_lower": overall.ci_lower,
-            "ci_upper": overall.ci_upper,
-            "passes_gate": overall.passes_gate,
+        "gate_contract": {
+            "design": "bakeoff",
+            "conditioning": "direct_text",
+            "criterion": "target_present",
+            "threshold": gate_threshold,
+            "secondary_diagnostics": ["target_visible", "prompt_ambiguous"],
         },
-        "per_model": {
-            model: {
-                "n_total": stats.n_total,
-                "n_valid": stats.n_valid,
-                "rate": stats.rate,
-                "ci_lower": stats.ci_lower,
-                "ci_upper": stats.ci_upper,
-                "passes_gate": stats.passes_gate,
-            }
-            for model, stats in per_model.items()
-        },
+        "overall": stats_dict(overall),
+        "per_model": {model: stats_dict(stats) for model, stats in per_model.items()},
         "per_property": {
-            prop: {
-                "n_total": stats.n_total,
-                "n_valid": stats.n_valid,
-                "rate": stats.rate,
-                "ci_lower": stats.ci_lower,
-                "ci_upper": stats.ci_upper,
-                "passes_gate": stats.passes_gate,
-            }
-            for prop, stats in per_property.items()
+            prop: stats_dict(stats) for prop, stats in per_property.items()
+        },
+        "per_model_property": {
+            model: {prop: stats_dict(stats) for prop, stats in properties.items()}
+            for model, properties in per_model_property.items()
+        },
+        "render_failures": {
+            "n_total": len(failures),
+            "n_bakeoff": len(bakeoff_failures),
+            "by_model": {
+                model: sum(row.model_backbone == model for row in bakeoff_failures)
+                for model in sorted({row.model_backbone for row in bakeoff_rows})
+            },
+            "by_property": {
+                prop: sum(row.property_id == prop for row in bakeoff_failures)
+                for prop in sorted({row.property_id for row in bakeoff_rows})
+            },
         },
         "ambiguity": {
-            "n_total": len(manifest),
+            "n_total": len(scored_rows),
             "n_ambiguous": n_ambiguous,
-            "rate": n_ambiguous / len(manifest) if manifest else 0.0,
+            "rate": n_ambiguous / len(scored_rows) if scored_rows else 0.0,
         },
         "visibility": {
-            "n_total": n_present_all,
+            "n_total": n_present,
             "n_invisible": n_invisible,
-            "rate": n_invisible / n_present_all if n_present_all > 0 else 0.0,
+            "rate": n_invisible / n_present if n_present else 0.0,
         },
         "eligibility": (
             {
@@ -614,6 +798,22 @@ def write_summary_csv(results: dict[str, Any], output_path: Path) -> None:
                 "passes_gate": str(stats["passes_gate"]),
             }
         )
+
+    # model-property cells prevent pooled properties from hiding a weak arm
+    for model, properties in results.get("per_model_property", {}).items():
+        for prop, stats in properties.items():
+            rows.append(
+                {
+                    "group_type": "model_property",
+                    "group_id": f"{model}:{prop}",
+                    "n_total": stats["n_total"],
+                    "n_valid": stats["n_valid"],
+                    "rate": f"{stats['rate']:.4f}",
+                    "ci_lower": f"{stats['ci_lower']:.4f}",
+                    "ci_upper": f"{stats['ci_upper']:.4f}",
+                    "passes_gate": str(stats["passes_gate"]),
+                }
+            )
 
     # per-property
     for prop, stats in results["per_property"].items():
