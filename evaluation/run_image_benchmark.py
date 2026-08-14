@@ -14,12 +14,12 @@ Rendering ladder (see ``evaluation/method_labels.py``):
   baseline.
 * ``prompt_only`` — **Exact full-embedding round-trip**. The prompt is encoded and the
   full text-encoder output (333x4096 + 2048 pooled) is immediately decoded. Despite the
-  key name, this is NOT true native generation. The key is kept for cache compatibility;
-  the label clarifies the computation.
+  key name, this is NOT true native generation. The key remains for method-name
+  compatibility; the label clarifies the computation.
 * ``prompt_modified_packed`` — **Prompt modification (packed top-k)**. The prompt is
-  encoded but only the SSAE's top-k coordinates survive; the rest are filled with the
-  training mean, matching how every embedding-space method is packed. Use for controlled-
-  subspace analysis. Never average or conflate these three paths.
+  encoded but only the SSAE's top-k coordinates survive; other coordinates use the active
+  fill policy. An untruncated run applies no fill. Use for controlled-subspace analysis.
+  Never average or conflate these three paths.
 
 Locality tests (both optional; independently enable-able in the same run). A single
 attribute is randomly sampled per holdout row (seeded by ``base_seed + idx`` so the pick
@@ -27,14 +27,15 @@ is reproducible), shared between the two tests when both are on:
 
 * ``--locality_drop_one_attr``: renders a same-seed **pre-edit** image per method with
   the chosen attribute's mask bit zeroed (or its phrase dropped from the prompt for
-  ``native_prompt`` and ``prompt_only``). Reports pixel MSE/SSIM between the pre- and
-  post-edit renders as an "edit surgical-ness" proxy under attribute removal.
+  ``native_prompt``, ``prompt_only``, and ``prompt_modified_packed``). Reports pixel
+  MSE/SSIM between the pre- and post-edit renders as an "edit surgical-ness" proxy under
+  attribute removal.
 * ``--locality_swap_one_attr``: renders a same-seed **swap** image per method with the
   chosen attribute's mask bit flipped to a different property in the same category (e.g.
   blond -> brunette), or the corresponding phrase substituted in the prompt for
-  ``native_prompt`` and ``prompt_only``. Reports pixel MSE/SSIM between the swap and
-  normal renders (surgical-ness under a value swap) and CLIP alignment of the swap image
-  against the swapped prompt.
+  all three prompt paths. Reports pixel MSE/SSIM between the swap and normal renders
+  (surgical-ness under a value swap) and CLIP alignment of the swap image against the
+  swapped prompt.
 
 Writes ``per_sample.csv``, ``summary.json``, and PNGs under ``<output>/images/<method>/``
 (post-edit), ``<output>/images_pre_edit/<method>/`` (only with ``--locality_drop_one_attr``),
@@ -59,7 +60,12 @@ from baselines.run_baselines import (
     predict_linear,
     predict_mean_arithmetic,
 )
-from evaluation.baseline_cache import BASELINE_METHODS, BaselineCache, load_or_create
+from evaluation.baseline_cache import (
+    BASELINE_METHODS,
+    BaselineCache,
+    load_or_create,
+    ordered_indices_fingerprint,
+)
 from evaluation.bootstrap import bootstrap_mean_ci
 from evaluation.clip_scorer import CLIPScorer
 from evaluation.method_labels import (
@@ -154,12 +160,64 @@ def _category_marginal_mask(dataset, mask_row: torch.Tensor, target_pid: int) ->
     return out
 
 
-def _packer_metadata(fill_policy: str, drop_operator: str) -> dict:
+def _packer_metadata(
+    fill_policy: str,
+    drop_operator: str,
+    truncate_embds_topk: int | None,
+    truncate_embds_topk_indices_fingerprint: dict,
+) -> dict:
     """Cache/run identity for policy choices that change rendered pixels"""
     meta = dict(packer_fingerprint())
-    meta["fill_policy"] = fill_policy
-    meta["drop_operator"] = drop_operator
+    meta.update(
+        {
+            "conditioning_contract_version": 2,
+            "fill_policy": fill_policy,
+            "drop_operator": drop_operator,
+            "truncate_embds_topk": truncate_embds_topk,
+            "truncate_embds_topk_indices_fingerprint": (
+                truncate_embds_topk_indices_fingerprint
+            ),
+        }
+    )
     return meta
+
+
+def _shared_baseline_cache_enabled(
+    *, use_baseline_cache: bool, simulated: bool
+) -> bool:
+    """Use shared storage only for real renders"""
+    return use_baseline_cache and not simulated
+
+
+def _populated_cache_methods(cache: BaselineCache) -> tuple[str, ...]:
+    """Return every method represented by a row in the shared cache"""
+    return _sort_methods(method for method, _sample_idx in cache.rows)
+
+
+def _generate_prompt_conditioned_image(
+    gen: ImageGenerator,
+    method: str,
+    prompt: str,
+    output_path: Path,
+    seed: int,
+) -> None:
+    """Dispatch one direct-text or exact-round-trip benchmark render"""
+    if method == "native_prompt":
+        gen.generate_image_from_prompt_native(
+            prompt,
+            output_path,
+            use_negative_prompts=False,
+            seed=seed,
+        )
+    elif method == "prompt_only":
+        gen.generate_image_from_prompt(
+            prompt,
+            output_path,
+            use_negative_prompts=False,
+            seed=seed,
+        )
+    else:
+        raise ValueError(f"unsupported prompt-conditioned method {method!r}")
 
 
 def _write_placeholder_png(path: Path) -> None:
@@ -180,7 +238,7 @@ def _encode_and_pack_prompt(
     seed: int,
     template: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """``prompt_modified_packed`` conditioning: re-encode, keep top-k, train-mean the rest.
+    """Re-encode a prompt, keep top-k, and use the active fill template for the rest.
 
     Distinct from ``prompt_only``, which hands the text encoder's full output straight to
     the pipeline. Here the prompt is pushed through the same information bottleneck as the
@@ -302,6 +360,23 @@ def run_image_benchmark(
     holdout_ds = h5_dataset_for_folder(checkpoint_dir, holdout_folder)
     decoder.eval()
 
+    topk_indices = holdout_ds.indices_truncate_embds_topk
+    active_topk = int(len(topk_indices)) if topk_indices is not None else None
+    topk_indices_fingerprint = ordered_indices_fingerprint(topk_indices)
+    packer_meta = _packer_metadata(
+        fill_policy,
+        drop_operator,
+        active_topk,
+        topk_indices_fingerprint,
+    )
+    render_mode = "simulated" if simulated else "real"
+    method_conditioning = conditioning_map(
+        methods,
+        fill_policy=fill_policy,
+        truncate_embds_topk=active_topk,
+        t5_max_sequence_length=ImageGenerator.MAX_SEQUENCE_LENGTH,
+    )
+
     model_name = tp["model_name"]
     n_repeat = int(tp["n_repeat"])
     dev_dec = torch.device(ssae_device)
@@ -324,7 +399,10 @@ def run_image_benchmark(
 
     cache: BaselineCache | None = None
     cache_methods: set[str] = set()
-    if use_baseline_cache:
+    # placeholders must never share identity or storage with real SD3 renders
+    if _shared_baseline_cache_enabled(
+        use_baseline_cache=use_baseline_cache, simulated=simulated
+    ):
         cache_root = Path(baseline_cache_root) if baseline_cache_root else DEFAULT_BASELINE_CACHE_ROOT
         cache = load_or_create(
             cache_root,
@@ -334,7 +412,8 @@ def run_image_benchmark(
             base_seed=base_seed,
             ridge_lambda=ridge_lambda,
             sd3_fingerprint=ImageGenerator.fingerprint(),
-            packer_fingerprint=_packer_metadata(fill_policy, drop_operator),
+            truncate_embds_topk_indices=topk_indices,
+            packer_fingerprint=packer_meta,
         )
         cache_methods = {m for m in methods if m in BASELINE_METHODS}
         loaded_fits = cache.load_fits()
@@ -584,13 +663,9 @@ def run_image_benchmark(
                     raise ValueError(f"Unknown method {method}")
 
                 if not simulated:
-                    if method == "native_prompt":
-                        gen.generate_image_from_prompt_native(
-                            prompt_text, out_path, use_negative_prompts=False, seed=seed_i
-                        )
-                    elif method == "prompt_only":
-                        gen.generate_image_from_prompt(
-                            prompt_text, out_path, use_negative_prompts=False, seed=seed_i
+                    if method in {"native_prompt", "prompt_only"}:
+                        _generate_prompt_conditioned_image(
+                            gen, method, prompt_text, out_path, seed_i
                         )
                     elif method == "linear_probe_direction":
                         pass  # hard-linked above; no diffusion call needed
@@ -743,13 +818,9 @@ def run_image_benchmark(
                         raise ValueError(f"Unknown method {method}")
 
                     if not simulated:
-                        if method == "native_prompt":
-                            gen.generate_image_from_prompt_native(
-                                residual_prompt, pre_path, use_negative_prompts=False, seed=seed_i
-                            )
-                        elif method == "prompt_only":
-                            gen.generate_image_from_prompt(
-                                residual_prompt, pre_path, use_negative_prompts=False, seed=seed_i
+                        if method in {"native_prompt", "prompt_only"}:
+                            _generate_prompt_conditioned_image(
+                                gen, method, residual_prompt, pre_path, seed_i
                             )
                         else:
                             pe_pre = pe_pre.to(sd_device)
@@ -809,13 +880,9 @@ def run_image_benchmark(
                         raise ValueError(f"Unknown method {method}")
 
                     if not simulated:
-                        if method == "native_prompt":
-                            gen.generate_image_from_prompt_native(
-                                swapped_prompt, swap_path, use_negative_prompts=False, seed=seed_i
-                            )
-                        elif method == "prompt_only":
-                            gen.generate_image_from_prompt(
-                                swapped_prompt, swap_path, use_negative_prompts=False, seed=seed_i
+                        if method in {"native_prompt", "prompt_only"}:
+                            _generate_prompt_conditioned_image(
+                                gen, method, swapped_prompt, swap_path, seed_i
                             )
                         else:
                             pe_sw = pe_sw.to(sd_device)
@@ -864,7 +931,6 @@ def run_image_benchmark(
         n_bootstrap=n_bootstrap,
         base_seed=base_seed,
     )
-    packer_meta = _packer_metadata(fill_policy, drop_operator)
     summary["ridge_lambda"] = ridge_lambda
     summary["methods"] = list(local_methods)
     summary["fill_policy"] = fill_policy
@@ -886,28 +952,39 @@ def run_image_benchmark(
 
     if cache is not None:
         cache_method_list = [m for m in methods if m in cache_methods]
+        cache_populated_methods = list(_populated_cache_methods(cache))
         cache_rows = list(cache.rows.values())
         cache_summary = _aggregate_summary(
             cache_rows,
-            methods=cache_method_list,
+            methods=cache_populated_methods,
             clip_failure_threshold=clip_failure_threshold,
             n_bootstrap=n_bootstrap,
             base_seed=base_seed,
         )
         cache_summary["ridge_lambda"] = ridge_lambda
-        cache_summary["methods"] = list(cache_method_list)
+        cache_summary["methods"] = cache_populated_methods
         cache_summary["fill_policy"] = fill_policy
         cache_summary["drop_operator"] = drop_operator
         cache_summary["packer_fingerprint"] = packer_meta
         cache.write(
-            methods=cache_method_list,
+            methods=cache_populated_methods,
             summary=cache_summary,
             extra_manifest={
+                "render_mode": render_mode,
+                "method_conditioning": conditioning_map(
+                    cache_populated_methods,
+                    fill_policy=fill_policy,
+                    truncate_embds_topk=active_topk,
+                    t5_max_sequence_length=ImageGenerator.MAX_SEQUENCE_LENGTH,
+                ),
                 "locality_drop_populated": locality_drop_one_attr,
                 "locality_swap_populated": locality_swap_one_attr,
                 "n_samples": n,
                 "fill_policy": fill_policy,
                 "drop_operator": drop_operator,
+                "truncate_embds_topk": active_topk,
+                "truncate_embds_topk_indices_fingerprint": topk_indices_fingerprint,
+                "packer_fingerprint": packer_meta,
             },
         )
     else:
@@ -927,12 +1004,12 @@ def run_image_benchmark(
         "locality_drop_one_attr": locality_drop_one_attr,
         "locality_swap_one_attr": locality_swap_one_attr,
         "n_samples": n,
-        # AUG-01 acceptance criterion: native-vs-packed conditioning is explicit, per
-        # method, in every manifest — so no downstream table can silently place a native
-        # and a packed row in the same statistical comparison.
-        "method_conditioning": conditioning_map(methods),
+        "render_mode": render_mode,
+        # runtime fill and truncation are explicit so comparisons cannot mix contracts
+        "method_conditioning": method_conditioning,
         "packer_fingerprint": packer_meta,
-        "truncate_embds_topk": tp.get("truncate_embds_topk"),
+        "truncate_embds_topk": active_topk,
+        "truncate_embds_topk_indices_fingerprint": topk_indices_fingerprint,
         "fill_policy": fill_policy,
         "drop_operator": drop_operator,
         "target_property": target_property,
@@ -956,6 +1033,8 @@ def run_image_benchmark(
             "benchmark": manifest,
             "sd3_fingerprint": ImageGenerator.fingerprint(),
             "simulated": simulated,
+            "render_mode": render_mode,
+            "method_conditioning": method_conditioning,
             "max_samples": max_samples,
             "n_samples_scored": n,
             "clip_failure_threshold": clip_failure_threshold,
@@ -1152,8 +1231,8 @@ def main() -> None:
             + ", ".join(METHOD_ORDER)
             + ". Rendering ladder: 'native_prompt' passes text directly to the pipeline "
             "without encode_prompt (true native). 'prompt_only' encodes and immediately "
-            "decodes through the full embedding (exact round-trip, kept for cache "
-            "compatibility). 'prompt_modified_packed' re-encodes and packs to top-k "
+            "decodes through the full embedding (exact round-trip, key kept for method "
+            "name compatibility). 'prompt_modified_packed' re-encodes and packs to top-k "
             "(controlled subspace). Do not conflate or average them."
         ),
     )

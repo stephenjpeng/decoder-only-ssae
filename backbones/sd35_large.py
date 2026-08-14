@@ -49,9 +49,13 @@ class Sd35LargeBackbone(Backbone):
         )
 
     def load(self) -> None:
-        """Load the pipeline with CPU offload when CUDA is the target device."""
+        """Load the pipeline with CUDA model offload."""
         if self._loaded:
             return
+        if self.device.type != "cuda":
+            raise RuntimeError(
+                "sd35_large requires a CUDA device; CPU and MPS loading are unsupported"
+            )
 
         from diffusers import StableDiffusion3Pipeline
 
@@ -68,13 +72,10 @@ class Sd35LargeBackbone(Backbone):
         except AttributeError:
             pass
 
-        if self.device.type == "cuda":
-            # Diffusers moves one component at a time and returns it to CPU
-            # after use, rather than placing the full SD3.5 stack on the GPU
-            gpu_id = self.device.index if self.device.index is not None else 0
-            self.pipeline.enable_model_cpu_offload(gpu_id=gpu_id)
-        else:
-            self.pipeline = self.pipeline.to(self.device)
+        # Diffusers moves one component at a time and returns it to CPU
+        # after use, rather than placing the full SD3.5 stack on the GPU
+        gpu_id = self.device.index if self.device.index is not None else 0
+        self.pipeline.enable_model_cpu_offload(gpu_id=gpu_id)
 
         self._loaded = True
 

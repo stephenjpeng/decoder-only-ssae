@@ -29,7 +29,8 @@ class ImageGenerator:
     MODEL_ID = "stabilityai/stable-diffusion-3.5-large-turbo"
     NUM_INFERENCE_STEPS = 4
     GUIDANCE_SCALE = 0.0
-    MAX_SEQUENCE_LENGTH = 512
+    # 256 T5 tokens plus CLIP tokens produce the stored [333, 4096] contract
+    MAX_SEQUENCE_LENGTH = 256
 
     @classmethod
     def fingerprint(cls) -> dict:
@@ -292,7 +293,12 @@ class ImageGenerator:
         seed: int | None = None,
     ) -> tuple[torch.tensor, torch.tensor, torch.tensor, torch.tensor]:
         setup_seed(0 if seed is None else seed)
-        embds = self.pipeline.encode_prompt(prompt, prompt, prompt)
+        embds = self.pipeline.encode_prompt(
+            prompt=prompt,
+            prompt_2=prompt,
+            prompt_3=prompt,
+            max_sequence_length=self.MAX_SEQUENCE_LENGTH,
+        )
         (
             prompt_embeds,
             negative_prompt_embeds,

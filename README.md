@@ -309,22 +309,23 @@ Unified CLI: `python -m evaluation.cli <subcommand> ...` (see `evaluation/cli.py
 
 #### Baseline cache (image benchmark)
 
-`run_image_benchmark` caches the non-SSAE baselines (`gt_embed`, `mean_arithmetic`, `ridge_embed`, `prompt_only`, `prompt_modified_packed`) under `results/bench_baseline_cache/<dataset_id>/` and reuses them across runs. A run folder then holds only SSAE outputs plus a `manifest.json` pointing at the cache. The Streamlit viewer merges the two transparently.
+`run_image_benchmark` caches the non-SSAE baselines (`gt_embed`, `mean_arithmetic`, `ridge_embed`, `native_prompt`, `prompt_only`, `prompt_modified_packed`) under `results/bench_baseline_cache/<dataset_id>/` and reuses them across real-render runs. Simulated runs keep placeholders in the run folder and never read or write this shared cache. A real run folder holds SSAE outputs plus a `manifest.json` that points at the cache. The Streamlit viewer merges the two transparently.
 
-Dataset identity (`dataset_id`) is a short hash of: the holdout `prompts.json`, the training embeddings + mask, `--base_seed`, `--ridge_lambda`, the SD3.5 pipeline fingerprint (model id, steps, guidance, sequence length), and the packer fingerprint (`fill_policy` + `packer_version`; currently `train_mean_fill` / v2). Changing any of these creates a fresh cache directory; locality flags grow an existing cache in place.
+Dataset identity (`dataset_id`) is a short hash of the holdout `prompts.json`, the training embeddings and mask, `--base_seed`, `--ridge_lambda`, the SD3.5 pipeline fingerprint, the ordered active top-k coordinate fingerprint, the fill policy, and an explicit cache identity version. A render-contract change creates a fresh cache directory instead of reusing older pixels under new semantics. Locality flags grow an existing compatible cache in place. Cache manifests record `render_mode`, the ordered-index fingerprint, active truncation, fill policy, and per-method conditioning.
 
 **Fill policy for non-top-k dimensions.** `run_image_benchmark` fills the ~1.36M non-top-k coordinates of the SD3.5 conditioning tensor with the **training-set mean** (cached at `<train_folder>/full_embd_mean.pt`), not with the holdout row's true embedding. This avoids leaking ground truth through the coordinates the SSAE doesn't predict; every method sees the same template and the metrics reflect only the top-k prediction. `run_magnitude_sensitivity` now uses the same train-mean fill (it previously used oracle fill, which made its curves incomparable with the benchmark's rows — fatal for a joint efficacy/collateral Pareto plot); `--oracle_fill` restores the old behaviour for reproducing pre-fix artifacts. Inference notebooks that don't pass `template=` still get oracle fill. Any cache populated under one policy is invalidated by the packer fingerprint when the other runs.
 
-#### The two prompt-modification methods
+#### The three prompt-conditioning paths
 
 | Method key | Label used in reports and the paper | Conditioning |
 |---|---|---|
-| `prompt_only` | Prompt modification (native/full embedding) | full text-encoder output, nothing replaced |
-| `prompt_modified_packed` | Prompt modification (packed top-k) | same prompt + seed, only top-k coordinates kept, rest training-mean filled |
+| `native_prompt` | Native text generation | prompt text goes directly to the SD3.5 pipeline |
+| `prompt_only` | Exact full-embedding round-trip | the prompt is encoded, then the full encoder output is passed back unchanged |
+| `prompt_modified_packed` | Prompt modification (packed top-k) | the prompt is re-encoded; only active top-k coordinates remain and other coordinates use the selected fill policy |
 
-These are genuinely different computations. The native row is the deployment-realistic baseline; the packed row puts prompt modification under the same information restriction as the feature-editing methods, for controlled-subspace analysis. **Do not average them.** The `prompt_only` key is kept only for cache compatibility.
+`native_prompt` and `prompt_only` both use a T5 maximum sequence length of 256. This produces the stored `[1,333,4096]` sequence contract and isolates direct text from an exact encode/decode round-trip. The packed path tests prompt modification under the same information restriction as the feature-editing methods. Do not average these paths. The `prompt_only` key remains for method-name compatibility, but cache identity now changes when render semantics change.
 
-`prompt_modified_packed` is opt-in via `--methods`. Labels, colours and conditioning semantics are defined once in `evaluation/method_labels.py` and imported by the report builders. Every run manifest records per-method conditioning and the packer fingerprint. Smoke-test the semantics with `python scripts/smoke_prompt_baselines.py` (CPU, no GPU or real data needed).
+`prompt_modified_packed` is opt-in via `--methods`. Labels, colours and conditioning semantics are defined once in `evaluation/method_labels.py`. Every run and cache manifest records the runtime conditioning, fill policy, active top-k, and packer fingerprint. Smoke-test the three paths with `python scripts/smoke_prompt_baselines.py` (CPU, no GPU or real data needed).
 
 #### Run provenance
 

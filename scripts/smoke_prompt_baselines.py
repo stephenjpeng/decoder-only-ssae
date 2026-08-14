@@ -3,18 +3,16 @@
 Builds a throwaway SD3-shaped dataset with the ``fake_sd3`` backbone, trains a tiny
 decoder, then runs ``evaluation.run_image_benchmark --simulated`` twice:
 
-1. with the legacy method set, to prove existing caches stay readable and that the
-   legacy run still works;
-2. with ``native_prompt`` and ``prompt_modified_packed`` added, to check their
-   canonical metadata and prove the embedding variants use separate cache paths.
+1. with the exact round-trip prompt path;
+2. with the native and packed prompt paths added.
 
 Asserts the plan's acceptance criteria:
 
 * metadata distinguishes direct text, exact full-embedding round-trip, and packed top-k;
-* existing ``prompt_only`` caches remain readable (same ``dataset_id``, rows survive);
+* simulated placeholders never create or reuse the shared real-render cache;
 * exact round-trip and packed paths use the same prompt text and seed per tuple;
 * the manifest records canonical labels and the packer fingerprint;
-* a simulated run produces separate rows and directories for the embedding variants.
+* a simulated run produces separate rows and directories for all three prompt paths.
 
 Run from the repo root:
 
@@ -62,8 +60,10 @@ PROPERTIES = {
 }
 PROPERTIES_SAME = {k: False for k in PROPERTIES}
 
-LEGACY_METHODS = "gt_embed,ssae_compose,mean_arithmetic,ridge_embed,prompt_only"
-PACKED_METHODS = LEGACY_METHODS + ",native_prompt,prompt_modified_packed"
+ROUND_TRIP_METHODS = "gt_embed,ssae_compose,mean_arithmetic,ridge_embed,prompt_only"
+THREE_PROMPT_PATH_METHODS = (
+    ROUND_TRIP_METHODS + ",native_prompt,prompt_modified_packed"
+)
 
 
 def _fail(msg: str) -> None:
@@ -268,19 +268,22 @@ def check_conditioning_differs(ckpt: Path, holdout: Path) -> None:
 # --------------------------------------------------------------------------- assertions
 
 
-def check_acceptance(cache_root: Path, out_legacy: Path, out_packed: Path, legacy_id: str) -> None:
-    manifest = json.loads((out_packed / "manifest.json").read_text())
-    run_manifest = json.loads((out_packed / "run_manifest.json").read_text())
+def check_acceptance(
+    cache_root: Path, out_round_trip: Path, out_three_paths: Path
+) -> None:
+    manifest = json.loads((out_three_paths / "manifest.json").read_text())
+    run_manifest = json.loads((out_three_paths / "run_manifest.json").read_text())
 
-    # --- existing caches remain readable: same dataset_id before and after
-    if manifest["dataset_id"] != legacy_id:
-        _fail(
-            "adding prompt_modified_packed changed the cache dataset_id "
-            f"({legacy_id} -> {manifest['dataset_id']}); existing caches would be orphaned"
-        )
-    _ok(f"cache dataset_id unchanged by the new method ({legacy_id})")
+    # placeholders stay local, so they cannot satisfy or overwrite a real cache row
+    if manifest["dataset_id"] is not None or manifest["baseline_cache_dir"] is not None:
+        _fail("simulated benchmark unexpectedly attached to a shared baseline cache")
+    if cache_root.exists() and any(cache_root.iterdir()):
+        _fail(f"simulated benchmark wrote shared cache content under {cache_root}")
+    if manifest.get("render_mode") != "simulated":
+        _fail(f"unexpected render mode: {manifest.get('render_mode')!r}")
+    _ok("simulated placeholders bypass shared baseline cache storage")
 
-    # --- manifest records canonical conditioning, labels, and packer fingerprint
+    # runtime metadata records all three entry paths and the active packing contract
     cond = manifest.get("method_conditioning") or {}
     expected = {
         "native_prompt": ("direct_text", "Native text generation"),
@@ -294,14 +297,16 @@ def check_acceptance(cache_root: Path, out_legacy: Path, out_packed: Path, legac
                 f"unexpected {method} conditioning/label: {actual!r}; "
                 f"expected {(conditioning, label)!r}"
             )
-    if not manifest.get("packer_fingerprint"):
-        _fail("manifest is missing packer_fingerprint")
-    _ok(
-        "manifest distinguishes direct text, exact full-embedding round-trip, and "
-        f"packed top-k ({manifest['packer_fingerprint']})"
-    )
+    packed_meta = cond["prompt_modified_packed"]
+    if packed_meta.get("fill_policy") != "train_mean":
+        _fail(f"packed path has wrong runtime fill metadata: {packed_meta!r}")
+    if packed_meta.get("truncate_embds_topk") != TOPK:
+        _fail(f"packed path has wrong runtime top-k metadata: {packed_meta!r}")
+    for method in ("native_prompt", "prompt_only", "prompt_modified_packed"):
+        if cond[method].get("t5_max_sequence_length") != 256:
+            _fail(f"{method} does not record the 256-token T5 contract")
+    _ok("manifest distinguishes all three prompt paths and their runtime contract")
 
-    # --- AUG-02 provenance rides along
     for key in ("git", "config", "datasets", "packer_fingerprint", "model_fingerprint"):
         if key not in run_manifest:
             _fail(f"run_manifest.json missing '{key}'")
@@ -309,69 +314,40 @@ def check_acceptance(cache_root: Path, out_legacy: Path, out_packed: Path, legac
         _fail("run_manifest.json has no git SHA")
     if not run_manifest["model_fingerprint"].get("model_pt_sha256"):
         _fail("run_manifest.json has no checkpoint hash")
-    _ok(
-        f"run_manifest.json carries git {run_manifest['git']['sha'][:8]}"
-        f"{' (dirty)' if run_manifest['git']['dirty'] else ''}, "
-        f"config_hash {str(run_manifest['config_hash'])[:8]}, checkpoint hash"
-    )
+    _ok("run_manifest.json carries dataset, packer, model, and git provenance")
 
-    # --- separate directories
-    cache_dir = cache_root / legacy_id
+    # all three prompt paths get distinct local images and rows in simulated mode
     for variant in ("images", "images_pre_edit", "images_swapped"):
-        round_trip_dir = cache_dir / variant / "prompt_only"
-        packed_dir = cache_dir / variant / "prompt_modified_packed"
-        if not round_trip_dir.is_dir():
-            _fail(f"missing {round_trip_dir}")
-        if not packed_dir.is_dir():
-            _fail(f"missing {packed_dir}")
-        n_round_trip = len(list(round_trip_dir.glob("*.png")))
-        n_packed = len(list(packed_dir.glob("*.png")))
-        if n_round_trip == 0 or n_packed == 0:
-            _fail(f"{variant}: round_trip={n_round_trip} packed={n_packed} images")
-        _ok(
-            f"{variant}/: prompt_only={n_round_trip} png, "
-            f"prompt_modified_packed={n_packed} png"
-        )
+        counts = {}
+        for method in ("native_prompt", "prompt_only", "prompt_modified_packed"):
+            method_dir = out_three_paths / variant / method
+            counts[method] = len(list(method_dir.glob("*.png")))
+            if counts[method] == 0:
+                _fail(f"missing simulated images under {method_dir}")
+        _ok(f"{variant}/ contains all three prompt paths: {counts}")
 
-    # --- separate rows, same prompt text per tuple
-    rows = read_rows(cache_dir / "per_sample.csv")
-    round_trip = {
-        int(r["sample_idx"]): r for r in rows if r["method"] == "prompt_only"
+    rows = read_rows(out_three_paths / "per_sample.csv")
+    by_method = {
+        method: {
+            int(row["sample_idx"]): row
+            for row in rows
+            if row["method"] == method
+        }
+        for method in ("native_prompt", "prompt_only", "prompt_modified_packed")
     }
-    packed = {
-        int(r["sample_idx"]): r for r in rows if r["method"] == "prompt_modified_packed"
-    }
-    if not packed:
-        _fail("no prompt_modified_packed rows in the cache CSV")
-    if set(round_trip) != set(packed):
-        _fail(
-            f"row index mismatch: round-trip {sorted(round_trip)} vs "
-            f"packed {sorted(packed)}"
-        )
-    _ok(f"separate rows for both embedding variants over {len(packed)} tuples")
+    indices = set(by_method["native_prompt"])
+    if not indices or any(set(rows_by_idx) != indices for rows_by_idx in by_method.values()):
+        _fail("prompt-path rows do not cover the same sample indices")
+    for idx in sorted(indices):
+        prompts = {by_method[method][idx]["prompt"] for method in by_method}
+        if len(prompts) != 1:
+            _fail(f"tuple {idx} uses different prompt text across entry paths")
+    _ok(f"all three prompt paths share prompt text over {len(indices)} tuples")
 
-    for i in sorted(packed):
-        for field in ("prompt", "swapped_prompt", "edit_attribute", "swap_target_attribute"):
-            if round_trip[i][field] != packed[i][field]:
-                _fail(
-                    f"tuple {i}: '{field}' differs between round-trip "
-                    f"({round_trip[i][field]!r}) and packed ({packed[i][field]!r})"
-                )
-    _ok("round-trip and packed use identical prompt text per tuple")
-
-    # Diffusion seed is a pure function of (base_seed, idx) in run_image_benchmark, and
-    # both methods are rendered inside the same idx loop, so seed parity is structural.
-    # Record it explicitly anyway so the criterion is visibly checked.
-    from evaluation.run_image_benchmark import _sample_seed
-
-    seeds = {i: _sample_seed(BASE_SEED, i) for i in sorted(packed)}
-    _ok(f"shared per-tuple diffusion seeds: {seeds}")
-
-    # --- legacy run still fine
-    legacy_manifest = json.loads((out_legacy / "manifest.json").read_text())
-    if "prompt_modified_packed" in legacy_manifest["methods"]:
-        _fail("legacy run unexpectedly included the packed method")
-    _ok("legacy method set runs unchanged")
+    round_trip_manifest = json.loads((out_round_trip / "manifest.json").read_text())
+    if "native_prompt" in round_trip_manifest["methods"]:
+        _fail("round-trip-only run unexpectedly included the native path")
+    _ok("round-trip-only method set runs without shared cache state")
 
 
 def main() -> None:
@@ -409,19 +385,30 @@ def main() -> None:
         )
 
         cache_root = root / "cache"
-        out_legacy = root / "bench_legacy"
-        out_packed = root / "bench_packed"
+        out_round_trip = root / "bench_round_trip"
+        out_three_paths = root / "bench_three_prompt_paths"
 
-        print("\n=== pass 1: legacy method set ===")
-        run_bench(ckpt, holdout_folder, out_legacy, cache_root, LEGACY_METHODS)
-        legacy_id = json.loads((out_legacy / "manifest.json").read_text())["dataset_id"]
+        print("\n=== pass 1: exact round-trip prompt path ===")
+        run_bench(
+            ckpt,
+            holdout_folder,
+            out_round_trip,
+            cache_root,
+            ROUND_TRIP_METHODS,
+        )
 
-        print("\n=== pass 2: + native_prompt and packed (must reuse the same cache) ===")
-        run_bench(ckpt, holdout_folder, out_packed, cache_root, PACKED_METHODS)
+        print("\n=== pass 2: native, exact round-trip, and packed prompt paths ===")
+        run_bench(
+            ckpt,
+            holdout_folder,
+            out_three_paths,
+            cache_root,
+            THREE_PROMPT_PATH_METHODS,
+        )
 
         print("\n=== acceptance criteria ===")
         check_conditioning_differs(ckpt, holdout_folder)
-        check_acceptance(cache_root, out_legacy, out_packed, legacy_id)
+        check_acceptance(cache_root, out_round_trip, out_three_paths)
         print("\nAUG-01 smoke test PASSED")
     finally:
         if args.keep or args.workdir:

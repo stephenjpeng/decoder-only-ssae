@@ -41,6 +41,15 @@ class TestSd35LargeBackbone(unittest.TestCase):
             (backbone.DEFAULT_HEIGHT, backbone.DEFAULT_WIDTH), (1024, 1024)
         )
 
+    def test_load_rejects_non_cuda_before_importing_diffusers(self) -> None:
+        """CPU and MPS fail before the multi-billion-parameter load starts."""
+        for device in ("cpu", "mps"):
+            backbone = Sd35LargeBackbone(device=device)
+            with patch.dict(sys.modules, {"diffusers": None}):
+                with self.assertRaisesRegex(RuntimeError, "requires a CUDA device"):
+                    backbone.load()
+            self.assertFalse(backbone._loaded)
+
     def test_load_uses_low_memory_cpu_offload_for_cuda(self) -> None:
         """CUDA loading never moves the complete pipeline onto one GPU."""
         pipeline = MagicMock()

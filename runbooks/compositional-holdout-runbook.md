@@ -100,25 +100,26 @@ python -m evaluation.run_image_benchmark \
     --dino --locality_drop_one_attr --locality_swap_one_attr
 ```
 
-### The two prompt-modification methods
+### The three prompt-conditioning paths
 
-`run_image_benchmark` exposes two prompt-side methods. They are **different computations**, not synonyms, and must never be averaged or substituted for one another:
+`run_image_benchmark` exposes three prompt-side entry paths. They are different computations and must not be averaged or substituted for one another:
 
 | Method key | Report / paper label | Conditioning | Use it for |
 |---|---|---|---|
-| `prompt_only` | **Prompt modification (native/full embedding)** | Text encoder's full `[1,333,4096]` + `[1,2048]` output goes straight to the pipeline | The practical comparison. This is what a deployed prompt-rewriting defense actually does. |
-| `prompt_modified_packed` | **Prompt modification (packed top-k)** | Same prompt text, same diffusion seed; only the SSAE's top-k coordinates survive, the rest are training-mean filled exactly as for an SSAE/ridge prediction | Apples-to-apples controlled-subspace analysis. Removes the confound that native prompt modification sees ~1.36M coordinates the feature-editing methods never touch. |
+| `native_prompt` | **Native text generation** | Prompt text goes directly to the SD3.5 pipeline | Deployment-realistic direct text generation |
+| `prompt_only` | **Exact full-embedding round-trip** | The prompt is encoded, then the full `[1,333,4096]` and `[1,2048]` output is passed back unchanged | Isolating the encode/decode entry path from native text |
+| `prompt_modified_packed` | **Prompt modification (packed top-k)** | The prompt is re-encoded; only the active top-k coordinates survive and other coordinates use the selected fill policy | Controlled-subspace comparison with SSAE and ridge edits |
 
-The key `prompt_only` is retained for cache compatibility — existing `results/bench_baseline_cache/` directories predate the rename and stay readable. Only the *label* changed. Labels, colours and conditioning semantics live in `evaluation/method_labels.py`, which the report builders import, so code and reports cannot drift apart.
+Native text and the exact round-trip both set the T5 maximum sequence length to 256. This preserves the stored 333-token stream contract. The key `prompt_only` remains for method-name compatibility. Cache identity changes when the render contract changes, so older pixels cannot silently acquire new semantics.
 
 `prompt_modified_packed` is **not** in the default method set (it roughly doubles prompt-side rendering cost). Opt in:
 
 ```bash
 python -m evaluation.run_image_benchmark ... \
-    --methods gt_embed,ssae_compose,mean_arithmetic,ridge_embed,prompt_only,prompt_modified_packed
+    --methods gt_embed,ssae_compose,mean_arithmetic,ridge_embed,native_prompt,prompt_only,prompt_modified_packed
 ```
 
-Every run manifest records per-method conditioning (`native` vs `packed`) plus the packer fingerprint, so a downstream table cannot silently mix the two.
+Every run and cache manifest records each method's runtime conditioning, active top-k, fill policy, and packer fingerprint.
 
 Verify the semantics without a GPU:
 
@@ -126,7 +127,7 @@ Verify the semantics without a GPU:
 .venv/bin/python scripts/smoke_prompt_baselines.py
 ```
 
-Non-SSAE baselines (`gt_embed`, `mean_arithmetic`, `ridge_embed`, `prompt_only`, `prompt_modified_packed`) land in a shared cache at `results/bench_baseline_cache/<dataset_id>/`, keyed by (holdout `prompts.json`, training embeddings + mask, `--base_seed`, `--ridge_lambda`, SD3.5 pipeline fingerprint). The run folder holds SSAE outputs plus a `manifest.json` pointing at the cache. Comparing several checkpoints on the same holdout only re-renders SSAE:
+Non-SSAE baselines (`gt_embed`, `mean_arithmetic`, `ridge_embed`, `native_prompt`, `prompt_only`, `prompt_modified_packed`) land in a shared cache at `results/bench_baseline_cache/<dataset_id>/`. The identity includes the data, seed, ridge setting, SD3.5 fingerprint, ordered active top-k coordinate fingerprint, fill policy, and cache contract version. Simulated runs bypass shared cache reads and writes. A real run folder holds SSAE outputs plus a `manifest.json` that points at the cache. Comparing several checkpoints on the same holdout only re-renders SSAE:
 
 ```bash
 # First run — populates baselines and SSAE-A
@@ -148,8 +149,8 @@ For VRAM-constrained runs (typically untruncated `W`, which is multi-GB and OOMs
 
 Both locality flags are independent and can be combined. For each sample with more than one active attribute, one active attribute is picked at random (seeded by `base_seed + idx` so the pick is reproducible), and the two flags each apply a different edit to that same attribute:
 
-- `--locality_drop_one_attr`: zeros the attribute's mask bit for the embedding methods, or drops its phrase from the prompt for both prompt-modification methods (`prompt_only` renders the residual prompt natively; `prompt_modified_packed` re-encodes the same residual prompt and packs it). Writes pre-edit images to `<output_dir>/images_pre_edit/<method>/` and adds `mse_pixel_pre_post_edit` / `ssim_pre_post_edit` per sample (surgical-ness under removal), plus `clip_image_vs_residual_prompt` on the normal image.
-- `--locality_swap_one_attr`: flips the attribute's mask bit to a random *different* property in the same category (e.g. blond → brunette), or substitutes the corresponding phrase in the prompt for both prompt-modification methods. Writes swap images to `<output_dir>/images_swapped/<method>/` and adds `mse_pixel_swap_vs_normal` / `ssim_swap_vs_normal` (surgical-ness under value swap) plus `clip_swap_image_vs_swapped_prompt` (did the swap image match the swapped prompt).
+- `--locality_drop_one_attr`: zeros the attribute's mask bit for embedding methods. For prompt paths, it removes the phrase, then uses native text, exact round-trip, or packed re-encoding as selected. It writes pre-edit images to `<output_dir>/images_pre_edit/<method>/` and adds pixel locality metrics.
+- `--locality_swap_one_attr`: replaces the attribute with a different property in the same category. Each prompt path then uses its own native, round-trip, or packed entry route. It writes swap images to `<output_dir>/images_swapped/<method>/` and adds pixel and CLIP swap metrics.
 - Both flags share the same `edit_pid` per sample, so drop and swap results are directly comparable when run together. The chosen attribute, its phrase, and the swap target (if any) are recorded per row in `per_sample.csv` as `edit_pid`, `edit_attribute`, `swap_target_pid`, `swap_target_attribute`, `swapped_prompt`.
 
 Categories with only one property (there's nothing to swap to) fall out of the swap test for those samples; they're still counted in the drop test.

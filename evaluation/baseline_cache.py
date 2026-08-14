@@ -1,14 +1,13 @@
 """Content-addressed cache of non-SSAE baselines for ``run_image_benchmark``.
 
-Baselines (gt_embed, mean_arithmetic, ridge_embed, prompt_only, prompt_modified_packed)
-are independent of the SSAE checkpoint. Caching them keyed by (holdout, training data,
-base_seed, ridge_lambda, SD3.5 fingerprint) lets subsequent runs with a new SSAE reuse the
-same images and metrics instead of re-rendering every baseline from scratch.
+Baselines (gt_embed, mean_arithmetic, ridge_embed, native_prompt, prompt_only, and
+prompt_modified_packed) are independent of the SSAE checkpoint. Caching them by the
+holdout data, training data, render contract, and packing policy lets subsequent runs
+reuse the same images and metrics.
 
-Backward compatibility (AUG-01): ``prompt_modified_packed`` was added to the method list
-without touching :func:`compute_dataset_id`, so caches populated before it existed keep
-their ``dataset_id`` and stay readable. Requesting the new method against an old cache
-simply renders it into the existing directory alongside the others.
+The cache identity has an explicit version. Render-contract changes therefore create a
+new directory instead of silently reusing images produced under older semantics.
+Simulated benchmark runs bypass this shared cache entirely.
 
 Cache layout::
 
@@ -48,6 +47,7 @@ import torch
 # Re-exported from the shared registry so method identity has exactly one definition.
 from evaluation.method_labels import BASELINE_METHODS  # noqa: E402,F401
 
+BASELINE_CACHE_IDENTITY_VERSION = 2
 VARIANTS: tuple[str, ...] = ("post", "pre_edit", "swapped")
 
 
@@ -67,6 +67,22 @@ def _sha256_file(path: Path) -> str:
     return h.hexdigest()
 
 
+def ordered_indices_fingerprint(
+    indices: Iterable[int] | np.ndarray | torch.Tensor | None,
+) -> dict:
+    """Fingerprint the ordered top-k coordinates without storing the full list"""
+    if indices is None:
+        return {"algorithm": "sha256", "count": None, "sha256": None}
+
+    ordered = torch.as_tensor(indices, dtype=torch.int64).detach().cpu().reshape(-1)
+    canonical = json.dumps(ordered.tolist(), separators=(",", ":")).encode("utf-8")
+    return {
+        "algorithm": "sha256",
+        "count": int(ordered.numel()),
+        "sha256": _sha256_bytes(canonical),
+    }
+
+
 def compute_dataset_id(
     *,
     holdout_folder: Path,
@@ -75,6 +91,7 @@ def compute_dataset_id(
     base_seed: int,
     ridge_lambda: float,
     sd3_fingerprint: dict,
+    truncate_embds_topk_indices: Iterable[int] | np.ndarray | torch.Tensor | None,
     packer_fingerprint: dict | None = None,
 ) -> tuple[str, dict]:
     holdout_hash = _sha256_file(Path(holdout_folder) / "prompts.json")
@@ -82,6 +99,7 @@ def compute_dataset_id(
     train_mask_np = train_mask.detach().to(torch.float32).cpu().contiguous().numpy()
     train_hash = _sha256_bytes(train_x_np.tobytes() + train_mask_np.tobytes())
     key = {
+        "baseline_cache_identity_version": BASELINE_CACHE_IDENTITY_VERSION,
         "holdout_hash": holdout_hash,
         "train_hash": train_hash,
         "train_shape": list(train_x_np.shape),
@@ -89,6 +107,9 @@ def compute_dataset_id(
         "base_seed": int(base_seed),
         "ridge_lambda": float(ridge_lambda),
         "sd3_fingerprint": sd3_fingerprint,
+        "truncate_embds_topk_indices_fingerprint": ordered_indices_fingerprint(
+            truncate_embds_topk_indices
+        ),
         "packer_fingerprint": packer_fingerprint or {},
     }
     canonical = json.dumps(key, sort_keys=True).encode("utf-8")
@@ -237,6 +258,7 @@ def load_or_create(
     base_seed: int,
     ridge_lambda: float,
     sd3_fingerprint: dict,
+    truncate_embds_topk_indices: Iterable[int] | np.ndarray | torch.Tensor | None,
     packer_fingerprint: dict | None = None,
 ) -> BaselineCache:
     dataset_id, key = compute_dataset_id(
@@ -246,6 +268,7 @@ def load_or_create(
         base_seed=base_seed,
         ridge_lambda=ridge_lambda,
         sd3_fingerprint=sd3_fingerprint,
+        truncate_embds_topk_indices=truncate_embds_topk_indices,
         packer_fingerprint=packer_fingerprint,
     )
     return BaselineCache(root=Path(root), dataset_id=dataset_id, key=key)
