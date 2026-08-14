@@ -15,11 +15,22 @@ import argparse
 import sys
 from pathlib import Path
 
+from evaluation.image_qualification import PromptSpec
 from evaluation.image_validity import (
     analyze_image_validity,
     write_results_json,
     write_summary_csv,
 )
+
+
+def required_bakeoff_arms(prompt_spec_path: Path) -> set[tuple[str, str]]:
+    """Load the frozen model-property arm universe used by the qualification gate"""
+    spec = PromptSpec.load(prompt_spec_path)
+    return {
+        (model, property_id)
+        for model in spec.bakeoff_design.model_backbones
+        for property_id in spec.bakeoff_design.property_ids
+    }
 
 
 def main() -> int:
@@ -67,6 +78,12 @@ def main() -> int:
         default=0.90,
         help="minimum observed validity rate to pass gate (default 0.90)",
     )
+    parser.add_argument(
+        "--prompt-spec",
+        type=Path,
+        default=Path("evaluation/config/image_validity_prompts.yaml"),
+        help="frozen prompt spec that defines every required bakeoff arm",
+    )
 
     args = parser.parse_args()
 
@@ -77,6 +94,7 @@ def main() -> int:
             gate_threshold=args.gate_threshold,
             blinding_mapping_path=args.blinding_mapping,
             unblinded_scores_output=args.unblinded_scores_output,
+            required_model_property_arms=required_bakeoff_arms(args.prompt_spec),
         )
 
         write_results_json(results, args.output_json)
@@ -85,13 +103,25 @@ def main() -> int:
         print(f"wrote JSON results to {args.output_json}")
         print(f"wrote CSV summary to {args.output_csv}")
 
-        # print key summary to stdout
+        # pooled validity is diagnostic; every required arm must pass the gate
         overall = results["overall"]
         print(
-            f"\noverall validity: {overall['n_valid']}/{overall['n_total']} = {overall['rate']:.2%}"
+            f"\npooled bakeoff validity (diagnostic, not gate): "
+            f"{overall['n_valid']}/{overall['n_total']} = {overall['rate']:.2%}"
         )
         print(f"95% CI: [{overall['ci_lower']:.2%}, {overall['ci_upper']:.2%}]")
-        print(f"passes {args.gate_threshold:.0%} gate: {overall['passes_gate']}")
+        decision = results["qualification_decision"]
+        outcome = "PASS" if decision["passes_gate"] else "FAIL"
+        print(
+            f"qualification decision: {outcome}; all "
+            f"{decision['required_model_property_arms']} model-property arms must meet "
+            f"{args.gate_threshold:.0%}"
+        )
+        for arm in decision["failed_arms"]:
+            print(
+                f"failed arm: {arm['model_backbone']} / {arm['property_id']} "
+                f"({arm['n_valid']}/{arm['n_total']} = {arm['rate']:.2%})"
+            )
 
         return 0
 

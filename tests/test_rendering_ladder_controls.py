@@ -19,6 +19,7 @@ from evaluation.method_labels import (
 )
 from evaluation.run_image_benchmark import (
     _generate_prompt_conditioned_image,
+    _locality_cache_properties,
     _populated_cache_methods,
     _shared_baseline_cache_enabled,
 )
@@ -70,9 +71,7 @@ class TestRenderingLadderControls(unittest.TestCase):
             metadata["prompt_modified_packed"]["detail"],
             "topk_512_reencoded_prompt_source_prompt_fill",
         )
-        self.assertEqual(
-            metadata["prompt_modified_packed"]["truncate_embds_topk"], 512
-        )
+        self.assertEqual(metadata["prompt_modified_packed"]["truncate_embds_topk"], 512)
         self.assertEqual(metadata["gt_embed"]["fill_policy"], "source_prompt")
 
     def test_untruncated_conditioning_records_no_fill(self):
@@ -93,14 +92,10 @@ class TestRenderingLadderControls(unittest.TestCase):
     def test_simulated_runs_bypass_shared_baseline_cache(self):
         """Placeholder renders cannot read or write the shared real-render cache."""
         self.assertFalse(
-            _shared_baseline_cache_enabled(
-                use_baseline_cache=True, simulated=True
-            )
+            _shared_baseline_cache_enabled(use_baseline_cache=True, simulated=True)
         )
         self.assertTrue(
-            _shared_baseline_cache_enabled(
-                use_baseline_cache=True, simulated=False
-            )
+            _shared_baseline_cache_enabled(use_baseline_cache=True, simulated=False)
         )
 
     def test_gt_embed_conditioning_is_packed(self):
@@ -202,7 +197,9 @@ class TestRenderingLadderControls(unittest.TestCase):
         gen = ImageGenerator(simulated=True, device="cpu")
 
         with patch.object(gen, "get_embds_text_encoder") as mock_encode:
-            with patch.object(gen, "_generate_image_from_prompt_native_simulated") as mock_native:
+            with patch.object(
+                gen, "_generate_image_from_prompt_native_simulated"
+            ) as mock_native:
                 gen.generate_image_from_prompt_native(
                     "test prompt", "out.png", use_negative_prompts=False, seed=42
                 )
@@ -313,13 +310,17 @@ class TestRenderingLadderControls(unittest.TestCase):
             self.assertIsNotNone(call_kwargs["prompt_embeds"])
             self.assertIsNotNone(call_kwargs["pooled_prompt_embeds"])
             torch.testing.assert_close(call_kwargs["prompt_embeds"], prompt_embeds)
-            torch.testing.assert_close(call_kwargs["pooled_prompt_embeds"], pooled_prompt_embeds)
+            torch.testing.assert_close(
+                call_kwargs["pooled_prompt_embeds"], pooled_prompt_embeds
+            )
 
     def test_native_and_round_trip_use_same_seed(self):
         """Native and round-trip paths honor the same seed."""
         gen = ImageGenerator(simulated=True, device="cpu")
 
-        with patch("inference.image_generation.image_generator.setup_seed") as mock_seed:
+        with patch(
+            "inference.image_generation.image_generator.setup_seed"
+        ) as mock_seed:
             gen.generate_image_from_prompt_native(
                 "test", "out1.png", use_negative_prompts=False, seed=123
             )
@@ -327,7 +328,9 @@ class TestRenderingLadderControls(unittest.TestCase):
             self.assertEqual(mock_seed.call_count, 1)
             mock_seed.assert_called_with(123)
 
-        with patch("inference.image_generation.image_generator.setup_seed") as mock_seed:
+        with patch(
+            "inference.image_generation.image_generator.setup_seed"
+        ) as mock_seed:
             gen.generate_image_from_prompt(
                 "test", "out2.png", use_negative_prompts=False, seed=123
             )
@@ -407,11 +410,11 @@ class TestRenderingLadderControls(unittest.TestCase):
             current_id, key = compute_dataset_id(
                 **common, packer_fingerprint=current_packer
             )
-            old_id, _ = compute_dataset_id(
-                **common, packer_fingerprint=old_packer
-            )
+            old_id, _ = compute_dataset_id(**common, packer_fingerprint=old_packer)
             self.assertNotEqual(current_id, old_id)
-            self.assertEqual(key["baseline_cache_identity_version"], 2)
+            self.assertEqual(key["baseline_cache_identity_version"], 3)
+            self.assertIsNone(key["target_property"])
+            self.assertIsNone(key["replacement_property"])
 
             metadata = conditioning_map(
                 ("native_prompt", "prompt_modified_packed"),
@@ -444,6 +447,62 @@ class TestRenderingLadderControls(unittest.TestCase):
                 key["truncate_embds_topk_indices_fingerprint"],
             )
 
+    def test_non_targeted_cache_ignores_unused_property_filters(self):
+        """Property filters do not fragment cache identity without locality variants."""
+        self.assertEqual(
+            _locality_cache_properties(
+                locality_drop_one_attr=False,
+                locality_swap_one_attr=False,
+                target_property="holding a gun",
+                replacement_property="holding a coffee",
+            ),
+            (None, None),
+        )
+        self.assertEqual(
+            _locality_cache_properties(
+                locality_drop_one_attr=True,
+                locality_swap_one_attr=False,
+                target_property="holding a gun",
+                replacement_property="holding a coffee",
+            ),
+            ("holding a gun", "holding a coffee"),
+        )
+
+    def test_targeted_locality_properties_change_cache_identity(self):
+        """Target and replacement names isolate edited baseline pixels."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            holdout = Path(tmpdir) / "holdout"
+            holdout.mkdir()
+            (holdout / "prompts.json").write_text(
+                json.dumps([{"prompt": "test"}]), encoding="utf-8"
+            )
+            common = {
+                "holdout_folder": holdout,
+                "train_x": torch.zeros(1, 2),
+                "train_mask": torch.ones(1, 1),
+                "base_seed": 0,
+                "ridge_lambda": 0.01,
+                "sd3_fingerprint": ImageGenerator.fingerprint(),
+                "truncate_embds_topk_indices": [0, 1],
+            }
+            non_targeted_id, non_targeted_key = compute_dataset_id(**common)
+            target_id, target_key = compute_dataset_id(
+                **common,
+                target_property="holding a gun",
+                replacement_property="holding a coffee",
+            )
+            other_target_id, _ = compute_dataset_id(
+                **common,
+                target_property="wearing a hat",
+                replacement_property="wearing a helmet",
+            )
+
+            self.assertNotEqual(non_targeted_id, target_id)
+            self.assertNotEqual(target_id, other_target_id)
+            self.assertIsNone(non_targeted_key["target_property"])
+            self.assertEqual(target_key["target_property"], "holding a gun")
+            self.assertEqual(target_key["replacement_property"], "holding a coffee")
+
     def test_subset_cache_write_preserves_conditioning_for_existing_rows(self):
         """A subset run keeps metadata for every method already stored in the cache."""
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -466,9 +525,7 @@ class TestRenderingLadderControls(unittest.TestCase):
             )
 
             manifest = json.loads((cache.dir / "manifest.json").read_text())
-            self.assertEqual(
-                set(manifest["methods"]), {"native_prompt", "prompt_only"}
-            )
+            self.assertEqual(set(manifest["methods"]), {"native_prompt", "prompt_only"})
             self.assertEqual(
                 set(manifest["method_conditioning"]),
                 {"native_prompt", "prompt_only"},

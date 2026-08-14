@@ -22,8 +22,8 @@ Cache layout::
 
 Caveats:
 
-* Locality flags (``locality_drop_one_attr`` / ``locality_swap_one_attr``) are not part of
-  the dataset id — the cache grows as new variants are requested.
+* Locality flags are not part of the dataset id, so a cache can grow new variants.
+  Targeted locality property names are part of the identity because they change pixels.
 * Optional per-row metrics (DINO, LPIPS) are captured at population time. A downstream run
   that enables a metric absent from the cache gets an empty value; pre-warm with the
   desired metrics enabled if you need them everywhere.
@@ -47,7 +47,7 @@ import torch
 # Re-exported from the shared registry so method identity has exactly one definition.
 from evaluation.method_labels import BASELINE_METHODS  # noqa: E402,F401
 
-BASELINE_CACHE_IDENTITY_VERSION = 2
+BASELINE_CACHE_IDENTITY_VERSION = 3
 VARIANTS: tuple[str, ...] = ("post", "pre_edit", "swapped")
 
 
@@ -93,6 +93,8 @@ def compute_dataset_id(
     sd3_fingerprint: dict,
     truncate_embds_topk_indices: Iterable[int] | np.ndarray | torch.Tensor | None,
     packer_fingerprint: dict | None = None,
+    target_property: str | None = None,
+    replacement_property: str | None = None,
 ) -> tuple[str, dict]:
     holdout_hash = _sha256_file(Path(holdout_folder) / "prompts.json")
     train_x_np = train_x.detach().to(torch.float32).cpu().contiguous().numpy()
@@ -111,6 +113,9 @@ def compute_dataset_id(
             truncate_embds_topk_indices
         ),
         "packer_fingerprint": packer_fingerprint or {},
+        # null values preserve one shared identity for every non-targeted run
+        "target_property": target_property,
+        "replacement_property": replacement_property,
     }
     canonical = json.dumps(key, sort_keys=True).encode("utf-8")
     return _sha256_bytes(canonical)[:16], key
@@ -260,6 +265,8 @@ def load_or_create(
     sd3_fingerprint: dict,
     truncate_embds_topk_indices: Iterable[int] | np.ndarray | torch.Tensor | None,
     packer_fingerprint: dict | None = None,
+    target_property: str | None = None,
+    replacement_property: str | None = None,
 ) -> BaselineCache:
     dataset_id, key = compute_dataset_id(
         holdout_folder=holdout_folder,
@@ -270,5 +277,7 @@ def load_or_create(
         sd3_fingerprint=sd3_fingerprint,
         truncate_embds_topk_indices=truncate_embds_topk_indices,
         packer_fingerprint=packer_fingerprint,
+        target_property=target_property,
+        replacement_property=replacement_property,
     )
     return BaselineCache(root=Path(root), dataset_id=dataset_id, key=key)

@@ -27,13 +27,18 @@ from evaluation.image_qualification import (
 )
 from evaluation.image_validity import analyze_image_validity
 from evaluation.run_native_model_qualification import (
+    QUALIFICATION_RENDER_CONTRACT_VERSION,
     build_model_configuration,
-    fingerprint_model_configuration,
     build_scoring_package,
+    fingerprint_model_configuration,
     manifest_success_matches,
+    prune_manifest_rows,
     qualification_identity,
+    qualification_repository_revision,
     write_manifest,
 )
+
+REPOSITORY_REVISION = "a" * 40
 
 SPEC_PATH = "evaluation/config/image_validity_prompts.yaml"
 
@@ -392,7 +397,8 @@ class TestBlinding(unittest.TestCase):
             first = build_scoring_package(output_dir, rows, manifest)
             opaque_id = first["rows"][rows[0].row_id]["blinded_row_id"]
             scoring_path = output_dir / "scoring_sheet.csv"
-            scored = list(csv.DictReader(scoring_path.open(newline="")))
+            with scoring_path.open(newline="") as file:
+                scored = list(csv.DictReader(file))
             scored[0]["target_present"] = "true"
             with scoring_path.open("w", newline="") as file:
                 writer = csv.DictWriter(file, fieldnames=list(scored[0]))
@@ -404,7 +410,8 @@ class TestBlinding(unittest.TestCase):
             self.assertNotEqual(
                 second["rows"][rows[0].row_id]["blinded_row_id"], opaque_id
             )
-            refreshed = list(csv.DictReader(scoring_path.open(newline="")))
+            with scoring_path.open(newline="") as file:
+                refreshed = list(csv.DictReader(file))
             self.assertEqual(refreshed[0]["target_present"], "")
 
 
@@ -528,58 +535,198 @@ class TestModelFingerprint(unittest.TestCase):
         self.assertEqual(configuration["render_parameters"]["guidance_scale"], 3.5)
         self.assertEqual(configuration["render_parameters"]["max_sequence_length"], 256)
 
-    def test_saved_success_requires_current_spec_and_model_fingerprints(self) -> None:
+    def test_saved_success_requires_current_render_identity(self) -> None:
         row = build_audit_plan(PromptSpec.load(SPEC_PATH))[0]
         configuration = build_model_configuration(
             "sd35_large_turbo", FakeQualificationBackbone()
         )
         model_fingerprint = fingerprint_model_configuration(configuration)
         contract_identity = qualification_identity(
-            row, "current-spec", model_fingerprint
+            row,
+            "current-spec",
+            model_fingerprint,
+            REPOSITORY_REVISION,
+            QUALIFICATION_RENDER_CONTRACT_VERSION,
         )
         manifest_row = {
             **row.to_dict(),
             "spec_fingerprint": "current-spec",
             "model_configuration": configuration,
             "model_fingerprint": model_fingerprint,
+            "repository_code_revision": REPOSITORY_REVISION,
+            "qualification_render_contract_version": QUALIFICATION_RENDER_CONTRACT_VERSION,
             "render_contract_fingerprint": contract_identity,
             "render_attempt_id": "attempt",
             "qualification_identity": f"{contract_identity}-attempt",
             "status": "success",
         }
-        self.assertTrue(
-            manifest_success_matches(
-                manifest_row,
-                row,
-                "current-spec",
-                configuration,
-                model_fingerprint,
-            )
-        )
 
-        stale_spec = {**manifest_row, "spec_fingerprint": "stale-spec"}
-        self.assertFalse(
-            manifest_success_matches(
-                stale_spec,
+        def matches(candidate: dict[str, object], revision: str, version: int) -> bool:
+            return manifest_success_matches(
+                candidate,
                 row,
                 "current-spec",
                 configuration,
                 model_fingerprint,
+                revision,
+                version,
             )
-        )
-        stale_model = {**manifest_row, "model_fingerprint": "stale-model"}
+
+        self.assertTrue(matches(manifest_row, REPOSITORY_REVISION, 1))
         self.assertFalse(
-            manifest_success_matches(
-                stale_model,
-                row,
-                "current-spec",
-                configuration,
-                model_fingerprint,
+            matches(
+                {**manifest_row, "spec_fingerprint": "stale-spec"},
+                REPOSITORY_REVISION,
+                1,
             )
         )
+        self.assertFalse(
+            matches(
+                {**manifest_row, "model_fingerprint": "stale-model"},
+                REPOSITORY_REVISION,
+                1,
+            )
+        )
+        self.assertFalse(matches(manifest_row, "b" * 40, 1))
+        self.assertFalse(matches(manifest_row, REPOSITORY_REVISION, 2))
+
+
+class TestQualificationIntegrity(unittest.TestCase):
+    def test_real_render_requires_clean_concrete_revision(self) -> None:
+        clean = {
+            "sha": REPOSITORY_REVISION,
+            "branch": "test",
+            "dirty": False,
+            "describe": REPOSITORY_REVISION,
+        }
+        with patch(
+            "evaluation.run_native_model_qualification.git_provenance",
+            return_value=clean,
+        ):
+            self.assertEqual(qualification_repository_revision(), REPOSITORY_REVISION)
+
+        for provenance in (
+            {**clean, "dirty": True},
+            {**clean, "dirty": None},
+            {**clean, "sha": None},
+        ):
+            with (
+                self.subTest(provenance=provenance),
+                patch(
+                    "evaluation.run_native_model_qualification.git_provenance",
+                    return_value=provenance,
+                ),
+                self.assertRaises(SystemExit),
+            ):
+                qualification_repository_revision()
+
+    def test_code_and_contract_change_render_identity(self) -> None:
+        row = build_audit_plan(PromptSpec.load(SPEC_PATH))[0]
+        current = qualification_identity(row, "spec", "model", "a" * 40, 1)
+        changed_code = qualification_identity(row, "spec", "model", "b" * 40, 1)
+        changed_contract = qualification_identity(row, "spec", "model", "a" * 40, 2)
+        self.assertNotEqual(current, changed_code)
+        self.assertNotEqual(current, changed_contract)
+
+    def test_obsolete_manifest_rows_and_private_artifacts_are_pruned(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            output_dir = Path(directory)
+            obsolete_path = output_dir / "obsolete.png"
+            obsolete_path.write_bytes(b"obsolete")
+            manifest = {
+                "current": {"row_id": "current", "status": "success"},
+                "obsolete": {
+                    "row_id": "obsolete",
+                    "status": "success",
+                    "image_path": str(obsolete_path),
+                },
+            }
+            retained, pruned = prune_manifest_rows(manifest, {"current"}, output_dir)
+
+            self.assertEqual(set(retained), {"current"})
+            self.assertEqual(pruned, 1)
+            self.assertFalse(obsolete_path.exists())
+
+    def test_invalid_obsolete_set_cannot_partially_delete_artifacts(self) -> None:
+        with (
+            tempfile.TemporaryDirectory() as output_directory,
+            tempfile.TemporaryDirectory() as external_directory,
+        ):
+            output_dir = Path(output_directory)
+            internal_path = output_dir / "internal.png"
+            internal_path.write_bytes(b"internal")
+            external_path = Path(external_directory) / "external.png"
+            external_path.write_bytes(b"external")
+            manifest = {
+                "first-internal": {
+                    "row_id": "first-internal",
+                    "status": "success",
+                    "image_path": str(internal_path),
+                },
+                "later-external": {
+                    "row_id": "later-external",
+                    "status": "success",
+                    "image_path": str(external_path),
+                },
+            }
+
+            with self.assertRaisesRegex(ValueError, "outside qualification output"):
+                prune_manifest_rows(manifest, set(), output_dir)
+            self.assertTrue(internal_path.exists())
+            self.assertTrue(external_path.exists())
+
+    def test_obsolete_symlink_is_unlinked_without_deleting_target(self) -> None:
+        with (
+            tempfile.TemporaryDirectory() as output_directory,
+            tempfile.TemporaryDirectory() as external_directory,
+        ):
+            output_dir = Path(output_directory)
+            external_path = Path(external_directory) / "external.png"
+            external_path.write_bytes(b"external")
+            symlink_path = output_dir / "obsolete.png"
+            symlink_path.symlink_to(external_path)
+            manifest = {
+                "obsolete": {
+                    "row_id": "obsolete",
+                    "status": "success",
+                    "image_path": str(symlink_path),
+                }
+            }
+
+            retained, pruned = prune_manifest_rows(manifest, set(), output_dir)
+            self.assertEqual(retained, {})
+            self.assertEqual(pruned, 1)
+            self.assertFalse(symlink_path.exists())
+            self.assertFalse(symlink_path.is_symlink())
+            self.assertTrue(external_path.exists())
+
+    def test_retained_row_protects_shared_artifact_path(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            output_dir = Path(directory)
+            shared_path = output_dir / "shared.png"
+            shared_path.write_bytes(b"shared")
+            manifest = {
+                "current": {"row_id": "current", "image_path": str(shared_path)},
+                "obsolete": {"row_id": "obsolete", "image_path": str(shared_path)},
+            }
+
+            retained, pruned = prune_manifest_rows(manifest, {"current"}, output_dir)
+            self.assertEqual(set(retained), {"current"})
+            self.assertEqual(pruned, 1)
+            self.assertTrue(shared_path.exists())
 
 
 class TestCLI(unittest.TestCase):
+    def setUp(self) -> None:
+        self.revision_patch = patch(
+            "evaluation.run_native_model_qualification.qualification_repository_revision",
+            return_value=REPOSITORY_REVISION,
+        )
+        self.revision_patch.start()
+
+    def tearDown(self) -> None:
+        self.revision_patch.stop()
+
     @patch("evaluation.run_native_model_qualification.get_backbone")
     def test_dry_run_does_not_load_a_backbone(self, get_backbone: MagicMock) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -615,7 +762,11 @@ class TestCLI(unittest.TestCase):
         model_configuration = build_model_configuration("sd35_large_turbo", backbone)
         model_fingerprint = fingerprint_model_configuration(model_configuration)
         contract_identity = qualification_identity(
-            row, "spec-fingerprint", model_fingerprint
+            row,
+            "spec-fingerprint",
+            model_fingerprint,
+            REPOSITORY_REVISION,
+            QUALIFICATION_RENDER_CONTRACT_VERSION,
         )
         manifest_row = {
             **row.to_dict(),
@@ -623,6 +774,8 @@ class TestCLI(unittest.TestCase):
             "spec_fingerprint": "spec-fingerprint",
             "model_configuration": model_configuration,
             "model_fingerprint": model_fingerprint,
+            "repository_code_revision": REPOSITORY_REVISION,
+            "qualification_render_contract_version": QUALIFICATION_RENDER_CONTRACT_VERSION,
             "render_contract_fingerprint": contract_identity,
             "render_attempt_id": "attempt",
             "qualification_identity": f"{contract_identity}-attempt",
@@ -637,9 +790,17 @@ class TestCLI(unittest.TestCase):
             legacy_path.write_bytes(b"existing image")
             manifest_row["image_path"] = str(legacy_path)
             manifest_path = output_dir / "manifest.jsonl"
+            obsolete_path = output_dir / "obsolete.png"
+            obsolete_path.write_bytes(b"obsolete image")
+            obsolete_row = {
+                **manifest_row,
+                "row_id": "obsolete-row",
+                "image_path": str(obsolete_path),
+            }
             with manifest_path.open("w") as file:
                 file.write(json.dumps(manifest_row) + "\n")
                 file.write(json.dumps(manifest_row) + "\n")
+                file.write(json.dumps(obsolete_row) + "\n")
 
             argv = ["run_native_model_qualification.py", "--output_dir", directory]
             with (
@@ -680,6 +841,8 @@ class TestCLI(unittest.TestCase):
             blinded_path = Path(final_rows[0]["image_path"])
             self.assertTrue(blinded_path.is_file())
             self.assertEqual(blinded_path.read_bytes(), b"existing image")
+            self.assertEqual(stat.S_IMODE(blinded_path.stat().st_mode), 0o600)
+            self.assertFalse(obsolete_path.exists())
 
         self.assertEqual(backbone.generate_calls, [])
         backbone.load.assert_called_once_with()
@@ -815,7 +978,11 @@ class TestCLI(unittest.TestCase):
         )
         model_fingerprint = fingerprint_model_configuration(model_configuration)
         contract_identity = qualification_identity(
-            successful, "spec-fingerprint", model_fingerprint
+            successful,
+            "spec-fingerprint",
+            model_fingerprint,
+            REPOSITORY_REVISION,
+            QUALIFICATION_RENDER_CONTRACT_VERSION,
         )
         existing_success = {
             **successful.to_dict(),
@@ -824,6 +991,8 @@ class TestCLI(unittest.TestCase):
             "spec_fingerprint": "spec-fingerprint",
             "model_configuration": model_configuration,
             "model_fingerprint": model_fingerprint,
+            "repository_code_revision": REPOSITORY_REVISION,
+            "qualification_render_contract_version": QUALIFICATION_RENDER_CONTRACT_VERSION,
             "render_contract_fingerprint": contract_identity,
             "render_attempt_id": "attempt",
             "qualification_identity": f"{contract_identity}-attempt",
@@ -893,6 +1062,10 @@ class TestCLI(unittest.TestCase):
                 )
             )
             self.assertEqual(generated_path.read_bytes(), b"fake image")
+            self.assertEqual(stat.S_IMODE(generated_path.stat().st_mode), 0o600)
+            self.assertEqual(
+                stat.S_IMODE((output_dir / "private_images").stat().st_mode), 0o700
+            )
 
         self.assertEqual(len(final_rows), 2)
         self.assertEqual(len({row["row_id"] for row in final_rows}), 2)

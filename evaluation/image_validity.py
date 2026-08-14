@@ -377,6 +377,15 @@ def load_manifest_jsonl(path: Path) -> list[ManifestRow]:
                     f"manifest line {line_num} field source_row_id "
                     "must be a nonblank string when present"
                 )
+            property_join_fields = ("source_property_id", "target_property_id")
+            if obj["stage"] == "edit":
+                for field_name in property_join_fields:
+                    value = obj.get(field_name)
+                    if not isinstance(value, str) or not value.strip():
+                        raise ValueError(
+                            f"manifest line {line_num} edit row requires nonblank "
+                            f"{field_name}"
+                        )
 
             row_id = obj["row_id"].strip()
             if row_id in seen_ids:
@@ -400,8 +409,16 @@ def load_manifest_jsonl(path: Path) -> list[ManifestRow]:
                     design=design,
                     conditioning=conditioning.strip(),
                     status=status,
-                    source_property_id=obj.get("source_property_id"),
-                    target_property_id=obj.get("target_property_id"),
+                    source_property_id=(
+                        obj["source_property_id"].strip()
+                        if obj.get("source_property_id") is not None
+                        else None
+                    ),
+                    target_property_id=(
+                        obj["target_property_id"].strip()
+                        if obj.get("target_property_id") is not None
+                        else None
+                    ),
                     qualification_identity=obj.get("qualification_identity"),
                 )
             )
@@ -553,38 +570,61 @@ def calculate_per_property_validity(
     return results
 
 
+def _validate_edit_source(
+    row: ManifestRow, source_rows: dict[str, ManifestRow]
+) -> ManifestRow:
+    """Return the native source only when every join identity field matches"""
+    if row.stage != "edit":
+        raise ValueError(f"eligibility row {row.row_id} must have stage edit")
+    if not row.source_row_id:
+        raise ValueError(f"edit row {row.row_id} has no source_row_id")
+    if row.source_row_id == row.row_id:
+        raise ValueError(f"edit row {row.row_id} cannot reference itself")
+    if not row.source_property_id:
+        raise ValueError(f"edit row {row.row_id} has no source_property_id")
+    if not row.target_property_id:
+        raise ValueError(f"edit row {row.row_id} has no target_property_id")
+
+    source = source_rows.get(row.source_row_id)
+    if source is None or source.stage != "native":
+        raise ValueError(
+            f"edit row {row.row_id} source_row_id must reference a native row: "
+            f"{row.source_row_id}"
+        )
+    for field_name in (
+        "model_backbone",
+        "context_id",
+        "seed",
+        "design",
+        "conditioning",
+    ):
+        if getattr(row, field_name) != getattr(source, field_name):
+            raise ValueError(f"edit row {row.row_id} must match source {field_name}")
+    if row.source_property_id != source.property_id:
+        raise ValueError(
+            f"edit row {row.row_id} source_property_id does not match source"
+        )
+    if row.target_property_id != row.property_id:
+        raise ValueError(
+            f"edit row {row.row_id} target_property_id does not match target"
+        )
+    return source
+
+
 def calculate_eligibility(
     manifest: list[ManifestRow],
     scores: dict[str, ScoringRow],
+    source_rows: dict[str, ManifestRow],
 ) -> EligibilityStats:
-    """
-    Calculate edit eligibility statistics for edit stages.
-
-    An edit row is eligible if its source_row_id exists and the source
-    target is present (scored target_present=true).
-
-    Args:
-        manifest: list of manifest rows (should be edit stage only)
-        scores: mapping from row_id to score
-
-    Returns:
-        EligibilityStats with attempted and eligible counts
-    """
+    """Calculate source-valid edit eligibility using a strict native-row join"""
     n_attempted = len(manifest)
     n_eligible = 0
 
     for row in manifest:
-        if row.stage != "edit":
-            raise ValueError(f"eligibility row {row.row_id} must have stage edit")
-        if not row.source_row_id:
-            raise ValueError(f"edit row {row.row_id} has no source_row_id")
-        if row.source_row_id == row.row_id:
-            raise ValueError(f"edit row {row.row_id} cannot reference itself")
-        # a failed source render has no human score and is conservatively ineligible
-        if row.source_row_id not in scores:
-            continue
-        source_score = scores[row.source_row_id]
-        if source_score.target_present:
+        source = _validate_edit_source(row, source_rows)
+        # a failed source render is conservatively ineligible even if scores are malformed
+        source_score = scores.get(source.row_id) if source.status == "success" else None
+        if source_score is not None and source_score.target_present:
             n_eligible += 1
 
     rate = n_eligible / n_attempted if n_attempted > 0 else 0.0
@@ -602,6 +642,7 @@ def analyze_image_validity(
     gate_threshold: float = 0.90,
     blinding_mapping_path: Path | None = None,
     unblinded_scores_output: Path | None = None,
+    required_model_property_arms: set[tuple[str, str]] | None = None,
 ) -> dict[str, Any]:
     """Analyze bakeoff validity after optional authorized unblinding.
 
@@ -648,33 +689,7 @@ def analyze_image_validity(
         )
 
     for row in edit_rows:
-        if not row.source_row_id:
-            raise ValueError(f"edit row {row.row_id} has no source_row_id")
-        source = manifest_by_id.get(row.source_row_id)
-        if source is None or source.stage != "native":
-            raise ValueError(
-                f"edit row {row.row_id} source_row_id must reference a native row: "
-                f"{row.source_row_id}"
-            )
-        for field_name in ("model_backbone", "context_id", "seed"):
-            if getattr(row, field_name) != getattr(source, field_name):
-                raise ValueError(
-                    f"edit row {row.row_id} must match source {field_name}"
-                )
-        if (
-            row.source_property_id is not None
-            and row.source_property_id != source.property_id
-        ):
-            raise ValueError(
-                f"edit row {row.row_id} source_property_id does not match source"
-            )
-        if (
-            row.target_property_id is not None
-            and row.target_property_id != row.property_id
-        ):
-            raise ValueError(
-                f"edit row {row.row_id} target_property_id does not match target"
-            )
+        _validate_edit_source(row, manifest_by_id)
 
     # audit rows diagnose prompt wording but never inflate candidate bakeoff counts
     overall = calculate_validity(bakeoff_rows, scores, gate_threshold)
@@ -687,7 +702,9 @@ def analyze_image_validity(
             model_rows, scores, gate_threshold
         )
 
-    eligibility = calculate_eligibility(edit_rows, scores) if edit_rows else None
+    eligibility = (
+        calculate_eligibility(edit_rows, scores, manifest_by_id) if edit_rows else None
+    )
     scored_rows = [manifest_by_id[row_id] for row_id in scores]
     n_ambiguous = sum(scores[row.row_id].prompt_ambiguous for row in scored_rows)
     n_present = sum(scores[row.row_id].target_present for row in scored_rows)
@@ -708,6 +725,53 @@ def analyze_image_validity(
 
     failures = [row for row in manifest if row.status == "error"]
     bakeoff_failures = [row for row in bakeoff_rows if row.status == "error"]
+    observed_arms = {
+        (model, prop)
+        for model, properties in per_model_property.items()
+        for prop in properties
+    }
+    arm_contract = (
+        required_model_property_arms
+        if required_model_property_arms is not None
+        else {
+            (model, prop)
+            for model in {row.model_backbone for row in bakeoff_rows}
+            for prop in {row.property_id for row in bakeoff_rows}
+        }
+    )
+    unexpected_arms = observed_arms - arm_contract
+    if unexpected_arms:
+        raise ValueError(
+            "manifest contains model-property arms outside the required contract: "
+            f"{sorted(unexpected_arms)}"
+        )
+    failed_arms = []
+    for model, prop in sorted(arm_contract):
+        stats = per_model_property.get(model, {}).get(prop)
+        if stats is None:
+            failed_arms.append(
+                {
+                    "model_backbone": model,
+                    "property_id": prop,
+                    "n_total": 0,
+                    "n_valid": 0,
+                    "rate": 0.0,
+                    "ci_lower": 0.0,
+                    "ci_upper": 0.0,
+                    "passes_gate": False,
+                    "missing": True,
+                }
+            )
+        elif not stats.passes_gate:
+            failed_arms.append(
+                {
+                    "model_backbone": model,
+                    "property_id": prop,
+                    **stats_dict(stats),
+                    "missing": False,
+                }
+            )
+    required_arm_count = len(arm_contract)
     return {
         "gate_contract": {
             "design": "bakeoff",
@@ -717,6 +781,11 @@ def analyze_image_validity(
             "secondary_diagnostics": ["target_visible", "prompt_ambiguous"],
         },
         "overall": stats_dict(overall),
+        "qualification_decision": {
+            "passes_gate": required_arm_count > 0 and not failed_arms,
+            "required_model_property_arms": required_arm_count,
+            "failed_arms": failed_arms,
+        },
         "per_model": {model: stats_dict(stats) for model, stats in per_model.items()},
         "per_property": {
             prop: stats_dict(stats) for prop, stats in per_property.items()

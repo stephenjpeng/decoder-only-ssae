@@ -299,6 +299,8 @@ class TestLoadManifestJSONL(unittest.TestCase):
                         "stage": "edit",
                         "image_path": "/path/to/img2.png",
                         "source_row_id": "r1",
+                        "source_property_id": "red_sphere",
+                        "target_property_id": "blue_cube",
                     }
                 )
                 + "\n"
@@ -426,6 +428,36 @@ class TestLoadManifestJSONL(unittest.TestCase):
                 load_manifest_jsonl(jsonl_path)
         finally:
             jsonl_path.unlink()
+
+    def test_edit_requires_explicit_property_join_fields(self):
+        base = {
+            "row_id": "edit",
+            "model_backbone": "m1",
+            "property_id": "target",
+            "context_id": "c1",
+            "seed": 1,
+            "stage": "edit",
+            "image_path": "/edit.png",
+            "source_row_id": "source",
+            "source_property_id": "source-property",
+            "target_property_id": "target",
+        }
+        for field_name in ("source_property_id", "target_property_id"):
+            with (
+                self.subTest(field_name=field_name),
+                tempfile.NamedTemporaryFile(
+                    mode="w", suffix=".jsonl", delete=False
+                ) as file,
+            ):
+                row = dict(base)
+                row.pop(field_name)
+                file.write(json.dumps(row) + "\n")
+                path = Path(file.name)
+            try:
+                with self.assertRaisesRegex(ValueError, field_name):
+                    load_manifest_jsonl(path)
+            finally:
+                path.unlink()
 
     def test_manifest_rejects_unknown_stage(self):
         row = {
@@ -596,42 +628,151 @@ class TestCalculateEligibility(unittest.TestCase):
     """Test edit eligibility calculation"""
 
     def test_basic_eligibility(self):
-        manifest = [
-            ManifestRow("e1", "m1", "p1", "c1", 1, "edit", "/img1.png", "src1"),
-            ManifestRow("e2", "m1", "p1", "c1", 2, "edit", "/img2.png", "src2"),
-            ManifestRow("e3", "m1", "p1", "c1", 3, "edit", "/img3.png", "src1"),
-        ]
-        scores = {
-            "src1": ScoringRow("src1", True, True, False, ""),  # eligible
-            "src2": ScoringRow("src2", False, False, False, ""),  # not eligible
+        sources = {
+            "src1": ManifestRow(
+                "src1", "m1", "source", "c1", 1, "native", "/src1.png", None
+            ),
+            "src2": ManifestRow(
+                "src2", "m1", "source", "c1", 2, "native", "/src2.png", None
+            ),
         }
-
-        eligibility = calculate_eligibility(manifest, scores)
-
-        self.assertEqual(eligibility.n_attempted, 3)
-        self.assertEqual(eligibility.n_eligible, 2)  # e1 and e3 both reference src1
-        self.assertAlmostEqual(eligibility.rate, 2 / 3)
-
-    def test_unscored_source_is_conservatively_ineligible(self):
         manifest = [
-            ManifestRow("e1", "m1", "p1", "c1", 1, "edit", "/img1.png", "src1"),
-            ManifestRow("e2", "m1", "p1", "c1", 2, "edit", "/img2.png", "src_missing"),
+            ManifestRow(
+                "e1",
+                "m1",
+                "p1",
+                "c1",
+                1,
+                "edit",
+                "/img1.png",
+                "src1",
+                source_property_id="source",
+                target_property_id="p1",
+            ),
+            ManifestRow(
+                "e2",
+                "m1",
+                "p1",
+                "c1",
+                2,
+                "edit",
+                "/img2.png",
+                "src2",
+                source_property_id="source",
+                target_property_id="p1",
+            ),
+            ManifestRow(
+                "e3",
+                "m1",
+                "p1",
+                "c1",
+                1,
+                "edit",
+                "/img3.png",
+                "src1",
+                source_property_id="source",
+                target_property_id="p1",
+            ),
         ]
         scores = {
             "src1": ScoringRow("src1", True, True, False, ""),
+            "src2": ScoringRow("src2", False, False, False, ""),
         }
 
-        eligibility = calculate_eligibility(manifest, scores)
+        eligibility = calculate_eligibility(manifest, scores, sources)
+
+        self.assertEqual(eligibility.n_attempted, 3)
+        self.assertEqual(eligibility.n_eligible, 2)
+        self.assertAlmostEqual(eligibility.rate, 2 / 3)
+
+    def test_unscored_source_is_conservatively_ineligible(self):
+        sources = {
+            "src1": ManifestRow(
+                "src1", "m1", "source", "c1", 1, "native", "/src1.png", None
+            ),
+            "src_missing": ManifestRow(
+                "src_missing",
+                "m1",
+                "source",
+                "c1",
+                2,
+                "native",
+                None,
+                None,
+                status="error",
+            ),
+        }
+        manifest = [
+            ManifestRow(
+                "e1",
+                "m1",
+                "p1",
+                "c1",
+                1,
+                "edit",
+                "/img1.png",
+                "src1",
+                source_property_id="source",
+                target_property_id="p1",
+            ),
+            ManifestRow(
+                "e2",
+                "m1",
+                "p1",
+                "c1",
+                2,
+                "edit",
+                "/img2.png",
+                "src_missing",
+                source_property_id="source",
+                target_property_id="p1",
+            ),
+        ]
+        scores = {"src1": ScoringRow("src1", True, True, False, "")}
+
+        eligibility = calculate_eligibility(manifest, scores, sources)
         self.assertEqual(eligibility.n_attempted, 2)
         self.assertEqual(eligibility.n_eligible, 1)
 
+    def test_wrong_property_native_row_cannot_confer_eligibility(self):
+        source = ManifestRow(
+            "source", "m1", "wrong-property", "c1", 1, "native", "/source.png", None
+        )
+        edit = ManifestRow(
+            "edit",
+            "m1",
+            "target-property",
+            "c1",
+            1,
+            "edit",
+            "/edit.png",
+            "source",
+            source_property_id="expected-property",
+            target_property_id="target-property",
+        )
+        scores = {"source": ScoringRow("source", True, True, False, "")}
+
+        with self.assertRaisesRegex(ValueError, "source_property_id"):
+            calculate_eligibility([edit], scores, {"source": source})
+
     def test_no_source_row_id(self):
         manifest = [
-            ManifestRow("e1", "m1", "p1", "c1", 1, "edit", "/img1.png", None),
+            ManifestRow(
+                "e1",
+                "m1",
+                "p1",
+                "c1",
+                1,
+                "edit",
+                "/img1.png",
+                None,
+                source_property_id="source",
+                target_property_id="p1",
+            ),
         ]
 
         with self.assertRaisesRegex(ValueError, "has no source_row_id"):
-            calculate_eligibility(manifest, {})
+            calculate_eligibility(manifest, {}, {})
 
     def test_non_edit_row_rejected(self):
         manifest = [
@@ -639,10 +780,10 @@ class TestCalculateEligibility(unittest.TestCase):
         ]
 
         with self.assertRaisesRegex(ValueError, "must have stage edit"):
-            calculate_eligibility(manifest, {})
+            calculate_eligibility(manifest, {}, {})
 
     def test_empty_manifest_eligibility(self):
-        eligibility = calculate_eligibility([], {})
+        eligibility = calculate_eligibility([], {}, {})
         self.assertEqual(eligibility.n_attempted, 0)
         self.assertEqual(eligibility.n_eligible, 0)
         self.assertEqual(eligibility.rate, 0.0)
@@ -765,6 +906,8 @@ class TestEndToEnd(unittest.TestCase):
                             "stage": "edit",
                             "image_path": "/e1.png",
                             "source_row_id": "n1",
+                            "source_property_id": "p1",
+                            "target_property_id": "p1",
                         }
                     )
                     + "\n"
@@ -780,6 +923,8 @@ class TestEndToEnd(unittest.TestCase):
                             "stage": "edit",
                             "image_path": "/e2.png",
                             "source_row_id": "n2",
+                            "source_property_id": "p1",
+                            "target_property_id": "p1",
                         }
                     )
                     + "\n"
@@ -866,6 +1011,8 @@ class TestEndToEnd(unittest.TestCase):
                             "stage": "edit",
                             "image_path": "/e1.png",
                             "source_row_id": "r1",
+                            "source_property_id": "p1",
+                            "target_property_id": "p1",
                         }
                     )
                     + "\n"
@@ -968,6 +1115,8 @@ class TestEndToEnd(unittest.TestCase):
                                 "stage": "edit",
                                 "image_path": f"/e{i}.png",
                                 "source_row_id": "n0",
+                                "source_property_id": "p1",
+                                "target_property_id": "p1",
                             }
                         )
                         + "\n"
@@ -1018,6 +1167,8 @@ class TestEndToEnd(unittest.TestCase):
                     "seed": 2,
                     "stage": "edit",
                     "image_path": "/e1.png",
+                    "source_property_id": "p1",
+                    "target_property_id": "p1",
                 },
             ]
             manifest_path.write_text(
@@ -1057,6 +1208,8 @@ class TestEndToEnd(unittest.TestCase):
                     "stage": "edit",
                     "image_path": "/e1.png",
                     "source_row_id": "n1",
+                    "source_property_id": "p1",
+                    "target_property_id": "p1",
                 },
                 {
                     "row_id": "e2",
@@ -1067,6 +1220,8 @@ class TestEndToEnd(unittest.TestCase):
                     "stage": "edit",
                     "image_path": "/e2.png",
                     "source_row_id": "e1",
+                    "source_property_id": "p1",
+                    "target_property_id": "p1",
                 },
             ]
             manifest_path.write_text(
@@ -1110,6 +1265,8 @@ class TestEndToEnd(unittest.TestCase):
             ("model_backbone", "m2", "model_backbone"),
             ("context_id", "c2", "context_id"),
             ("seed", 10, "seed"),
+            ("design", "audit", "design"),
+            ("conditioning", "packed", "conditioning"),
             ("source_property_id", "wrong", "source_property_id"),
             ("target_property_id", "wrong", "target_property_id"),
         )
@@ -1219,13 +1376,87 @@ class TestCLI(unittest.TestCase):
             ]
 
             stdout = StringIO()
-            with patch("sys.argv", argv), redirect_stdout(stdout):
+            with (
+                patch("sys.argv", argv),
+                patch(
+                    "evaluation.run_image_validity_analysis.required_bakeoff_arms",
+                    return_value={("m1", "p1")},
+                ),
+                redirect_stdout(stdout),
+            ):
                 exit_code = validity_main()
 
             self.assertEqual(exit_code, 0)
             self.assertTrue(json_path.is_file())
             self.assertTrue(csv_path.is_file())
-            self.assertIn("passes 90% gate: True", stdout.getvalue())
+            self.assertIn("qualification decision: PASS", stdout.getvalue())
+            self.assertIn("diagnostic, not gate", stdout.getvalue())
+
+    def test_cli_gate_is_conjunctive_and_names_failed_arms(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            rows = []
+            score_lines = []
+            for index in range(11):
+                weak_arm = index < 2
+                row_id = f"row-{index}"
+                rows.append(
+                    {
+                        "row_id": row_id,
+                        "model_backbone": "m1",
+                        "property_id": "weak" if weak_arm else "strong",
+                        "context_id": "c1",
+                        "seed": index,
+                        "stage": "native",
+                        "image_path": f"/{row_id}.png",
+                    }
+                )
+                present = index != 0
+                score_lines.append(f"{row_id},{str(present).lower()},true,false,\n")
+            manifest_path = root / "manifest.jsonl"
+            manifest_path.write_text(
+                "".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8"
+            )
+            scores_path = root / "scores.csv"
+            scores_path.write_text(
+                "row_id,target_present,target_visible,prompt_ambiguous,notes\n"
+                + "".join(score_lines),
+                encoding="utf-8",
+            )
+            argv = [
+                "run_image_validity_analysis",
+                "--manifest",
+                str(manifest_path),
+                "--scores",
+                str(scores_path),
+                "--output-json",
+                str(root / "results.json"),
+                "--output-csv",
+                str(root / "summary.csv"),
+            ]
+
+            stdout = StringIO()
+            required_arms = {("m1", "weak"), ("m1", "strong"), ("m2", "missing")}
+            with (
+                patch("sys.argv", argv),
+                patch(
+                    "evaluation.run_image_validity_analysis.required_bakeoff_arms",
+                    return_value=required_arms,
+                ),
+                redirect_stdout(stdout),
+            ):
+                exit_code = validity_main()
+
+            self.assertEqual(exit_code, 0)
+            self.assertIn("qualification decision: FAIL", stdout.getvalue())
+            self.assertIn("failed arm: m1 / weak", stdout.getvalue())
+            self.assertIn("failed arm: m2 / missing", stdout.getvalue())
+            results = json.loads((root / "results.json").read_text())
+            self.assertGreaterEqual(results["overall"]["rate"], 0.90)
+            self.assertFalse(results["qualification_decision"]["passes_gate"])
+            missing = results["qualification_decision"]["failed_arms"][1]
+            self.assertTrue(missing["missing"])
+            self.assertEqual(missing["n_total"], 0)
 
     def test_cli_returns_error_for_invalid_input(self):
         with tempfile.TemporaryDirectory() as tmpdir:

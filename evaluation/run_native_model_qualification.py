@@ -22,6 +22,7 @@ from evaluation.image_qualification import (
     build_bakeoff_plan,
     validate_coverage,
 )
+from trainings.utils.run_manifest import git_provenance
 
 _MODEL_BASE_CONFIGS: dict[str, dict[str, Any]] = {
     "sd35_large_turbo": {
@@ -68,6 +69,7 @@ _CONFIG_MARKER_FIELDS = (
     "revision",
 )
 _SCORE_FIELDS = ("target_present", "target_visible", "prompt_ambiguous", "notes")
+QUALIFICATION_RENDER_CONTRACT_VERSION = 1
 
 
 def parse_args() -> argparse.Namespace:
@@ -104,6 +106,48 @@ def load_existing_manifest(manifest_path: Path) -> dict[str, dict[str, Any]]:
                 row = json.loads(line)
                 rows[row["row_id"]] = row
     return rows
+
+
+def prune_manifest_rows(
+    rows: dict[str, dict[str, Any]],
+    planned_row_ids: set[str],
+    output_dir: Path,
+) -> tuple[dict[str, dict[str, Any]], int]:
+    """Remove obsolete rows and their image artifacts inside the qualification output"""
+    obsolete = {
+        row_id: row for row_id, row in rows.items() if row_id not in planned_row_ids
+    }
+    retained = {
+        row_id: row for row_id, row in rows.items() if row_id in planned_row_ids
+    }
+    output_root = Path(os.path.abspath(output_dir))
+
+    def artifact_path(row: dict[str, Any]) -> Path | None:
+        """Normalize a manifest artifact path without following symlinks"""
+        value = row.get("image_path")
+        return Path(os.path.abspath(value)) if value else None
+
+    retained_paths = {
+        path for row in retained.values() if (path := artifact_path(row)) is not None
+    }
+    deletion_paths: set[Path] = set()
+    for row_id, row in obsolete.items():
+        image_path = artifact_path(row)
+        if image_path is None or not (image_path.exists() or image_path.is_symlink()):
+            continue
+        if not image_path.is_relative_to(output_root):
+            raise ValueError(
+                f"refusing to prune obsolete row {row_id} with image outside "
+                f"qualification output: {image_path}"
+            )
+        if image_path not in retained_paths:
+            deletion_paths.add(image_path)
+
+    # validation finishes before mutation, so rejection cannot partially prune a run
+    for image_path in deletion_paths:
+        image_path.unlink()
+
+    return retained, len(obsolete)
 
 
 def write_manifest(manifest_path: Path, rows: dict[str, dict[str, Any]]) -> None:
@@ -251,14 +295,33 @@ def fingerprint_model_configuration(configuration: dict[str, Any]) -> str:
     return hashlib.sha256(canonical.encode()).hexdigest()[:16]
 
 
+def qualification_repository_revision(repo_dir: Path | str = ".") -> str:
+    """Return the clean repository revision required for a real render"""
+    provenance = git_provenance(repo_dir)
+    if not provenance.get("sha"):
+        raise SystemExit("qualification rendering requires a Git repository revision")
+    if provenance.get("dirty") is not False:
+        raise SystemExit(
+            "qualification rendering requires a clean Git working tree; "
+            "commit or remove local changes before rendering"
+        )
+    return str(provenance["sha"])
+
+
 def qualification_identity(
-    row: RenderRow, spec_fingerprint: str, model_fingerprint: str
+    row: RenderRow,
+    spec_fingerprint: str,
+    model_fingerprint: str,
+    repository_code_revision: str,
+    render_contract_version: int,
 ) -> str:
-    """Bind one rendered pixel artifact to its spec, model, and render contract."""
+    """Bind one rendered pixel artifact to code, spec, model, and render contract"""
     payload = {
         "row": row.to_dict(),
         "spec_fingerprint": spec_fingerprint,
         "model_fingerprint": model_fingerprint,
+        "repository_code_revision": repository_code_revision,
+        "qualification_render_contract_version": render_contract_version,
     }
     canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(canonical.encode()).hexdigest()[:24]
@@ -270,6 +333,8 @@ def manifest_success_matches(
     spec_fingerprint: str,
     model_configuration: dict[str, Any],
     model_fingerprint: str,
+    repository_code_revision: str,
+    render_contract_version: int,
 ) -> bool:
     """Return whether a saved success matches the complete direct render contract."""
     expected = {
@@ -277,8 +342,14 @@ def manifest_success_matches(
         "spec_fingerprint": spec_fingerprint,
         "model_configuration": model_configuration,
         "model_fingerprint": model_fingerprint,
+        "repository_code_revision": repository_code_revision,
+        "qualification_render_contract_version": render_contract_version,
         "render_contract_fingerprint": qualification_identity(
-            row, spec_fingerprint, model_fingerprint
+            row,
+            spec_fingerprint,
+            model_fingerprint,
+            repository_code_revision,
+            render_contract_version,
         ),
         "status": "success",
     }
@@ -475,6 +546,9 @@ def _write_dry_run_plan(
 def main() -> None:
     """Render the qualification plan through native direct-text dispatch."""
     args = parse_args()
+    repository_code_revision = (
+        None if args.dry_run else qualification_repository_revision()
+    )
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     spec = PromptSpec.load(args.prompt_spec)
@@ -491,8 +565,17 @@ def main() -> None:
         _write_dry_run_plan(output_dir, spec_fingerprint, audit_rows, bakeoff_rows)
         return
 
+    # pixels must be reproducible from the recorded revision alone
+    if repository_code_revision is None:
+        raise RuntimeError("real qualification run has no repository revision")
+    render_contract_version = QUALIFICATION_RENDER_CONTRACT_VERSION
     manifest_path = output_dir / "manifest.jsonl"
     manifest = load_existing_manifest(manifest_path)
+    manifest, obsolete_count = prune_manifest_rows(
+        manifest, {row.row_id for row in all_rows}, output_dir
+    )
+    if obsolete_count:
+        print(f"pruned {obsolete_count} obsolete manifest row(s)")
     # canonicalize duplicate legacy rows even when every render can be resumed
     write_manifest(manifest_path, manifest)
     rows_by_backbone: dict[str, list[RenderRow]] = {}
@@ -525,7 +608,11 @@ def main() -> None:
             skipped_count = 0
             for index, row in enumerate(rows, start=1):
                 contract_identity = qualification_identity(
-                    row, spec_fingerprint, model_fingerprint
+                    row,
+                    spec_fingerprint,
+                    model_fingerprint,
+                    repository_code_revision,
+                    render_contract_version,
                 )
                 image_path = private_images / f"{row.row_id}.{contract_identity}.png"
                 existing = manifest.get(row.row_id, {})
@@ -542,8 +629,11 @@ def main() -> None:
                         spec_fingerprint,
                         model_configuration,
                         model_fingerprint,
+                        repository_code_revision,
+                        render_contract_version,
                     )
                 ):
+                    existing_path.chmod(0o600)
                     skipped_count += 1
                     continue
 
@@ -555,6 +645,8 @@ def main() -> None:
                     "model_fingerprint": model_fingerprint,
                     "model_configuration": model_configuration,
                     "spec_fingerprint": spec_fingerprint,
+                    "repository_code_revision": repository_code_revision,
+                    "qualification_render_contract_version": render_contract_version,
                     "render_contract_fingerprint": contract_identity,
                     "render_attempt_id": render_attempt_id,
                     "qualification_identity": f"{contract_identity}-{render_attempt_id}",
@@ -574,10 +666,12 @@ def main() -> None:
                         raise RuntimeError(
                             f"backbone generate did not create image at {image_path}"
                         )
+                    image_path.chmod(0o600)
                     if old_path_value and Path(old_path_value) != image_path:
                         Path(old_path_value).unlink(missing_ok=True)
                 except Exception as err:
                     print(f"render error for {row.row_id}: {err}")
+                    image_path.unlink(missing_ok=True)
                     manifest_row["status"] = "error"
                     manifest_row["error"] = str(err)
                     manifest_row["image_path"] = None

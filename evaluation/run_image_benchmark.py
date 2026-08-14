@@ -79,7 +79,11 @@ from evaluation.composition import (
     property_block_means_trainable_inputs,
     predict_embedding_compositional,
 )
-from evaluation.io import ensure_folder_path, h5_dataset_for_folder, load_decoder_checkpoint
+from evaluation.io import (
+    ensure_folder_path,
+    h5_dataset_for_folder,
+    load_decoder_checkpoint,
+)
 from evaluation.lpips_metric import lpips_alex
 from evaluation.pixel_metrics import pixel_mse, ssim
 from evaluation.sd3_pack import (
@@ -132,13 +136,13 @@ def _resolve_property(dataset, name: str) -> int:
             return int(pid)
     raise SystemExit(
         f"unknown property {name!r}. Valid: "
-        + ", ".join(repr(props.pid_to_property[p]) for p in sorted(props.pid_to_property))
+        + ", ".join(
+            repr(props.pid_to_property[p]) for p in sorted(props.pid_to_property)
+        )
     )
 
 
-def _choose_swap_target_pid(
-    dataset, active_pid: int, rng: random.Random
-) -> int | None:
+def _choose_swap_target_pid(dataset, active_pid: int, rng: random.Random) -> int | None:
     """Return a random pid in the same category as ``active_pid`` but different from it, or None."""
     props = dataset.properties
     cid = props.pid_to_cid[active_pid]
@@ -148,7 +152,9 @@ def _choose_swap_target_pid(
     return rng.choice(alternatives)
 
 
-def _category_marginal_mask(dataset, mask_row: torch.Tensor, target_pid: int) -> torch.Tensor:
+def _category_marginal_mask(
+    dataset, mask_row: torch.Tensor, target_pid: int
+) -> torch.Tensor:
     """Replace ``target_pid`` with the uniform marginal over its category"""
     props = dataset.properties
     cid = props.pid_to_cid[target_pid]
@@ -187,6 +193,19 @@ def _shared_baseline_cache_enabled(
 ) -> bool:
     """Use shared storage only for real renders"""
     return use_baseline_cache and not simulated
+
+
+def _locality_cache_properties(
+    *,
+    locality_drop_one_attr: bool,
+    locality_swap_one_attr: bool,
+    target_property: str | None,
+    replacement_property: str | None,
+) -> tuple[str | None, str | None]:
+    """Return property identity only when locality variants can change cached pixels"""
+    if not (locality_drop_one_attr or locality_swap_one_attr):
+        return None, None
+    return target_property, replacement_property
 
 
 def _populated_cache_methods(cache: BaselineCache) -> tuple[str, ...]:
@@ -287,7 +306,12 @@ def _merge_row(cached: dict, fresh: dict) -> dict:
 
 def _ci_dict(vals: list[float], n_boot: int, seed: int) -> dict:
     if not vals:
-        return {"mean": float("nan"), "ci_low": float("nan"), "ci_high": float("nan"), "n": 0}
+        return {
+            "mean": float("nan"),
+            "ci_low": float("nan"),
+            "ci_high": float("nan"),
+            "n": 0,
+        }
     mean, lo, hi = bootstrap_mean_ci(vals, n_boot=n_boot, seed=seed)
     return {"mean": mean, "ci_low": lo, "ci_high": hi, "n": len(vals)}
 
@@ -352,9 +376,13 @@ def run_image_benchmark(
     probe_artifact: dict | None = None
     if "linear_probe_direction" in methods:
         if probe_artifact_path is None:
-            raise SystemExit("--probe_artifact is required when 'linear_probe_direction' is in --methods")
+            raise SystemExit(
+                "--probe_artifact is required when 'linear_probe_direction' is in --methods"
+            )
         if "gt_embed" not in methods:
-            raise SystemExit("'gt_embed' must be in --methods when using 'linear_probe_direction' (its post image is reused)")
+            raise SystemExit(
+                "'gt_embed' must be in --methods when using 'linear_probe_direction' (its post image is reused)"
+            )
 
     decoder, tp, train_ds = load_decoder_checkpoint(checkpoint_dir, device=ssae_device)
     holdout_ds = h5_dataset_for_folder(checkpoint_dir, holdout_folder)
@@ -403,7 +431,17 @@ def run_image_benchmark(
     if _shared_baseline_cache_enabled(
         use_baseline_cache=use_baseline_cache, simulated=simulated
     ):
-        cache_root = Path(baseline_cache_root) if baseline_cache_root else DEFAULT_BASELINE_CACHE_ROOT
+        cache_root = (
+            Path(baseline_cache_root)
+            if baseline_cache_root
+            else DEFAULT_BASELINE_CACHE_ROOT
+        )
+        cache_target, cache_replacement = _locality_cache_properties(
+            locality_drop_one_attr=locality_drop_one_attr,
+            locality_swap_one_attr=locality_swap_one_attr,
+            target_property=target_property,
+            replacement_property=replacement_property,
+        )
         cache = load_or_create(
             cache_root,
             holdout_folder=holdout_folder,
@@ -414,6 +452,8 @@ def run_image_benchmark(
             sd3_fingerprint=ImageGenerator.fingerprint(),
             truncate_embds_topk_indices=topk_indices,
             packer_fingerprint=packer_meta,
+            target_property=cache_target,
+            replacement_property=cache_replacement,
         )
         cache_methods = {m for m in methods if m in BASELINE_METHODS}
         loaded_fits = cache.load_fits()
@@ -437,9 +477,13 @@ def run_image_benchmark(
 
     # E3 targeted-concept mode. `target_property` names the concept to delete/replace;
     # `replacement_property` fixes the on-manifold counterfactual instead of sampling one.
-    target_pid = _resolve_property(holdout_ds, target_property) if target_property else None
+    target_pid = (
+        _resolve_property(holdout_ds, target_property) if target_property else None
+    )
     replacement_pid = (
-        _resolve_property(holdout_ds, replacement_property) if replacement_property else None
+        _resolve_property(holdout_ds, replacement_property)
+        if replacement_property
+        else None
     )
     if replacement_pid is not None:
         if target_pid is None:
@@ -513,7 +557,9 @@ def run_image_benchmark(
 
         if do_drop or do_swap:
             edit_pid = (
-                target_pid if target_pid is not None else _choose_edit_pid(mask_t, sample_rng)
+                target_pid
+                if target_pid is not None
+                else _choose_edit_pid(mask_t, sample_rng)
             )
             if edit_pid is None:
                 do_drop = False
@@ -554,7 +600,11 @@ def run_image_benchmark(
                 block_means=block_means,
             )
             mse_ssae = torch.nn.functional.mse_loss(pred_ssae, x_tgt).item()
-            cos_ssae = torch.nn.functional.cosine_similarity(pred_ssae, x_tgt, dim=-1).mean().item()
+            cos_ssae = (
+                torch.nn.functional.cosine_similarity(pred_ssae, x_tgt, dim=-1)
+                .mean()
+                .item()
+            )
         else:
             pred_ssae = None
             mse_ssae = float("nan")
@@ -570,7 +620,9 @@ def run_image_benchmark(
         pred_ssae_pre = pred_ma_pre = pred_ridge_pre = None
         if do_drop:
             if drop_operator == "category_marginal":
-                mask_pre_ds = _category_marginal_mask(holdout_ds, mask_row_ds, edit_pid).to(dev_dec)
+                mask_pre_ds = _category_marginal_mask(
+                    holdout_ds, mask_row_ds, edit_pid
+                ).to(dev_dec)
             else:
                 mask_pre_ds = mask_row_ds.clone().float()
                 mask_pre_ds[edit_pid] = 0
@@ -585,7 +637,9 @@ def run_image_benchmark(
                     block_means=block_means,
                 )
             M_pre_cpu = mask_pre_ds.float().cpu().unsqueeze(0)
-            pred_ma_pre = predict_mean_arithmetic(mu_ma, deltas_ma, M_pre_cpu).to(dev_base)
+            pred_ma_pre = predict_mean_arithmetic(mu_ma, deltas_ma, M_pre_cpu).to(
+                dev_base
+            )
             pred_ridge_pre = predict_linear(M_pre_cpu, W_ridge).to(dev_base)
 
         pred_ssae_swap = pred_ma_swap = pred_ridge_swap = None
@@ -593,7 +647,9 @@ def run_image_benchmark(
             mask_swap_ds = mask_row_ds.clone()
             mask_swap_ds[edit_pid] = 0
             mask_swap_ds[swap_target_pid] = 1
-            ref_tid_swap = _find_ref_training_tid(train_mask, mask_swap_ds, swap_target_pid)
+            ref_tid_swap = _find_ref_training_tid(
+                train_mask, mask_swap_ds, swap_target_pid
+            )
             if want_ssae:
                 pred_ssae_swap = predict_embedding_compositional(
                     decoder,
@@ -605,7 +661,9 @@ def run_image_benchmark(
                     block_means=block_means,
                 )
             M_swap_cpu = mask_swap_ds.float().cpu().unsqueeze(0)
-            pred_ma_swap = predict_mean_arithmetic(mu_ma, deltas_ma, M_swap_cpu).to(dev_base)
+            pred_ma_swap = predict_mean_arithmetic(mu_ma, deltas_ma, M_swap_cpu).to(
+                dev_base
+            )
             pred_ridge_swap = predict_linear(M_swap_cpu, W_ridge).to(dev_base)
 
         for method in methods:
@@ -619,7 +677,9 @@ def run_image_benchmark(
                 out_path = img_root / method / f"{idx:05d}.png"
                 out_path.parent.mkdir(parents=True, exist_ok=True)
 
-            post_cached = is_cached_method and out_path.exists() and cache.has_row(method, idx)
+            post_cached = (
+                is_cached_method and out_path.exists() and cache.has_row(method, idx)
+            )
             if method == "gt_embed":
                 ref_paths[idx] = out_path
 
@@ -628,15 +688,24 @@ def run_image_benchmark(
                 pass
             else:
                 if method == "gt_embed":
-                    pe, pp = pack_sd3_from_truncated_normalized(holdout_ds, idx, x_tgt.cpu(), template=pack_template)
+                    pe, pp = pack_sd3_from_truncated_normalized(
+                        holdout_ds, idx, x_tgt.cpu(), template=pack_template
+                    )
                 elif method == "ssae_compose":
                     pe, pp = pack_sd3_from_truncated_normalized(
-                        holdout_ds, idx, pred_ssae.detach().cpu(), template=pack_template
+                        holdout_ds,
+                        idx,
+                        pred_ssae.detach().cpu(),
+                        template=pack_template,
                     )
                 elif method == "mean_arithmetic":
-                    pe, pp = pack_sd3_from_truncated_normalized(holdout_ds, idx, pred_ma.cpu(), template=pack_template)
+                    pe, pp = pack_sd3_from_truncated_normalized(
+                        holdout_ds, idx, pred_ma.cpu(), template=pack_template
+                    )
                 elif method == "ridge_embed":
-                    pe, pp = pack_sd3_from_truncated_normalized(holdout_ds, idx, pred_ridge.cpu(), template=pack_template)
+                    pe, pp = pack_sd3_from_truncated_normalized(
+                        holdout_ds, idx, pred_ridge.cpu(), template=pack_template
+                    )
                 elif method == "native_prompt":
                     pe, pp = None, None
                 elif method == "prompt_only":
@@ -651,12 +720,14 @@ def run_image_benchmark(
                     gt_post_path = ref_paths.get(idx)
                     if gt_post_path is not None and gt_post_path.exists():
                         import os
+
                         out_path.parent.mkdir(parents=True, exist_ok=True)
                         if not out_path.exists():
                             try:
                                 os.link(gt_post_path, out_path)
                             except OSError:
                                 import shutil
+
                                 shutil.copy2(gt_post_path, out_path)
                     pe, pp = None, None  # skip generation below
                 else:
@@ -686,7 +757,9 @@ def run_image_benchmark(
                 "prompt": prompt_text,
                 "edit_pid": edit_pid if edit_pid is not None else "",
                 "edit_attribute": edit_attribute,
-                "swap_target_pid": swap_target_pid if swap_target_pid is not None else "",
+                "swap_target_pid": swap_target_pid
+                if swap_target_pid is not None
+                else "",
                 "swap_target_attribute": swap_target_attribute,
                 "swapped_prompt": swapped_prompt,
                 "mse_embedding_vs_gt": "",
@@ -723,8 +796,12 @@ def run_image_benchmark(
                     row["intervention_source"] = "true_holdout_topk_embedding"
                     if probe_artifact is not None:
                         row["probe_artifact"] = str(probe_artifact_path)
-                        row["probe_delete_alpha"] = probe_artifact.get("delete_alpha", "")
-                        row["probe_replace_alpha"] = probe_artifact.get("replace_alpha", "")
+                        row["probe_delete_alpha"] = probe_artifact.get(
+                            "delete_alpha", ""
+                        )
+                        row["probe_replace_alpha"] = probe_artifact.get(
+                            "replace_alpha", ""
+                        )
 
                 if clip_scorer is not None:
                     row["clip_image_vs_full_prompt"] = clip_scorer.image_text_cosine(
@@ -733,14 +810,16 @@ def run_image_benchmark(
                     al = clip_scorer.image_attribute_alignment(out_path, attrs)
                     row["clip_mean_vs_attrs"] = al["mean_cosine_attr"]
                     row["clip_min_vs_attrs"] = al["min_cosine_attr"]
-                    row["clip_fail"] = float(row["clip_image_vs_full_prompt"] < clip_failure_threshold)
+                    row["clip_fail"] = float(
+                        row["clip_image_vs_full_prompt"] < clip_failure_threshold
+                    )
                     if do_drop:
-                        row["clip_image_vs_residual_prompt"] = clip_scorer.image_text_cosine(
-                            out_path, residual_prompt
+                        row["clip_image_vs_residual_prompt"] = (
+                            clip_scorer.image_text_cosine(out_path, residual_prompt)
                         )
                     if edit_attribute:
-                        row["clip_normal_vs_target_phrase"] = clip_scorer.image_text_cosine(
-                            out_path, edit_attribute
+                        row["clip_normal_vs_target_phrase"] = (
+                            clip_scorer.image_text_cosine(out_path, edit_attribute)
                         )
                 else:
                     row["clip_image_vs_full_prompt"] = ""
@@ -761,7 +840,12 @@ def run_image_benchmark(
                         ref_paths[idx], out_path, d_m, d_tf, d_dev
                     )
 
-                if not skip_lpips and method != "gt_embed" and idx in ref_paths and not simulated:
+                if (
+                    not skip_lpips
+                    and method != "gt_embed"
+                    and idx in ref_paths
+                    and not simulated
+                ):
                     lp = lpips_alex(ref_paths[idx], out_path, device=clip_device)
                     row["lpips_vs_gt_embed"] = lp if lp is not None else ""
                 else:
@@ -796,7 +880,10 @@ def run_image_benchmark(
                         )
                     elif method == "ssae_compose":
                         pe_pre, pp_pre = pack_sd3_from_truncated_normalized(
-                            holdout_ds, idx, pred_ssae_pre.detach().cpu(), template=pack_template
+                            holdout_ds,
+                            idx,
+                            pred_ssae_pre.detach().cpu(),
+                            template=pack_template,
                         )
                     elif method == "mean_arithmetic":
                         pe_pre, pp_pre = pack_sd3_from_truncated_normalized(
@@ -804,9 +891,15 @@ def run_image_benchmark(
                         )
                     elif method == "ridge_embed":
                         pe_pre, pp_pre = pack_sd3_from_truncated_normalized(
-                            holdout_ds, idx, pred_ridge_pre.cpu(), template=pack_template
+                            holdout_ds,
+                            idx,
+                            pred_ridge_pre.cpu(),
+                            template=pack_template,
                         )
-                    elif method == "linear_probe_direction" and probe_artifact is not None:
+                    elif (
+                        method == "linear_probe_direction"
+                        and probe_artifact is not None
+                    ):
                         # deletion: x_tgt - delete_alpha * delete_direction
                         d_del = probe_artifact["delete_direction"].to(x_tgt.device)
                         alpha_del = probe_artifact.get("delete_alpha") or 0.0
@@ -825,7 +918,9 @@ def run_image_benchmark(
                         else:
                             pe_pre = pe_pre.to(sd_device)
                             pp_pre = pp_pre.to(sd_device)
-                            gen.generate_image_from_embd(pe_pre, pp_pre, pre_path, seed=seed_i)
+                            gen.generate_image_from_embd(
+                                pe_pre, pp_pre, pre_path, seed=seed_i
+                            )
                     else:
                         _write_placeholder_png(pre_path)
 
@@ -834,8 +929,8 @@ def run_image_benchmark(
                     row["ssim_pre_post_edit"] = ssim(pre_path, out_path)
 
                 if clip_scorer is not None and not pre_cached and edit_attribute:
-                    row["clip_deleted_vs_target_phrase"] = clip_scorer.image_text_cosine(
-                        pre_path, edit_attribute
+                    row["clip_deleted_vs_target_phrase"] = (
+                        clip_scorer.image_text_cosine(pre_path, edit_attribute)
                     )
 
             if do_swap and method != "gt_embed":
@@ -858,17 +953,29 @@ def run_image_benchmark(
                         )
                     elif method == "ssae_compose":
                         pe_sw, pp_sw = pack_sd3_from_truncated_normalized(
-                            train_ds, ref_tid_swap, pred_ssae_swap.detach().cpu(), template=pack_template
+                            train_ds,
+                            ref_tid_swap,
+                            pred_ssae_swap.detach().cpu(),
+                            template=pack_template,
                         )
                     elif method == "mean_arithmetic":
                         pe_sw, pp_sw = pack_sd3_from_truncated_normalized(
-                            train_ds, ref_tid_swap, pred_ma_swap.cpu(), template=pack_template
+                            train_ds,
+                            ref_tid_swap,
+                            pred_ma_swap.cpu(),
+                            template=pack_template,
                         )
                     elif method == "ridge_embed":
                         pe_sw, pp_sw = pack_sd3_from_truncated_normalized(
-                            train_ds, ref_tid_swap, pred_ridge_swap.cpu(), template=pack_template
+                            train_ds,
+                            ref_tid_swap,
+                            pred_ridge_swap.cpu(),
+                            template=pack_template,
                         )
-                    elif method == "linear_probe_direction" and probe_artifact is not None:
+                    elif (
+                        method == "linear_probe_direction"
+                        and probe_artifact is not None
+                    ):
                         # replacement: x_tgt + replace_alpha * replace_direction
                         d_rep = probe_artifact["replace_direction"].to(x_tgt.device)
                         alpha_rep = probe_artifact.get("replace_alpha") or 0.0
@@ -887,7 +994,9 @@ def run_image_benchmark(
                         else:
                             pe_sw = pe_sw.to(sd_device)
                             pp_sw = pp_sw.to(sd_device)
-                            gen.generate_image_from_embd(pe_sw, pp_sw, swap_path, seed=seed_i)
+                            gen.generate_image_from_embd(
+                                pe_sw, pp_sw, swap_path, seed=seed_i
+                            )
                     else:
                         _write_placeholder_png(swap_path)
 
@@ -900,12 +1009,14 @@ def run_image_benchmark(
                         clip_scorer.image_text_cosine(swap_path, swapped_prompt)
                     )
                     if edit_attribute:
-                        row["clip_swapped_vs_target_phrase"] = clip_scorer.image_text_cosine(
-                            swap_path, edit_attribute
+                        row["clip_swapped_vs_target_phrase"] = (
+                            clip_scorer.image_text_cosine(swap_path, edit_attribute)
                         )
                     if swap_target_attribute:
                         row["clip_swapped_vs_replacement_phrase"] = (
-                            clip_scorer.image_text_cosine(swap_path, swap_target_attribute)
+                            clip_scorer.image_text_cosine(
+                                swap_path, swap_target_attribute
+                            )
                         )
 
             if is_cached_method:
@@ -915,7 +1026,9 @@ def run_image_benchmark(
             else:
                 rows.append(row)
 
-    local_methods = [m for m in methods if not (cache is not None and m in cache_methods)]
+    local_methods = [
+        m for m in methods if not (cache is not None and m in cache_methods)
+    ]
 
     csv_path = output_dir / "per_sample.csv"
     if rows:
@@ -937,8 +1050,16 @@ def run_image_benchmark(
     summary["drop_operator"] = drop_operator
     summary["packer_fingerprint"] = packer_meta
 
-    mse_ssae = [float(r["mse_embedding_vs_gt"]) for r in rows if r["method"] == "ssae_compose" and r["mse_embedding_vs_gt"] != ""]
-    cos_ssae = [float(r["cosine_embedding_vs_gt"]) for r in rows if r["method"] == "ssae_compose" and r["cosine_embedding_vs_gt"] != ""]
+    mse_ssae = [
+        float(r["mse_embedding_vs_gt"])
+        for r in rows
+        if r["method"] == "ssae_compose" and r["mse_embedding_vs_gt"] != ""
+    ]
+    cos_ssae = [
+        float(r["cosine_embedding_vs_gt"])
+        for r in rows
+        if r["method"] == "ssae_compose" and r["cosine_embedding_vs_gt"] != ""
+    ]
     if mse_ssae:
         summary["ssae_holdout_embedding_space"] = {
             "mse_mean": float(np.mean(mse_ssae)),
@@ -1095,7 +1216,8 @@ def _aggregate_summary(
         dino_vals = [
             float(r["dino_cosine_vs_gt_embed"])
             for r in xs
-            if r.get("dino_cosine_vs_gt_embed") != "" and r["dino_cosine_vs_gt_embed"] is not None
+            if r.get("dino_cosine_vs_gt_embed") != ""
+            and r["dino_cosine_vs_gt_embed"] is not None
         ]
         resid_vals = [
             float(r["clip_image_vs_residual_prompt"])
@@ -1106,7 +1228,8 @@ def _aggregate_summary(
         mse_pixel_vals = [
             float(r["mse_pixel_vs_gt_embed"])
             for r in xs
-            if r.get("mse_pixel_vs_gt_embed") != "" and r["mse_pixel_vs_gt_embed"] is not None
+            if r.get("mse_pixel_vs_gt_embed") != ""
+            and r["mse_pixel_vs_gt_embed"] is not None
         ]
         ssim_vals = [
             float(r["ssim_vs_gt_embed"])
@@ -1133,7 +1256,8 @@ def _aggregate_summary(
         ssim_swap_vals = [
             float(r["ssim_swap_vs_normal"])
             for r in xs
-            if r.get("ssim_swap_vs_normal") != "" and r["ssim_swap_vs_normal"] is not None
+            if r.get("ssim_swap_vs_normal") != ""
+            and r["ssim_swap_vs_normal"] is not None
         ]
         clip_swap_vals = [
             float(r["clip_swap_image_vs_swapped_prompt"])
@@ -1143,8 +1267,7 @@ def _aggregate_summary(
         ]
 
         def _col(name):
-            return [float(r[name]) for r in xs
-                    if r.get(name) not in ("", None)]
+            return [float(r[name]) for r in xs if r.get(name) not in ("", None)]
 
         tgt_normal = _col("clip_normal_vs_target_phrase")
         tgt_deleted = _col("clip_deleted_vs_target_phrase")
@@ -1154,35 +1277,55 @@ def _aggregate_summary(
         seed_m = base_seed + 17 * mi
         out["per_method"][m] = {
             "clip_image_vs_full_prompt": _ci_dict(clip_vals, n_bootstrap, seed_m),
-            "clip_mean_vs_active_attrs": _ci_dict(attr_mean_vals, n_bootstrap, seed_m + 3),
+            "clip_mean_vs_active_attrs": _ci_dict(
+                attr_mean_vals, n_bootstrap, seed_m + 3
+            ),
             "failure_rate_clip_below_threshold": float(np.mean(fail_vals))
             if fail_vals
             else float("nan"),
             "lpips_vs_gt_embed": _ci_dict(lpips_vals, n_bootstrap, seed_m + 5),
             "dino_cosine_vs_gt_embed": _ci_dict(dino_vals, n_bootstrap, seed_m + 7),
-            "clip_image_vs_residual_prompt": _ci_dict(resid_vals, n_bootstrap, seed_m + 9),
+            "clip_image_vs_residual_prompt": _ci_dict(
+                resid_vals, n_bootstrap, seed_m + 9
+            ),
             "mse_pixel_vs_gt_embed": _ci_dict(mse_pixel_vals, n_bootstrap, seed_m + 11),
             "ssim_vs_gt_embed": _ci_dict(ssim_vals, n_bootstrap, seed_m + 13),
-            "mse_pixel_pre_post_edit": _ci_dict(mse_pre_post_vals, n_bootstrap, seed_m + 15),
-            "ssim_pre_post_edit": _ci_dict(ssim_pre_post_vals, n_bootstrap, seed_m + 17),
-            "mse_pixel_swap_vs_normal": _ci_dict(mse_swap_vals, n_bootstrap, seed_m + 19),
+            "mse_pixel_pre_post_edit": _ci_dict(
+                mse_pre_post_vals, n_bootstrap, seed_m + 15
+            ),
+            "ssim_pre_post_edit": _ci_dict(
+                ssim_pre_post_vals, n_bootstrap, seed_m + 17
+            ),
+            "mse_pixel_swap_vs_normal": _ci_dict(
+                mse_swap_vals, n_bootstrap, seed_m + 19
+            ),
             "ssim_swap_vs_normal": _ci_dict(ssim_swap_vals, n_bootstrap, seed_m + 21),
             "clip_swap_image_vs_swapped_prompt": _ci_dict(
                 clip_swap_vals, n_bootstrap, seed_m + 23
             ),
             # E3 efficacy on the target concept. The deletion/replacement drop is the
             # signal; the absolute values are not comparable across concepts.
-            "clip_normal_vs_target_phrase": _ci_dict(tgt_normal, n_bootstrap, seed_m + 25),
-            "clip_deleted_vs_target_phrase": _ci_dict(tgt_deleted, n_bootstrap, seed_m + 27),
-            "clip_swapped_vs_target_phrase": _ci_dict(tgt_swapped, n_bootstrap, seed_m + 29),
-            "clip_swapped_vs_replacement_phrase": _ci_dict(repl_swapped, n_bootstrap, seed_m + 31),
+            "clip_normal_vs_target_phrase": _ci_dict(
+                tgt_normal, n_bootstrap, seed_m + 25
+            ),
+            "clip_deleted_vs_target_phrase": _ci_dict(
+                tgt_deleted, n_bootstrap, seed_m + 27
+            ),
+            "clip_swapped_vs_target_phrase": _ci_dict(
+                tgt_swapped, n_bootstrap, seed_m + 29
+            ),
+            "clip_swapped_vs_replacement_phrase": _ci_dict(
+                repl_swapped, n_bootstrap, seed_m + 31
+            ),
             "efficacy_delta_clip_deletion": (
                 float(np.mean(tgt_normal) - np.mean(tgt_deleted))
-                if tgt_normal and tgt_deleted else float("nan")
+                if tgt_normal and tgt_deleted
+                else float("nan")
             ),
             "efficacy_delta_clip_replacement": (
                 float(np.mean(tgt_normal) - np.mean(tgt_swapped))
-                if tgt_normal and tgt_swapped else float("nan")
+                if tgt_normal and tgt_swapped
+                else float("nan")
             ),
         }
 
@@ -1300,9 +1443,7 @@ def main() -> None:
             "property and always edit *it*, instead of sampling a random active attribute. "
             "Combine with --locality_drop_one_attr (off-manifold deletion) and/or "
             "--locality_swap_one_attr (on-manifold replacement). Example: 'holding a gun'. "
-            "IMPORTANT: pre-edit/swapped cache entries are keyed only by (method, sample_idx), "
-            "so different targets MUST use different --baseline_cache_root values or they will "
-            "overwrite each other's edited renders."
+            "Target and replacement names enter shared cache identity for locality runs."
         ),
     )
     p.add_argument(

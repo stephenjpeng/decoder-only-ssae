@@ -323,7 +323,9 @@ python -m evaluation.run_native_model_qualification \
     --output_dir results/image_qualification --device cuda
 ```
 
-Give only `scoring_sheet.csv` and `blinded_images/` to the scorer. This package contains successful bakeoff rows only. Audit rows stay outside the model-blinded handoff because audit membership identifies Turbo. The sheet contains opaque IDs, image paths, target phrases, and full prompts. Keep `manifest.jsonl` and `blinded_row_mapping.json` private. Both files use mode 0600. Failed renders remain in the private manifest, count as invalid in the gate, and do not appear in the scoring sheet.
+Give only `scoring_sheet.csv` and `blinded_images/` to the scorer. This package contains successful bakeoff rows only. Audit rows stay outside the model-blinded handoff because audit membership identifies Turbo. The sheet contains opaque IDs, image paths, target phrases, and full prompts. Keep `manifest.jsonl`, `blinded_row_mapping.json`, and `private_images/` private. Private metadata and images use mode 0600; the private image directory uses mode 0700. Failed renders remain in the private manifest, count as invalid in the gate, and do not appear in the scoring sheet.
+
+A real qualification run requires a clean Git working tree. Each row identity includes the exact repository revision and qualification render-contract version. A code or contract change rerenders the row and clears its stale blinded score. Resume also removes manifest rows outside the current validated plan before it rebuilds the scoring package.
 
 After the scorer fills all three boolean columns, authorize unblinding and run the bakeoff-only analysis:
 
@@ -337,13 +339,13 @@ python -m evaluation.run_image_validity_analysis \
     --output-csv results/image_qualification/bakeoff-summary.csv
 ```
 
-The 90% gate uses only `design=bakeoff`, `conditioning=direct_text`, and `target_present=true`. Prompt-audit rows do not enter candidate counts. Visibility and ambiguity are secondary diagnostics. Results include each model, each property, and each model-property cell.
+The 90% gate uses only `design=bakeoff`, `conditioning=direct_text`, and `target_present=true`. Every required model-property arm must meet the threshold. The pooled bakeoff rate is a diagnostic, not the gate. The CLI prints the conjunctive decision and each failed arm. Prompt-audit rows do not enter candidate counts. Visibility and ambiguity are secondary diagnostics.
 
 #### Baseline cache (image benchmark)
 
 `run_image_benchmark` caches the non-SSAE baselines (`gt_embed`, `mean_arithmetic`, `ridge_embed`, `native_prompt`, `prompt_only`, `prompt_modified_packed`) under `results/bench_baseline_cache/<dataset_id>/` and reuses them across real-render runs. Simulated runs keep placeholders in the run folder and never read or write this shared cache. A real run folder holds SSAE outputs plus a `manifest.json` that points at the cache. The Streamlit viewer merges the two transparently.
 
-Dataset identity (`dataset_id`) is a short hash of the holdout `prompts.json`, the training embeddings and mask, `--base_seed`, `--ridge_lambda`, the SD3.5 pipeline fingerprint, the ordered active top-k coordinate fingerprint, the fill policy, and an explicit cache identity version. A render-contract change creates a fresh cache directory instead of reusing older pixels under new semantics. Locality flags grow an existing compatible cache in place. Cache manifests record `render_mode`, the ordered-index fingerprint, active truncation, fill policy, and per-method conditioning.
+Dataset identity (`dataset_id`) is a short hash of the holdout `prompts.json`, the training embeddings and mask, `--base_seed`, `--ridge_lambda`, the SD3.5 pipeline fingerprint, the ordered active top-k coordinate fingerprint, the fill policy, and an explicit cache identity version. Targeted locality runs also include `--target_property` and `--replacement_property`. Non-targeted runs record null property fields and retain one shared cache identity. A render-contract change creates a fresh cache directory instead of reusing older pixels under new semantics. Locality flags grow an existing compatible cache in place. Cache manifests record `render_mode`, the ordered-index fingerprint, active truncation, fill policy, and per-method conditioning.
 
 **Fill policy for non-top-k dimensions.** `run_image_benchmark` fills the ~1.36M non-top-k coordinates of the SD3.5 conditioning tensor with the **training-set mean** (cached at `<train_folder>/full_embd_mean.pt`), not with the holdout row's true embedding. This avoids leaking ground truth through the coordinates the SSAE doesn't predict; every method sees the same template and the metrics reflect only the top-k prediction. `run_magnitude_sensitivity` now uses the same train-mean fill (it previously used oracle fill, which made its curves incomparable with the benchmark's rows — fatal for a joint efficacy/collateral Pareto plot); `--oracle_fill` restores the old behaviour for reproducing pre-fix artifacts. Inference notebooks that don't pass `template=` still get oracle fill. Any cache populated under one policy is invalidated by the packer fingerprint when the other runs.
 
