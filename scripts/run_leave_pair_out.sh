@@ -94,8 +94,8 @@ build_pair_split() {
     fi
 
     # verify holdout counts
-    pair_n=$(python -c "import json; m=json.load(open('$pair_root/split_manifest.json')); print(m['n_holdout_written'])")
-    rand_n=$(python -c "import json; m=json.load(open('$rand_root/split_manifest.json')); print(m['n_holdout_written'])")
+    pair_n=$("$PYTHON" -c "import json; m=json.load(open('$pair_root/split_manifest.json')); print(m['n_holdout_written'])")
+    rand_n=$("$PYTHON" -c "import json; m=json.load(open('$rand_root/split_manifest.json')); print(m['n_holdout_written'])")
     if [[ "$pair_n" -ne "$n_holdout" ]]; then
         echo "ERROR: $slug pair holdout has $pair_n rows, expected $n_holdout" >&2; exit 1
     fi
@@ -130,6 +130,50 @@ materialize_split() {
 
 # ------------------------------------------------------------------ training
 
+write_training_yaml() {
+    local folder_path="$1"
+    local seed="$2"
+    local output_yaml="$3"
+
+    mkdir -p "$(dirname "$output_yaml")"
+    cat > "$output_yaml" <<YAML
+training:
+  model:
+    model_name: "model_avg_feature"
+    using_blocs: False
+    num_layers: 2
+    hidden_dims: 19
+    head_type: "dense"
+  dataloader:
+    folder_path: "$folder_path"
+    truncate_n_prompts: null
+    truncate_embds_topk: 100000
+    pca_rotation: False
+    add_property_is_the_same: True
+    normalize: "MAX_MIN"
+    num_workers: 6
+    simulated:
+      simulated: False
+      dim_clip_simulated: 100
+  training:
+    n_epochs: 100
+    print_frequency: 1
+    save_model_frequency: null
+    plot_frequency: 1
+    seed: $seed
+    batch_size: 16
+    lr: 0.001
+    beta1: 0.9
+    beta2: 0.999
+    lr_scheduler:
+      lr_scheduler_type: LINEAR
+      lr_scheduler_linear:
+        lr_scheduler_lr_final_linear: 0.0001
+  sparse_feature_design:
+    n_repeat: 10
+YAML
+}
+
 train_split() {
     local slug="$1"
     local split_type="$2"   # pair_split or matched_random_split
@@ -139,28 +183,21 @@ train_split() {
     for seed in 0 1 2; do
         local run_name="${split_type}_h19_s${seed}"
         local ckpt="$ckpt_root/$run_name"
+        local config="$OUTPUT_ROOT/$slug/yamls/${run_name}.yaml"
         if [[ -f "$ckpt/model.pt" ]]; then
             log "$run_name already trained; skipping"
             continue
         fi
+        write_training_yaml "$split_root/train/" "$seed" "$config"
+        mkdir -p "$ckpt"
         log "training $run_name"
         "$PYTHON" training_cli.py \
             --output_folder "$ckpt" \
-            --path_yaml trainings/config/params_default.yaml \
-            --overwrite_output True \
-            --model_name model_avg_feature \
+            --path_yaml "$config" \
+            --overwrite_output \
             --head_type dense \
             --num_layers 2 \
-            --hidden_dims 19 \
-            --n_repeat 10 \
-            --truncate_embds_topk 100000 \
-            --normalize MAX_MIN \
-            --batch_size 16 \
-            --lr 0.001 \
-            --n_epochs 100 \
-            --num_workers 6 \
-            --seed "$seed" \
-            --folder_path "$split_root/train/"
+            --hidden_dims 19
     done
 }
 
@@ -168,13 +205,9 @@ copy_sidecars() {
     local slug="$1"
     local split_type="$2"
     local split_root="$OUTPUT_ROOT/$slug/$split_type"
-    local ckpt_root="$OUTPUT_ROOT/$slug/checkpoints"
 
-    # use s0 checkpoint as the sidecar source (all seeds share topk config)
-    local ref_ckpt="$ckpt_root/${split_type}_h19_s0"
     log "copying top-k sidecars for $slug/$split_type"
     "$PYTHON" -m evaluation.run_copy_truncation \
-        --checkpoint "$ref_ckpt" \
         --train_folder "$split_root/train" \
         --holdout_folder "$split_root/holdout"
 }
@@ -198,7 +231,7 @@ run_compositional_embeddings() {
         "$PYTHON" -m evaluation.run_compositional_embeddings \
             --checkpoint "$ckpt" \
             --holdout_folder "$split_root/holdout" \
-            --output_dir "$out"
+            --output_json "$out/metrics.json"
     done
 }
 

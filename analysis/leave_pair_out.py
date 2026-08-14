@@ -63,12 +63,12 @@ def split_contrast(pair_metrics: dict, random_metrics: dict) -> dict:
     # h19 gain contraction
     pair_h19_improvement = (pair_plain - pair_h19) / pair_plain if pair_plain != 0 else 0.0
     random_h19_improvement = (random_plain - random_h19) / random_plain if random_plain != 0 else 0.0
-    h19_gain_contraction = pair_h19_improvement / random_h19_improvement if random_h19_improvement != 0 else None
+    h19_gain_contraction = pair_h19_improvement - random_h19_improvement
 
     # pairwise gain contraction
     pair_pw_improvement = (pair_plain - pair_pw) / pair_plain if pair_plain != 0 else 0.0
     random_pw_improvement = (random_plain - random_pw) / random_plain if random_plain != 0 else 0.0
-    pairwise_gain_contraction = pair_pw_improvement / random_pw_improvement if random_pw_improvement != 0 else None
+    pairwise_gain_contraction = pair_pw_improvement - random_pw_improvement
 
     # gap closed (pair only)
     denom = pair_plain - pair_h19

@@ -47,7 +47,10 @@ def compositional_holdout_metrics(
         )
 
     mses = []
+    squared_error_sums = []
     cosines = []
+    target_sum = torch.zeros(holdout_ds.dim_x, dtype=torch.float64, device=dev_dec)
+    target_square_sum = torch.zeros_like(target_sum)
     for idx in range(len(holdout_ds)):
         target, mask_row = holdout_ds[idx]
         target = target.unsqueeze(0).to(dev_dec).float()
@@ -61,19 +64,36 @@ def compositional_holdout_metrics(
             device=dev_dec,
             block_means=block_means,
         )
-        mses.append(torch.nn.functional.mse_loss(pred, target, reduction="mean").item())
+        squared_error = (pred - target).square()
+        mses.append(squared_error.mean().item())
+        squared_error_sums.append(squared_error.sum().item())
         cosines.append(
             torch.nn.functional.cosine_similarity(pred, target, dim=-1).mean().item()
         )
+        target_double = target.squeeze(0).double()
+        target_sum += target_double
+        target_square_sum += target_double.square()
+
+    n_holdout = len(holdout_ds)
+    target_mean = target_sum / n_holdout
+    target_variance_sum = (
+        target_square_sum / n_holdout - target_mean.square()
+    ).clamp_min(0).sum().item()
+    mean_squared_error_sum = float(sum(squared_error_sums) / n_holdout)
+    fvu = mean_squared_error_sum / target_variance_sum
 
     return {
         "checkpoint": str(Path(checkpoint_dir).resolve()),
         "holdout_folder": str(Path(holdout_folder).resolve()),
         "model_name": model_name,
-        "n_holdout": len(holdout_ds),
-        "mse_mean": float(sum(mses) / len(mses)),
-        "cosine_mean": float(sum(cosines) / len(cosines)),
+        "n_holdout": n_holdout,
+        "mse_mean": float(sum(mses) / n_holdout),
+        "cosine_mean": float(sum(cosines) / n_holdout),
+        "target_variance_sum": target_variance_sum,
+        "fvu": fvu,
+        "r2": 1.0 - fvu,
         "per_index_mse": mses,
+        "per_index_squared_error_sum": squared_error_sums,
         "per_index_cosine": cosines,
     }
 
