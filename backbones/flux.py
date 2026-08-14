@@ -126,6 +126,51 @@ class FluxBackbone(Backbone):
         }
 
     @torch.no_grad()
+    def generate(
+        self,
+        prompt: str,
+        output_path: str | Path,
+        seed: int | None = None,
+        num_inference_steps: int | None = None,
+        guidance_scale: float | None = None,
+        height: int = 1024,
+        width: int = 1024,
+        max_sequence_length: int | None = None,
+        **_: Any,
+    ) -> Path:
+        """Generate directly from text with the configured FLUX context."""
+        if not self._loaded:
+            self.load()
+        if max_sequence_length is None:
+            max_sequence_length = self.max_length
+        if max_sequence_length != self.max_length:
+            raise ValueError(
+                "max_sequence_length must match the configured FLUX stream context"
+            )
+
+        is_schnell = "schnell" in self.model_id.lower()
+        if num_inference_steps is None:
+            num_inference_steps = 4 if is_schnell else 50
+        if guidance_scale is None:
+            guidance_scale = 0.0 if is_schnell else 3.5
+        generator = None
+        if seed is not None:
+            generator = torch.Generator(device="cpu").manual_seed(seed)
+        image = self.pipeline(
+            prompt=prompt,
+            prompt_2=prompt,
+            num_inference_steps=num_inference_steps,
+            guidance_scale=guidance_scale,
+            max_sequence_length=max_sequence_length,
+            height=height,
+            width=width,
+            generator=generator,
+        ).images[0]
+        output_path = Path(output_path)
+        image.save(output_path)
+        return output_path
+
+    @torch.no_grad()
     def decode(
         self,
         streams: StreamTensors,
@@ -164,9 +209,7 @@ class FluxBackbone(Backbone):
         # sequence embeddings. It is deterministic (all zeros) for text
         # tokens; the image side has its own `latent_image_ids` that the
         # pipeline computes internally.
-        text_ids = torch.zeros(
-            seq.shape[1], 3, device=seq.device, dtype=seq.dtype
-        )
+        text_ids = torch.zeros(seq.shape[1], 3, device=seq.device, dtype=seq.dtype)
 
         generator = None
         if seed is not None:

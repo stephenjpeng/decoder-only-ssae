@@ -15,16 +15,10 @@ from pathlib import Path
 
 import pandas as pd
 
+from evaluation.method_labels import METHOD_ORDER
+
 
 _NON_METRIC_COLUMNS = ("task", "sample_idx", "method", "prompt")
-
-_METHOD_ORDER = (
-    "gt_embed",
-    "ssae_compose",
-    "mean_arithmetic",
-    "ridge_embed",
-    "prompt_only",
-)
 
 
 def load_holdout_prompts(holdout_folder: Path) -> list[dict]:
@@ -102,8 +96,8 @@ def _load_json(path: Path) -> dict:
 
 def _order_methods(methods: list[str]) -> list[str]:
     seen = list(dict.fromkeys(methods))
-    known = [m for m in _METHOD_ORDER if m in seen]
-    extra = [m for m in seen if m not in _METHOD_ORDER]
+    known = [m for m in METHOD_ORDER if m in seen]
+    extra = [m for m in seen if m not in METHOD_ORDER]
     return known + extra
 
 
