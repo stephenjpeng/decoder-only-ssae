@@ -1,7 +1,5 @@
-import matplotlib.pyplot as plt
 import torch
 import torch.nn as nn
-import torch.optim as optim
 
 
 @torch.no_grad()
@@ -9,45 +7,63 @@ def compute_W(X, Y, lambd, I):
     A = X.T @ X
     return torch.linalg.solve(A + lambd * I, X.T @ Y)
 
-class Decoder(nn.Module):
-    def __init__(self, n_data, n_properties, n_repeat, Y_dim, is_the_same_indices, n_features_situation, lambd=0):
-        super().__init__()
-        # W is not considered as a trainable parameters (no gradient descent)
 
-        self.n_data = n_data
+class Decoder(nn.Module):
+    """Decoder variant that learns only the sparse feature matrix Y.
+
+    W is not a trainable parameter -- it is refit each step via ridge
+    regression against the full target embedding matrix. The training loop
+    calls ``refit_W(X_full)`` at the start of each epoch to supply targets.
+    """
+
+    def __init__(
+        self,
+        n_prompts,
+        n_properties,
+        n_repeat,
+        dim_output,
+        tid_same=None,
+        n_features_situation=0,
+        lambd=0.0,
+        logger=None,
+    ):
+        super().__init__()
+
+        self.n_prompts = n_prompts
         self.n_properties = n_properties
         self.n_repeat = n_repeat
         self.n_features = n_properties * n_repeat
-        self.Y_dim = Y_dim
+        self.dim_output = dim_output
         self.lambd = lambd
+        self.logger = logger
+        self.log_print = print if logger is None else logger.print
 
-        self.register_buffer('I', torch.eye(self.n_features))
-
-        self.latent = nn.Parameter(torch.rand(self.n_data, self.n_features, requires_grad = True))
-        self.register_buffer('latent_with_mask', torch.zeros_like(self.latent))
-        self.register_buffer('W', torch.zeros((self.n_features, self.Y_dim)))
+        self.register_buffer("I", torch.eye(self.n_features))
+        self.latent = nn.Parameter(torch.rand(self.n_prompts, self.n_features))
+        self.register_buffer("W", torch.zeros((self.n_features, self.dim_output)))
 
         self.activation = nn.ReLU()
-        #self.dropout = nn.Dropout(p=0.5)
+        self.mask = None
 
-    def forward(self, Y):
-        if self.training:
-            latent_with_mask = self.apply_mask()
-            #latent_with_mask = self.dropout(latent_with_mask)
-            self.W = compute_W(latent_with_mask, Y, self.lambd, self.I)
-            return latent_with_mask @ self.W 
-        else:
-            return self.latent_with_mask @ self.W 
+    def apply_mask(self, mask_reduced, batch_size):
+        self.mask = torch.repeat_interleave(mask_reduced, self.n_repeat, dim=1)
 
-    
-    def initialize_mask(self, mask):
-        mask = torch.repeat_interleave(mask, self.n_repeat, dim=1)
-        self.mask = mask
+    @property
+    def latent_with_mask(self):
+        return self.activation(self.latent * self.mask)
 
-    def apply_mask(self):
+    @torch.no_grad()
+    def refit_W(self, X_full):
+        """Refit the closed-form W using the current latent state and full X."""
+        self.W = compute_W(self.latent_with_mask.detach(), X_full, self.lambd, self.I)
+
+    def forward(self, batch_size, batch_idx):
         if self.mask is None:
-            raise Exception("mask not defined...")
-        
-        self.latent_with_mask =  self.activation(self.latent * self.mask)
-        return self.latent_with_mask
-    
+            raise RuntimeError("apply_mask must be called before forward")
+
+        start = batch_idx * batch_size
+        end = start + batch_size
+        return self.latent_with_mask[start:end] @ self.W
+
+    def get_rank_Y(self):
+        return torch.linalg.matrix_rank(self.latent)

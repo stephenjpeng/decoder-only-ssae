@@ -145,7 +145,7 @@ python get_embeddings_large_turbo_many_h5.py
 # 3. Train the decoder-only SSAE
 python training_cli.py --output_folder results/run1 \
     --path_yaml trainings/config/params_default.yaml \
-    --overwrite_output True
+    --overwrite_output
 
 # 4. Run inference interactively (see notebook)
 jupyter notebook inference/notebooks/inference_and_testing_output_visuals.ipynb
@@ -221,7 +221,7 @@ Train the decoder-only SSAE using the CLI:
 python training_cli.py \
     --output_folder results/my_run \
     --path_yaml trainings/config/params_default.yaml \
-    --overwrite_output True
+    --overwrite_output
 ```
 
 **Key CLI arguments:**
@@ -230,7 +230,7 @@ python training_cli.py \
 |---|---|
 | `--output_folder` | Directory for model checkpoint, logs, and plots |
 | `--path_yaml` | Path to the YAML configuration file |
-| `--overwrite_output` | Overwrite existing output folder if `True` |
+| `--overwrite_output` | Flag: if present, overwrite an existing output folder |
 | `--num_layers` | Number of `Linear` layers in the decoder head (default from YAML, currently `1`). Overrides `model.num_layers`. |
 | `--hidden_dims` | Hidden widths for the MLP head as an int or comma-separated ints (e.g. `512` or `512,256`). Broadcast when a single int is given; length must be `num_layers - 1`. Overrides `model.hidden_dims`. |
 
@@ -423,8 +423,6 @@ decoder-only-ssae/
 ├── get_embeddings_large_turbo_many_h5.py  # Embedding extraction script
 ├── training_cli.py                    # Training CLI entry point
 ├── trainable_inputs_all_clips.py      # Alternative training script
-├── config/
-│   └── models.yaml                    # Model configuration
 ├── dataset_generation/
 │   ├── functions.py                   # PromptsGenerator class
 │   ├── compositional_split.py         # Disjoint train/holdout full tuples

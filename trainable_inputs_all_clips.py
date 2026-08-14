@@ -7,7 +7,11 @@ import torch.optim as optim
 import yaml
 from torch.utils.data import DataLoader
 
-from trainings.config.config import initialise_instance, read_training_params_from_yaml
+from trainings.config.config import (
+    derive_shapes,
+    initialise_instance,
+    read_training_params_from_yaml,
+)
 from trainings.dataloader.dataloader import H5Dataset
 from trainings.models.mlp import parse_hidden_dims
 from trainings.models.utils import import_model
@@ -66,19 +70,7 @@ def training(
 
     dataset = initialise_instance(H5Dataset, tp)
 
-    tp["n_properties"] = dataset.properties.n_properties
-    tp["n_categories"] = dataset.properties.n_categories
-    tp["n_properties_situation"] = dataset.same_id.n_pid_never_same
-    tp["n_features"] = dataset.properties.n_properties * tp["n_repeat"]
-    # width of the "shared identity" block within that same n_repeat-wide
-    # feature space -- must scale with n_repeat like n_features above, not
-    # n_properties, or it overshoots n_features whenever most categories are
-    # marked "never same" in properties_same.json (the common case).
-    tp["n_features_situation"] = tp["n_repeat"] * dataset.same_id.n_pid_never_same
-    tp["tid_same"] = dataset.same_id.tid_same
-    tp["dim_output"] = dataset.dim_x
-    tp["n_prompts"] = len(dataset)
-    tp["backbone"] = dataset.backbone_name
+    derive_shapes(tp, dataset)
 
     dataloader = DataLoader(
         dataset,
@@ -146,7 +138,15 @@ def training(
     start = time.time()
     log_print("Start training...")
 
+    # inv variant refits W in closed form each epoch against the full X
+    X_full_for_refit = (
+        dataset.get_X().to(device).to(torch.float32) if hasattr(decoder, "refit_W") else None
+    )
+
     for epoch in range(tp["n_epochs"]):
+        if X_full_for_refit is not None:
+            decoder.refit_W(X_full_for_refit)
+
         for batch_idx, (y, mask) in enumerate(dataloader):
             y = y.to(device).to(torch.float32)
             mask = mask.to(device)

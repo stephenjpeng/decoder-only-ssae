@@ -5,8 +5,11 @@ from typing import List
 import torch
 
 from inference.utils import display_table, flatten_dict_of_list, is_in
-from trainings.config.config import (initialise_instance,
-                                     read_training_params_from_yaml)
+from trainings.config.config import (
+    derive_shapes,
+    initialise_instance,
+    read_training_params_from_yaml,
+)
 from trainings.dataloader.dataloader import H5Dataset
 from trainings.models.utils import import_model
 
@@ -32,18 +35,7 @@ class SFDInference:
         self.tp["logger"] = None
         self.tp["device"] = self.device
 
-        self.tp["n_properties"] = self.dataset.properties.n_properties
-        self.tp["n_categories"] = self.dataset.properties.n_categories
-        self.tp["n_properties_situation"] = self.dataset.same_id.n_pid_never_same
-        self.tp["n_features"] = self.dataset.properties.n_properties * self.tp["n_repeat"]
-        # scale with n_repeat, matching trainable_inputs_all_clips.training(); using
-        # n_properties instead overshoots n_features when most categories are never-same
-        # (drives y_same negative and crashes checkpoint reload).
-        self.tp["n_features_situation"] = self.tp["n_repeat"] * self.dataset.same_id.n_pid_never_same
-        self.tp["tid_same"] = self.dataset.same_id.tid_same
-        self.tp["dim_output"] = self.dataset.dim_x
-        self.tp["n_prompts"] = len(self.dataset)
-        self.tp["backbone"] = self.dataset.backbone_name
+        derive_shapes(self.tp, self.dataset)
 
     def initialize_model(self):
         Decoder = import_model(self.tp["model_name"])

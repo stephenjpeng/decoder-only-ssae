@@ -53,3 +53,25 @@ def check_yaml_params(value, possible_values):
     if value is not None and isinstance(value, str) and value not in possible_values:
         raise Exception(f"Wrong value {value}.Mmust be in {possible_values}")
     return value
+
+
+def derive_shapes(tp: Dict[str, Any], dataset) -> Dict[str, Any]:
+    """Populate shape-derived keys on tp from an initialised H5Dataset.
+
+    Mutates tp in place and returns it for convenience. Callers (training and
+    inference) share this block so any new derived key lives in one place.
+    """
+    tp["n_properties"] = dataset.properties.n_properties
+    tp["n_categories"] = dataset.properties.n_categories
+    tp["n_properties_situation"] = dataset.same_id.n_pid_never_same
+    tp["n_features"] = dataset.properties.n_properties * tp["n_repeat"]
+    # This block occupies n_repeat slots per shared property, matching the
+    # full feature-space construction above.
+    tp["n_features_situation"] = (
+        tp["n_repeat"] * dataset.same_id.n_pid_never_same
+    )
+    tp["tid_same"] = dataset.same_id.tid_same
+    tp["dim_output"] = dataset.dim_x
+    tp["n_prompts"] = len(dataset)
+    tp["backbone"] = dataset.backbone_name
+    return tp
