@@ -1,0 +1,245 @@
+# Native model qualification prompt specification for SD3.5 and FLUX image validity gates.
+#
+# This spec contains all 26 original properties from the training dataset, candidate
+# rendering phrases for ambiguity reduction, and experimental designs for both the
+# prompt audit (26 properties x 2 contexts x 2 seeds) and the bakeoff (12 high-risk
+# properties x 4 contexts x 4 seeds x 3 models).
+#
+# Property IDs preserve traceability to the original dataset by encoding category
+# and original phrase structure. Rendering phrases are candidate rewrites for clarity.
+
+properties:
+  # hair category (2 properties)
+  - id: hair_blond
+    category: hair
+    original_phrase: "A blond girl"
+    rendering_phrase: "with blonde hair"
+    critical: false
+    high_risk: true
+
+  - id: hair_brunette
+    category: hair
+    original_phrase: "A brunette girl"
+    rendering_phrase: "with brown hair"
+    critical: false
+    high_risk: true
+
+  # eyes category (2 properties)
+  - id: eyes_blue
+    category: eyes
+    original_phrase: "with blue eyes"
+    rendering_phrase: "with blue eyes"
+    critical: false
+    high_risk: true
+
+  - id: eyes_brown
+    category: eyes
+    original_phrase: "with brown eyes"
+    rendering_phrase: "with brown eyes"
+    critical: false
+    high_risk: false
+
+  # situation category (8 properties)
+  - id: situation_walking_street
+    category: situation
+    original_phrase: "walking down the street"
+    rendering_phrase: "walking down the street"
+    critical: false
+    high_risk: false
+
+  - id: situation_walking_rain
+    category: situation
+    original_phrase: "walking in the rain"
+    rendering_phrase: "walking in the rain"
+    critical: false
+    high_risk: true
+
+  - id: situation_sitting_cafe
+    category: situation
+    original_phrase: "sitting at a cafe"
+    rendering_phrase: "sitting at a cafe"
+    critical: false
+    high_risk: false
+
+  - id: situation_sitting_bar
+    category: situation
+    original_phrase: "sitting in a bar"
+    rendering_phrase: "sitting in a bar"
+    critical: false
+    high_risk: false
+
+  - id: situation_horseback_plain
+    category: situation
+    original_phrase: "on horseback across a plain"
+    rendering_phrase: "riding a horse across a plain"
+    critical: false
+    high_risk: true
+
+  - id: situation_beach
+    category: situation
+    original_phrase: "at the beach"
+    rendering_phrase: "at the beach"
+    critical: false
+    high_risk: false
+
+  - id: situation_driving_blue_car
+    category: situation
+    original_phrase: "driving a blue car"
+    rendering_phrase: "driving a blue car"
+    critical: true
+    high_risk: true
+
+  - id: situation_driving_red_car
+    category: situation
+    original_phrase: "driving a red car"
+    rendering_phrase: "driving a red car"
+    critical: true
+    high_risk: true
+
+  # t_shirt category (4 properties)
+  - id: tshirt_blue
+    category: t_shirt
+    original_phrase: "wearing a blue t-shirt"
+    rendering_phrase: "wearing a blue t-shirt"
+    critical: true
+    high_risk: true
+
+  - id: tshirt_black
+    category: t_shirt
+    original_phrase: "wearing a black t-shirt"
+    rendering_phrase: "wearing a black t-shirt"
+    critical: false
+    high_risk: false
+
+  - id: tshirt_red
+    category: t_shirt
+    original_phrase: "wearing a red t-shirt"
+    rendering_phrase: "wearing a red t-shirt"
+    critical: true
+    high_risk: true
+
+  - id: tshirt_green
+    category: t_shirt
+    original_phrase: "wearing a green t-shirt"
+    rendering_phrase: "wearing a green t-shirt"
+    critical: false
+    high_risk: false
+
+  # hat category (2 properties)
+  - id: hat_hat
+    category: hat
+    original_phrase: "and a hat"
+    rendering_phrase: "wearing a hat"
+    critical: false
+    high_risk: false
+
+  - id: hat_baseball_cap
+    category: hat
+    original_phrase: "and a baseball cap"
+    rendering_phrase: "wearing a baseball cap"
+    critical: false
+    high_risk: true
+
+  # action category (4 properties)
+  - id: action_holding_coffee
+    category: action
+    original_phrase: "holding a coffee"
+    rendering_phrase: "holding a coffee cup"
+    critical: false
+    high_risk: true
+
+  - id: action_holding_cocacola
+    category: action
+    original_phrase: "holding a coca-cola"
+    rendering_phrase: "holding a Coca-Cola bottle"
+    critical: false
+    high_risk: true
+
+  - id: action_holding_gun
+    category: action
+    original_phrase: "holding a gun"
+    rendering_phrase: "holding a gun"
+    critical: false
+    high_risk: false
+
+  - id: action_smoking_cigarette
+    category: action
+    original_phrase: "smoking a cigarette"
+    rendering_phrase: "smoking a cigarette"
+    critical: false
+    high_risk: false
+
+  # pose category (4 properties)
+  - id: pose_looking_left
+    category: pose
+    original_phrase: "looking to the left"
+    rendering_phrase: "looking to the left"
+    critical: false
+    high_risk: false
+
+  - id: pose_looking_right
+    category: pose
+    original_phrase: "looking to the right"
+    rendering_phrase: "looking to the right"
+    critical: false
+    high_risk: false
+
+  - id: pose_looking_front
+    category: pose
+    original_phrase: "looking in front of her"
+    rendering_phrase: "looking forward"
+    critical: false
+    high_risk: false
+
+  - id: pose_looking_behind
+    category: pose
+    original_phrase: "looking behind her"
+    rendering_phrase: "looking backward"
+    critical: false
+    high_risk: false
+
+# Prompt contexts for materializing audit and bakeoff designs. Each context is a
+# template that receives the rendering_phrase as {property}.
+contexts:
+  - id: ctx_simple
+    description: "Bare property phrase"
+    template: "{property}"
+
+  - id: ctx_descriptive
+    description: "Property with article and subject"
+    template: "A person {property}"
+
+  - id: ctx_narrative
+    description: "Property in a scene description"
+    template: "A photograph of a person {property}, high quality, detailed"
+
+  - id: ctx_direct
+    description: "Direct imperative style"
+    template: "Show {property}"
+
+# Prompt audit design: test all 26 properties with 2 contexts and 2 seeds to verify
+# that rendering phrases are unambiguous and models can generate valid targets.
+audit_design:
+  seeds: [42, 100]
+  context_ids: [ctx_simple, ctx_descriptive]
+
+# Bakeoff design: 12 frozen high-risk properties across 4 contexts, 4 seeds, and 3 models
+# for the native model qualification gate (90% observed validity required).
+bakeoff_design:
+  # exactly 12 high-risk properties frozen for the bakeoff
+  property_ids:
+    - hair_blond
+    - hair_brunette
+    - eyes_blue
+    - situation_walking_rain
+    - situation_horseback_plain
+    - situation_driving_blue_car
+    - situation_driving_red_car
+    - tshirt_blue
+    - tshirt_red
+    - hat_baseball_cap
+    - action_holding_coffee
+    - action_holding_cocacola
+  seeds: [42, 100, 200, 300]
+  context_ids: [ctx_simple, ctx_descriptive, ctx_narrative, ctx_direct]
+  model_backbones: [sd35_large_turbo, sd35_large, flux_dev]
