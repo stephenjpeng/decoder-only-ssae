@@ -12,6 +12,7 @@ _ARTIFACT_GLOBS = (
     "embds_min*.json",
     "pca_mean_top_*.pt",
     "pca_components_top_*.pt",
+    "pca_top_*.npz",
 )
 
 

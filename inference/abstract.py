@@ -136,11 +136,18 @@ class SFDInference:
 
         embd_topk = self.dataset.denormalize(embd_topk)
 
-        if self.dataset.pca_rotation:
-            # slot the edited top-k dims into the rotated full vector, then invert
-            full_rot = (full_embd - self.dataset.pca_mean) @ self.dataset.pca_components
-            full_rot[self.dataset.indices_truncate_embds_topk] = embd_topk
-            full_embd = self.dataset.pca_mean + full_rot @ self.dataset.pca_components.T
+        if getattr(self.dataset, "pca_components", None) is not None:
+            components = self.dataset.pca_components.to(
+                embd_topk.device, embd_topk.dtype
+            )
+            mean = self.dataset.pca_mean.to(embd_topk.device, embd_topk.dtype)
+            source = full_embd.to(embd_topk.device, embd_topk.dtype)
+            semantics = getattr(self.dataset, "pca_semantics", "residual")
+            if semantics == "residual":
+                projected = (source - mean) @ components.T
+                full_embd = source + (embd_topk - projected) @ components
+            else:
+                full_embd = embd_topk @ components + mean
         else:
             full_embd[self.dataset.indices_truncate_embds_topk] = embd_topk
 
@@ -168,15 +175,17 @@ class SFDInference:
     def get_full_embedding(self, idx: int) -> torch.tensor:
         indices_truncate_embds_topk = self.dataset.indices_truncate_embds_topk
         normalize = self.dataset.normalize
-        pca_rotation = self.dataset.pca_rotation
+        pca_components = getattr(self.dataset, "pca_components", None)
         self.dataset.indices_truncate_embds_topk = None
         self.dataset.normalize = None
-        self.dataset.pca_rotation = False
+        if pca_components is not None:
+            self.dataset.pca_components = None
 
         full_embd, _ = self.dataset.__getitem__(idx)
 
         self.dataset.indices_truncate_embds_topk = indices_truncate_embds_topk
         self.dataset.normalize = normalize
-        self.dataset.pca_rotation = pca_rotation
+        if pca_components is not None:
+            self.dataset.pca_components = pca_components
 
         return full_embd

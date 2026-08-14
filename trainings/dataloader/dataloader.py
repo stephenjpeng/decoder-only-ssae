@@ -17,6 +17,11 @@ from trainings.dataloader.properties.same_id import SameId
 MAX_MIN = "MAX_MIN"
 MANIFEST_FILENAME = "manifest.json"
 
+TRUNCATE_RANGE = "range"
+TRUNCATE_PCA = "pca"
+PCA_RESIDUAL = "residual"
+PCA_REPLACE = "replace"
+
 
 class MissingManifestError(FileNotFoundError):
     """Embedding folder was produced by an older extraction script.
@@ -32,6 +37,8 @@ class H5Dataset(Dataset):
         folder_path,
         truncate_n_prompts=None,
         truncate_embds_topk=None,
+        truncate_embds_method=TRUNCATE_RANGE,
+        pca_semantics=PCA_RESIDUAL,
         add_property_is_the_same=False,
         simulated=False,
         dim_clip_simulated=5000,
@@ -44,10 +51,24 @@ class H5Dataset(Dataset):
         self.logger = logger
         self.log_print = print if self.logger is None else logger.print
         self.truncate_embds_topk = truncate_embds_topk
+        # Preserve the original CLI flag while exposing the clearer method API.
+        # The legacy path used replacement semantics when reconstructing the
+        # full embedding, so retain that behavior for existing configurations.
+        if pca_rotation and truncate_embds_method == TRUNCATE_RANGE:
+            truncate_embds_method = TRUNCATE_PCA
+            pca_semantics = PCA_REPLACE
+        self.truncate_embds_method = check_yaml_params(
+            truncate_embds_method, possible_values=[TRUNCATE_RANGE, TRUNCATE_PCA]
+        )
+        self.pca_semantics = check_yaml_params(
+            pca_semantics, possible_values=[PCA_RESIDUAL, PCA_REPLACE]
+        )
+        self.pca_rotation = self.truncate_embds_method == TRUNCATE_PCA
         self.indices_truncate_embds_topk = None
-        self.pca_rotation = bool(pca_rotation)
         self.pca_mean = None
         self.pca_components = None
+        self.pca_singular_values = None
+        self.pca_explained_variance_ratio = None
         self.normalize = None  # we init the dateset with self.normalize = None and overwrite it to its actual value (normalize) at the end of the init
 
         self.X = None
@@ -145,9 +166,6 @@ class H5Dataset(Dataset):
         self.dim_x = int(vector_0.size()[0])
         self.log_print(f"dim_x = {self.dim_x}")
 
-        # PCA rotation (must run before truncate_embds so top-k operates on rotated X)
-        self.fit_or_load_pca()
-
         # truncate_embds_topk
         self.truncate_embds()
 
@@ -161,18 +179,13 @@ class H5Dataset(Dataset):
             properties=self.properties, same_id=self.same_id, logger=self.logger
         )
 
-        # final invariant: what the dataloader actually emits must match dim_x.
-        # If this fails, something in the truncation / PCA / normalization
-        # pipeline is out of sync with what the decoder gets built against.
         probe, _ = self.__getitem__(0)
         if int(probe.shape[0]) != self.dim_x:
             raise RuntimeError(
                 f"H5Dataset produced a vector of size {int(probe.shape[0])} but "
                 f"dim_x={self.dim_x}. "
                 f"truncate_embds_topk={self.truncate_embds_topk}, "
-                f"pca_rotation={self.pca_rotation}, "
-                f"indices_len={None if self.indices_truncate_embds_topk is None else len(self.indices_truncate_embds_topk)}, "
-                f"pca_components_shape={None if self.pca_components is None else tuple(self.pca_components.shape)}."
+                f"truncate_embds_method={self.truncate_embds_method}."
             )
 
     def __len__(self):
@@ -189,11 +202,9 @@ class H5Dataset(Dataset):
             parts.append(torch.from_numpy(arr).to(torch.float32).flatten())
 
         embds = torch.cat(parts) if len(parts) > 1 else parts[0]
-
-        if self.pca_rotation and self.pca_components is not None:
-            embds = (embds - self.pca_mean) @ self.pca_components
-
-        if self.indices_truncate_embds_topk is not None:
+        if self.pca_components is not None:
+            embds = (embds - self.pca_mean) @ self.pca_components.T
+        elif self.indices_truncate_embds_topk is not None:
             embds = embds[self.indices_truncate_embds_topk]
 
         if self.normalize is not None and self.normalize == MAX_MIN:
@@ -208,7 +219,14 @@ class H5Dataset(Dataset):
             return self._get_item_real(idx)
 
     def _get_item_simulated(self, idx):
-        return self.X_simulated[idx, :], self.mask_reduced[idx]
+        embds = self.X_simulated[idx, :]
+        if self.pca_components is not None:
+            embds = (embds - self.pca_mean) @ self.pca_components.T
+        elif self.indices_truncate_embds_topk is not None:
+            embds = embds[self.indices_truncate_embds_topk]
+        if self.normalize is not None and self.normalize == MAX_MIN:
+            embds = (embds - self.embds_min) / (self.embds_max - self.embds_min + 1e-6)
+        return embds, self.mask_reduced[idx]
 
     def _get_X_simulated(self):
         self.X = self.X_simulated
@@ -235,104 +253,118 @@ class H5Dataset(Dataset):
     def build_property_is_the_same(self):
         pass
 
-    def _cache_suffix(self):
-        # keeps PCA and non-PCA cached artifacts against the same folder_path
-        # from clobbering each other
-        return "_pca" if self.pca_rotation else ""
-
-    def fit_or_load_pca(self):
-        if not self.pca_rotation:
-            return
+    def truncate_embds(self):
         if self.truncate_embds_topk is None:
-            raise ValueError(
-                "pca_rotation=True requires truncate_embds_topk to be set: "
-                "the number of PCA components is tied to top-k."
-            )
-
-        k = self.truncate_embds_topk
-        mean_path = os.path.join(self.folder_path, f"pca_mean_top_{k}.pt")
-        comp_path = os.path.join(self.folder_path, f"pca_components_top_{k}.pt")
-
-        if os.path.exists(mean_path) and os.path.exists(comp_path):
-            self.log_print(f"Found {mean_path} and {comp_path}; loading PCA basis.")
-            self.pca_mean = torch.load(mean_path)
-            self.pca_components = torch.load(comp_path)
-            self.dim_x = int(self.pca_components.shape[1])
             return
 
         self.log_print(
-            f"Fitting PCA basis (q={self.truncate_embds_topk}) on raw X..."
+            f"Truncating embeddings from {self.dim_x} to "
+            f"{self.truncate_embds_topk} via method={self.truncate_embds_method}..."
         )
-        # invalidate downstream caches computed against a previous (possibly
-        # broken) basis at the same k -- otherwise truncate_embds() would load
-        # stale top-k indices and produce vectors of the wrong dimensionality
-        suffix = self._cache_suffix()
-        for stale in (
-            f"indices_top_{k}{suffix}.json",
-            f"embds_max_top_{k}{suffix}.json",
-            f"embds_min_top_{k}{suffix}.json",
-        ):
-            stale_path = os.path.join(self.folder_path, stale)
-            if os.path.exists(stale_path):
-                self.log_print(f"Removing stale {stale}")
-                os.remove(stale_path)
 
-        # temporarily disable rotation so get_X() fetches the raw D-dim vectors
-        self.pca_rotation = False
-        X_raw = self.get_X()
-        self.pca_rotation = True
+        if self.truncate_embds_method == TRUNCATE_PCA:
+            self._truncate_embds_pca()
+        else:
+            self._truncate_embds_range()
 
-        mu = X_raw.mean(dim=0)
-        Xc = X_raw - mu
-        _, _, V = torch.pca_lowrank(Xc, q=self.truncate_embds_topk, niter=4)
+        self.dim_x = self.truncate_embds_topk
+        self.log_print(f"dim_x is now {self.truncate_embds_topk}.")
 
-        self.pca_mean = mu
-        self.pca_components = V
-        self.dim_x = int(V.shape[1])
-
-        torch.save(self.pca_mean, mean_path)
-        torch.save(self.pca_components, comp_path)
-        self.log_print(f"Saved PCA basis to {mean_path} and {comp_path}.")
-
-        # replace cached raw X with its rotated form so downstream (top-k,
-        # min/max) sees the rotated space without re-reading H5
-        self.X = Xc @ self.pca_components
-
-    def truncate_embds(self):
-        if self.truncate_embds_topk is not None:
-            self.log_print(
-                f"Truncating embeddings from {self.dim_x} to {self.truncate_embds_topk}..."
-            )
-            file = f"indices_top_{self.truncate_embds_topk}{self._cache_suffix()}.json"
-            if os.path.exists(os.path.join(self.folder_path, file)):
-                self.log_print(f"Found {file}")
-                with open(os.path.join(self.folder_path, file), "r") as f:
-                    self.indices_truncate_embds_topk = json.load(f)
-                if len(self.indices_truncate_embds_topk) != self.truncate_embds_topk:
-                    self.log_print(
-                        f"Stale {file}: has {len(self.indices_truncate_embds_topk)} "
-                        f"entries, expected {self.truncate_embds_topk}. Recomputing."
-                    )
-                    # must clear before recompute -- get_indices_truncate_embds_topk
-                    # calls get_X() -> _get_item_real, which would otherwise slice
-                    # each vector with the stale index list before we've replaced it
-                    self.indices_truncate_embds_topk = None
-                    self.X = None
-                    self.indices_truncate_embds_topk = (
-                        self.get_indices_truncate_embds_topk()
-                    )
-                    with open(os.path.join(self.folder_path, file), "w") as f:
-                        json.dump(self.indices_truncate_embds_topk, f)
-            else:
-                self.log_print(f"Did not find {file}. Re-calculating it...")
+    def _truncate_embds_range(self):
+        K = self.truncate_embds_topk
+        file = f"indices_top_{K}.json"
+        if os.path.exists(os.path.join(self.folder_path, file)):
+            self.log_print(f"Found {file}")
+            with open(os.path.join(self.folder_path, file), "r") as f:
+                self.indices_truncate_embds_topk = json.load(f)
+            if len(self.indices_truncate_embds_topk) != K:
+                self.log_print(
+                    f"Stale {file}: has {len(self.indices_truncate_embds_topk)} "
+                    f"entries, expected {K}. Recomputing."
+                )
+                self.indices_truncate_embds_topk = None
+                self.X = None
                 self.indices_truncate_embds_topk = (
                     self.get_indices_truncate_embds_topk()
                 )
-                self.log_print(f"Saving {file}.")
                 with open(os.path.join(self.folder_path, file), "w") as f:
                     json.dump(self.indices_truncate_embds_topk, f)
-            self.dim_x = self.truncate_embds_topk
-            self.log_print(f"dim_x is now {self.truncate_embds_topk}.")
+        else:
+            self.log_print(f"Did not find {file}. Re-calculating it...")
+            self.indices_truncate_embds_topk = self.get_indices_truncate_embds_topk()
+            self.log_print(f"Saving {file}.")
+            with open(os.path.join(self.folder_path, file), "w") as f:
+                json.dump(self.indices_truncate_embds_topk, f)
+
+    def _truncate_embds_pca(self):
+        K = self.truncate_embds_topk
+        pca_file = f"pca_top_{K}.npz"
+        pca_path = os.path.join(self.folder_path, pca_file)
+        if os.path.exists(pca_path):
+            self.log_print(f"Found {pca_file}")
+            data = np.load(pca_path)
+            self.pca_mean = torch.tensor(data["mean"], dtype=torch.float32)
+            self.pca_components = torch.tensor(data["components"], dtype=torch.float32)
+            self.pca_singular_values = torch.tensor(
+                data["singular_values"], dtype=torch.float32
+            )
+            self.pca_explained_variance_ratio = torch.tensor(
+                data["explained_variance_ratio"], dtype=torch.float32
+            )
+        else:
+            self.log_print(f"Did not find {pca_file}. Computing PCA projection...")
+            self._compute_pca_projection()
+            np.savez(
+                pca_path,
+                mean=self.pca_mean.cpu().numpy(),
+                components=self.pca_components.cpu().numpy(),
+                singular_values=self.pca_singular_values.cpu().numpy(),
+                explained_variance_ratio=self.pca_explained_variance_ratio.cpu().numpy(),
+            )
+            self.log_print(f"Saved {pca_file}.")
+
+    def _compute_pca_projection(self):
+        if self.X is None:
+            _ = self.get_X()
+        X = self.X.to(torch.float32)
+        n, d = X.shape
+        K = self.truncate_embds_topk
+
+        mean = X.mean(dim=0)
+        X_centered = X - mean
+
+        # torch.pca_lowrank uses randomised SVD and becomes numerically unstable
+        # as q approaches min(n, d); fall back to torch.linalg.svd for the
+        # small-scale case where an exact decomposition is cheap. The threshold
+        # here (>= min(n, d) / 2) is conservative; PROPOSAL.md's real-training
+        # workloads stay well below it.
+        capacity = min(n, d)
+        if K >= capacity // 2 or capacity <= 128:
+            U, S, Vh = torch.linalg.svd(X_centered, full_matrices=False)
+            V = Vh.T
+        else:
+            U, S, V = torch.pca_lowrank(X_centered, q=min(K, capacity), niter=6)
+
+        available = S.shape[0]
+        if available < K:
+            pad_v = torch.zeros(V.shape[0], K - available, dtype=V.dtype)
+            pad_s = torch.zeros(K - available, dtype=S.dtype)
+            V = torch.cat([V, pad_v], dim=1)
+            S = torch.cat([S, pad_s], dim=0)
+
+        components = V[:, :K].T.contiguous()
+        singular_values = S[:K].contiguous()
+
+        denom = max(n - 1, 1)
+        total_var = (X_centered ** 2).sum() / denom
+        component_var = singular_values ** 2 / denom
+        explained_variance_ratio = component_var / (total_var + 1e-12)
+
+        self.pca_mean = mean
+        self.pca_components = components
+        self.pca_singular_values = singular_values
+        self.pca_explained_variance_ratio = explained_variance_ratio
+        self.X = X_centered @ components.T
 
     def get_indices_truncate_embds_topk(self):
         if self.X is None:
@@ -359,17 +391,15 @@ class H5Dataset(Dataset):
     def get_min_max_X(self):
         if self.normalize == MAX_MIN:
             self.log_print(f"Setting up {MAX_MIN} normalization")
-            suffix = self._cache_suffix()
-            file_max = (
-                f"embds_max_top_{self.truncate_embds_topk}{suffix}.json"
-                if self.truncate_embds_topk is not None
-                else f"embds_max{suffix}.json"
-            )
-            file_min = (
-                f"embds_min_top_{self.truncate_embds_topk}{suffix}.json"
-                if self.truncate_embds_topk is not None
-                else f"embds_min{suffix}.json"
-            )
+            if self.truncate_embds_topk is None:
+                file_max = "embds_max.json"
+                file_min = "embds_min.json"
+            elif self.truncate_embds_method == TRUNCATE_PCA:
+                file_max = f"embds_max_pca_{self.truncate_embds_topk}.json"
+                file_min = f"embds_min_pca_{self.truncate_embds_topk}.json"
+            else:
+                file_max = f"embds_max_top_{self.truncate_embds_topk}.json"
+                file_min = f"embds_min_top_{self.truncate_embds_topk}.json"
             if os.path.exists(os.path.join(self.folder_path, file_max)):
                 self.log_print(f"Found {file_max}")
                 with open(os.path.join(self.folder_path, file_max), "r") as f:
@@ -405,11 +435,10 @@ class H5Dataset(Dataset):
         if self.X is None:
             _ = self.get_X()
 
-        # self.X may already be truncation-applied (shape (N, k)) if it was
-        # populated by _get_X_real AFTER indices_truncate_embds_topk was set --
-        # e.g. when normalization stats are recomputed on a stale-cache path.
-        # In that case its columns are already the top-k dims (in indices
-        # order), and slicing again with `indices` would double-permute.
+        if self.pca_components is not None:
+            return torch.max(self.X, dim=0)[0], torch.min(self.X, dim=0)[0]
+
+        # X may already have been populated after range indices were applied.
         if (
             self.indices_truncate_embds_topk is not None
             and self.X.shape[1] != len(self.indices_truncate_embds_topk)

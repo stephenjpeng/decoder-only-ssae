@@ -18,6 +18,9 @@ training:
     folder_path: "results/compositional_split/train/"
     truncate_n_prompts: null
     truncate_embds_topk: 1000
+    truncate_embds_method: "range"
+    pca_semantics: "residual"
+    # Deprecated compatibility flag. Prefer truncate_embds_method: "pca".
     pca_rotation: False
     add_property_is_the_same: True
     normalize: "MAX_MIN"

@@ -178,6 +178,8 @@ def dataset_fingerprint(dataset: Any = None, *, folder_path: str | Path | None =
         "dim_x": None,
         "truncate_embds_topk": None,
         "normalize": None,
+        "truncate_embds_method": None,
+        "pca_semantics": None,
         "pca_rotation": None,
         "backbone": None,
         "n_properties": None,
@@ -192,6 +194,10 @@ def dataset_fingerprint(dataset: Any = None, *, folder_path: str | Path | None =
             getattr(dataset, "truncate_embds_topk", None)
         )
         fp["normalize"] = getattr(dataset, "normalize", None)
+        fp["truncate_embds_method"] = getattr(
+            dataset, "truncate_embds_method", None
+        )
+        fp["pca_semantics"] = getattr(dataset, "pca_semantics", None)
         fp["pca_rotation"] = _bool_or_none(getattr(dataset, "pca_rotation", None))
         fp["backbone"] = getattr(dataset, "backbone_name", None)
         try:
@@ -223,14 +229,19 @@ def dataset_fingerprint(dataset: Any = None, *, folder_path: str | Path | None =
 
     k = fp["truncate_embds_topk"]
     if k is not None:
-        # Mirrors H5Dataset._cache_suffix(): PCA and non-PCA sidecars coexist in one
-        # folder, so hash only the variant this run actually reads.
-        suffix = "_pca" if fp["pca_rotation"] else ""
-        for name in (
-            f"indices_top_{k}{suffix}.json",
-            f"embds_min_top_{k}{suffix}.json",
-            f"embds_max_top_{k}{suffix}.json",
-        ):
+        if fp["truncate_embds_method"] == "pca":
+            sidecars = (
+                f"pca_top_{k}.npz",
+                f"embds_min_pca_{k}.json",
+                f"embds_max_pca_{k}.json",
+            )
+        else:
+            sidecars = (
+                f"indices_top_{k}.json",
+                f"embds_min_top_{k}.json",
+                f"embds_max_top_{k}.json",
+            )
+        for name in sidecars:
             digest = sha256_file(folder / name)
             if digest is not None:
                 fp["files"][name] = digest
